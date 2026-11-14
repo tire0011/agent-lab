@@ -7,6 +7,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from modules.local_model_bakeoff import choose_winner, list_bakeoffs
@@ -50,10 +51,11 @@ class BakeoffTests(unittest.TestCase):
 
     def execute(self, candidates=None, **kwargs):
         bench_fn = kwargs.pop("bench_fn", self.bench)
+        replay_fn = kwargs.pop("replay_fn", self.replay)
         return bakeoff.run_bakeoff(
             candidates or ["7b.gguf", "3b.gguf"], db_path=self.db,
             fixture_path=self.fixture, run_command=self.command, bench_fn=bench_fn,
-            replay_fn=self.replay, **kwargs,
+            replay_fn=replay_fn, **kwargs,
         )
 
     def test_candidates_are_ordered_and_original_restored_and_rows_stored(self):
@@ -74,6 +76,24 @@ class BakeoffTests(unittest.TestCase):
                 self.execute(candidates=["3b.gguf"], bench_fn=broken)
             self.assertEqual(self.calls[-1], "MODEL=7b.gguf")
             self.assertEqual(self.active, "7b.gguf")
+        rows = list_bakeoffs(10, db_path=self.db)
+        self.assertEqual([row["status"] for row in rows], ["interrupted", "error"])
+
+    def test_failure_halfway_records_remaining_candidates_as_not_run(self):
+        calls = 0
+        def bench(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("candidate crashed")
+            return self.bench(*args, **kwargs)
+        with self.assertRaises(RuntimeError):
+            self.execute(candidates=["7b.gguf", "3b.gguf", "1b.gguf"], bench_fn=bench)
+        rows = list_bakeoffs(10, db_path=self.db)
+        by_model = {row["model"]: row["status"] for row in rows}
+        self.assertEqual(by_model, {"7b.gguf": "completed", "3b.gguf": "error",
+                                    "1b.gguf": "not_run"})
+        self.assertEqual(self.active, "7b.gguf")
 
     def test_switch_failure_is_recorded_and_skipped(self):
         def command(argv):
@@ -100,6 +120,72 @@ class BakeoffTests(unittest.TestCase):
         tied = {**fast, "model": "1b", "local_too_slow": 0,
                 "passing_hunks_per_hour": 11, "passing_hunks": 6}
         self.assertEqual(choose_winner([current, fast, tied], "7b")["winner"]["model"], "1b")
+
+    def test_candidate_model_rates_seed_and_timeout_reach_every_replay(self):
+        seen = []
+        class FakeClient:
+            model = "wrong-7b"
+        fake = FakeClient()
+        def replay(experiment_id, **kwargs):
+            seen.append((kwargs["client"].model,
+                         os.environ.get("NEXUS_SHADOW_REPLAY_UNIT_TIMEOUT_SECONDS"),
+                         kwargs["client"].model in json.loads(Path(
+                             os.environ["LOCAL_MODEL_RATES_PATH"]).read_text())["models"]))
+            return self.replay(experiment_id, **kwargs)
+        self.execute(candidates=["3b.gguf"], replay_fn=replay, client=fake,
+                     seed=123, timeout=17)
+        self.assertEqual(seen, [("3b.gguf", "17", True)] * 10)
+        self.assertEqual(list(self.root.glob(".bakeoff-rates-*.json")), [])
+        row = list_bakeoffs(1, db_path=self.db)[0]
+        self.assertEqual((row["details"]["seed"], row["details"]["timeout_seconds"]), (123, 17))
+
+    def test_lease_busy_is_retried_and_never_counted_as_failed_hunk(self):
+        attempts = 0
+        clock = [0.0]
+        def replay(experiment_id, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                return None
+            return self.replay(experiment_id, **kwargs)
+        def sleep(seconds):
+            clock[0] += seconds
+        report = self.execute(candidates=["3b.gguf"], replay_fn=replay,
+                              lease_wait_seconds=5, sleep_fn=sleep,
+                              monotonic_fn=lambda: clock[0])
+        self.assertEqual(attempts, 12)
+        self.assertEqual(report["rows"][0]["hunks_total"], 10)
+        self.assertEqual(report["rows"][0]["passing_hunks"], 9)
+
+    def test_persistent_lease_busy_aborts_candidate_without_failed_hunk(self):
+        clock = [0.0]
+        def sleep(seconds):
+            clock[0] += seconds
+        report = self.execute(candidates=["3b.gguf"], replay_fn=lambda *_a, **_k: None,
+                              lease_wait_seconds=2, sleep_fn=sleep,
+                              monotonic_fn=lambda: clock[0])
+        row = report["rows"][0]
+        self.assertEqual(row["status"], "lease_busy")
+        self.assertEqual(row["passing_hunks"], 0)
+        self.assertEqual(row["local_too_slow"], 0)
+        self.assertEqual(row["details_json"].count("lease_busy"), 1)
+
+    def test_bad_fixture_case_is_recorded_and_remaining_hunks_continue(self):
+        def replay(experiment_id, **kwargs):
+            if experiment_id == "e3":
+                raise ValueError("not merged")
+            return self.replay(experiment_id, **kwargs)
+        report = self.execute(candidates=["3b.gguf"], replay_fn=replay)
+        row = report["rows"][0]
+        self.assertEqual(row["hunks_total"], 10)
+        self.assertEqual(row["passing_hunks"], 8)
+        self.assertIn("fixture_error", row["details_json"])
+
+    def test_repeated_runs_have_distinct_ids_and_rows(self):
+        first = self.execute(candidates=["7b.gguf"])
+        second = self.execute(candidates=["7b.gguf"])
+        self.assertNotEqual(first["run_id"], second["run_id"])
+        self.assertEqual(len(list_bakeoffs(10, db_path=self.db)), 2)
 
 
 if __name__ == "__main__":

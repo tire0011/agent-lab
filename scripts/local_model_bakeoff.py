@@ -9,7 +9,9 @@ the process is interrupted.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import re
 import sqlite3
 import subprocess
@@ -30,6 +32,9 @@ from modules.local_model_bakeoff import (  # noqa: E402
     passing_hunks_per_hour,
 )
 from modules.local_shadow_replay_hunks import replay_hunks  # noqa: E402
+from modules import local_shadow_replay as lsr  # noqa: E402
+from modules import local_shadow_replay_hunks as lsh  # noqa: E402
+from modules.local_model_rates import LocalModelRates  # noqa: E402
 from modules.run_store import DEFAULT_DB_PATH, init_db  # noqa: E402
 
 from scripts import bench_local_speed  # noqa: E402
@@ -67,24 +72,81 @@ def _units(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
     return list((summary or {}).get("units") or [])
 
 
-def fixture_experiment_id(item: dict[str, Any], db_path: str) -> str:
-    if item.get("experiment_id"):
-        return str(item["experiment_id"])
-    issue = item.get("issue_number")
-    if not isinstance(issue, int):
-        raise ValueError("fixture entry needs experiment_id or integer issue_number")
-    conn = sqlite3.connect(db_path)
+def fixture_experiment_id(item: dict[str, Any], _db_path: str) -> str:
+    """Return the immutable experiment identity stored in the fixture.
+
+    In particular, never resolve an issue number to its newest retry: that made
+    previous bake-offs silently compare different work over time.
+    """
+    value = item.get("experiment_id")
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("fixture entry needs a non-empty fixed experiment_id")
+    return value.strip()
+
+
+class SeededReplayClient(lsr._UsageCountingClient):
+    """Production replay client pinned to the candidate and bake-off seed."""
+
+    def __init__(self, *, model: str, seed: int, timeout: float) -> None:
+        super().__init__(model=model, timeout=timeout)
+        self._bakeoff_seed = seed
+
+    async def chat_completion(self, messages, temperature=0.0, max_tokens=1024, **kwargs):
+        kwargs["seed"] = self._bakeoff_seed
+        return await super().chat_completion(
+            messages, temperature=temperature, max_tokens=max_tokens, **kwargs)
+
+
+def _record_benchmark_rates(model: str, speed: dict[str, Any], rates_path: str | None) -> None:
+    """Make hunk admission use this candidate's measured rates immediately."""
+    rates = (speed.get("summary") or {}).get("all") or {}
+    prompt = rates.get("prompt_tokens_per_second")
+    output = rates.get("output_tokens_per_second")
+    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0
+               for v in (prompt, output)):
+        raise RuntimeError("speed benchmark did not produce positive prompt/output rates")
+    # LocalModelRates consumes llama-server timing fields. One second of
+    # synthetic timing exactly preserves each aggregate measured rate.
+    store = LocalModelRates(rates_path, model=model)
+    stored = store.record({
+        "prompt_n": float(prompt), "prompt_ms": 1000.0,
+        "predicted_n": float(output), "predicted_ms": 1000.0,
+    })
+    measured = store.medians()
+    if not stored or any(value is None for value in measured):
+        raise RuntimeError("could not store candidate-specific benchmark rates")
+
+
+@contextlib.contextmanager
+def _replay_environment(timeout: float, rates_path: str | None):
+    changes = {lsh.ENV_UNIT_TIMEOUT: str(timeout)}
+    if rates_path:
+        changes["LOCAL_MODEL_RATES_PATH"] = rates_path
+    old = {key: os.environ.get(key) for key in changes}
+    os.environ.update(changes)
     try:
-        row = conn.execute(
-            "SELECT id FROM experiments WHERE (source_type='issue' AND source_id=?) "
-            "OR goal LIKE ? ORDER BY created_at DESC LIMIT 1",
-            (str(issue), f"%GitHub Issue #{issue}%"),
-        ).fetchone()
+        yield
     finally:
-        conn.close()
-    if row is None:
-        raise ValueError(f"no experiment found for fixture issue #{issue}")
-    return str(row[0])
+        for key, value in old.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _replay_when_available(replay_fn: Callable[..., dict[str, Any] | None],
+                           experiment_id: str, *, lease_wait_seconds: float,
+                           sleep_fn: Callable[[float], None] = time.sleep,
+                           monotonic_fn: Callable[[], float] = time.monotonic,
+                           **kwargs: Any) -> dict[str, Any]:
+    deadline = monotonic_fn() + max(0.0, lease_wait_seconds)
+    while True:
+        result = replay_fn(experiment_id, **kwargs)
+        if result is not None:
+            return result
+        if monotonic_fn() >= deadline:
+            raise TimeoutError("shadow replay global lease remained busy")
+        sleep_fn(min(1.0, max(0.0, deadline - monotonic_fn())))
 
 
 def score_candidate(
@@ -100,18 +162,39 @@ def score_candidate(
     bench_fn: Callable[..., dict[str, Any]] = bench_local_speed.bench,
     replay_fn: Callable[..., dict[str, Any] | None] = replay_hunks,
     client: Any | None = None,
+    rates_path: str | None = None,
+    lease_wait_seconds: float = 60.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     speed = bench_fn(url, seed=seed, timeout=timeout)
+    _record_benchmark_rates(model, speed, rates_path)
+    replay_client = client or SeededReplayClient(model=model, seed=seed, timeout=timeout)
+    # Test doubles and injected transports are supported, but admission must
+    # still key rates by the candidate that was actually switched in.
+    replay_client.model = model
     all_speed = (speed.get("summary") or {}).get("all") or {}
     outcomes: list[dict[str, Any]] = []
     started = time.monotonic()
     for index, item in enumerate(fixture):
-        experiment_id = fixture_experiment_id(item, db_path)
         variant = f"bakeoff-{run_id[:8]}-{_slug(model)}-{index:02d}"
-        summary = replay_fn(
-            experiment_id, repo_root=repo_root, db_path=db_path, variant=variant,
-            client=client, max_units=1,
-        )
+        try:
+            experiment_id = fixture_experiment_id(item, db_path)
+            with _replay_environment(timeout, rates_path):
+                summary = _replay_when_available(
+                    replay_fn, experiment_id, lease_wait_seconds=lease_wait_seconds,
+                    sleep_fn=sleep_fn, monotonic_fn=monotonic_fn,
+                    repo_root=repo_root, db_path=db_path, variant=variant,
+                    client=replay_client, max_units=1,
+                )
+        except TimeoutError as exc:
+            # Contention is a run condition, never evidence that the model
+            # failed a hunk. Preserve it distinctly and stop this candidate.
+            outcomes.append({"status": "lease_busy", "error": str(exc)})
+            break
+        except (ValueError, sqlite3.Error) as exc:
+            outcomes.append({"status": "fixture_error", "error": f"{type(exc).__name__}: {exc}"})
+            continue
         units = _units(summary)
         if units:
             # A fresh variant and max_units=1 yield exactly one scored unit.
@@ -123,7 +206,8 @@ def score_candidate(
         seconds = time.monotonic() - started
     row: dict[str, Any] = {
         "model": model,
-        "status": "completed",
+        "status": "lease_busy" if any(u.get("status") == "lease_busy" for u in outcomes)
+                  else "completed",
         "prompt_tokens_per_second": all_speed.get("prompt_tokens_per_second"),
         "output_tokens_per_second": all_speed.get("output_tokens_per_second"),
         "hunks_total": len(outcomes),
@@ -132,7 +216,8 @@ def score_candidate(
         "passing_hunks": sum(bool(u.get("tests_passed")) for u in outcomes),
         "local_too_slow": sum(u.get("status") == "local_too_slow" for u in outcomes),
         "seconds": round(seconds, 3),
-        "details": {"speed": speed, "hunks": outcomes},
+        "details": {"speed": speed, "hunks": outcomes, "seed": seed,
+                    "timeout_seconds": timeout, "model": model},
     }
     row["passing_hunks_per_hour"] = round(passing_hunks_per_hour(row), 3)
     return row
@@ -151,19 +236,27 @@ def run_bakeoff(
     bench_fn: Callable[..., dict[str, Any]] = bench_local_speed.bench,
     replay_fn: Callable[..., dict[str, Any] | None] = replay_hunks,
     client: Any | None = None,
+    rates_path: str | None = None,
+    lease_wait_seconds: float = 60.0,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    monotonic_fn: Callable[[], float] = time.monotonic,
 ) -> dict[str, Any]:
     if not candidates:
         raise ValueError("at least one candidate is required")
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-    if len(fixture) != 10 or any(not ({"experiment_id", "issue_number"} & set(item)) for item in fixture):
-        raise ValueError("bakeoff fixture must contain exactly 10 experiment or issue entries")
+    if (not isinstance(fixture, list) or len(fixture) != 10
+            or any(not isinstance(item, dict) or not isinstance(item.get("experiment_id"), str)
+                   or not item["experiment_id"].strip() for item in fixture)):
+        raise ValueError("bakeoff fixture must contain exactly 10 fixed experiment_id entries")
     original = current_model(run_command)
     run_id = uuid.uuid4().hex
+    ephemeral_rates = rates_path is None
+    rates_path = rates_path or str(Path(db_path).parent / f".bakeoff-rates-{run_id}.json")
     created_at = datetime.now(timezone.utc).isoformat()
     conn = init_db(db_path)
     rows: list[dict[str, Any]] = []
     try:
-        for model in candidates:
+        for candidate_index, model in enumerate(candidates):
             base = {"run_id": run_id, "created_at": created_at, "model": model,
                     "is_current": int(model == original), "winner": 0,
                     "recommend_switch": 0}
@@ -177,11 +270,40 @@ def run_bakeoff(
                 insert_bakeoff_row(conn, row)
                 rows.append(row)
                 continue
-            scored = score_candidate(
-                model, fixture, repo_root=repo_root, db_path=db_path, url=url,
-                seed=seed, timeout=timeout, run_id=run_id, bench_fn=bench_fn,
-                replay_fn=replay_fn, client=client,
-            )
+            try:
+                scored = score_candidate(
+                    model, fixture, repo_root=repo_root, db_path=db_path, url=url,
+                    seed=seed, timeout=timeout, run_id=run_id, bench_fn=bench_fn,
+                    replay_fn=replay_fn, client=client, rates_path=rates_path,
+                    lease_wait_seconds=lease_wait_seconds, sleep_fn=sleep_fn,
+                    monotonic_fn=monotonic_fn,
+                )
+            except BaseException as exc:
+                # A durable partial row makes interruption/crash observable;
+                # BaseException is immediately re-raised after persistence.
+                row = {**base, "status": "interrupted" if isinstance(exc, KeyboardInterrupt) else "error",
+                       "hunks_total": 0, "hunks_applied": 0, "hunks_compiled": 0,
+                       "passing_hunks": 0, "local_too_slow": 0, "seconds": 0,
+                       "passing_hunks_per_hour": 0, "details_json": json.dumps({
+                           "seed": seed, "timeout_seconds": timeout, "model": model}),
+                       "error": f"{type(exc).__name__}: {exc}"[:1000]}
+                insert_bakeoff_row(conn, row)
+                rows.append(row)
+                for pending_model in candidates[candidate_index + 1:]:
+                    pending = {
+                        "run_id": run_id, "created_at": created_at, "model": pending_model,
+                        "is_current": int(pending_model == original), "status": "not_run",
+                        "hunks_total": 0, "hunks_applied": 0, "hunks_compiled": 0,
+                        "passing_hunks": 0, "local_too_slow": 0, "seconds": 0,
+                        "passing_hunks_per_hour": 0, "winner": 0, "recommend_switch": 0,
+                        "details_json": json.dumps({"seed": seed,
+                                                    "timeout_seconds": timeout,
+                                                    "model": pending_model}),
+                        "error": "an earlier candidate interrupted the run",
+                    }
+                    insert_bakeoff_row(conn, pending)
+                    rows.append(pending)
+                raise
             details = scored.pop("details")
             row = {**base, **scored, "details_json": json.dumps(details), "error": None}
             insert_bakeoff_row(conn, row)
@@ -203,7 +325,14 @@ def run_bakeoff(
         try:
             switch_model(original, run_command)
         finally:
-            conn.close()
+            try:
+                conn.close()
+            finally:
+                if ephemeral_rates:
+                    try:
+                        Path(rates_path).unlink()
+                    except FileNotFoundError:
+                        pass
 
 
 def main(argv: list[str] | None = None) -> int:
