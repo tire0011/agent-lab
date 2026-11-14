@@ -960,16 +960,21 @@ def release_local_llm_job_service(service: LocalLlmJobService) -> None:
     Safe for a private service too (it is simply closed), so a caller never
     has to remember which kind :func:`acquire_local_llm_job_service` gave it.
     """
+    should_close = True
     with _SHARED_LOCK:
         for key, (shared, refcount) in list(_SHARED_SERVICES.items()):
             if shared is not service:
                 continue
             if refcount > 1:
                 _SHARED_SERVICES[key] = (shared, refcount - 1)
-                return
+                should_close = False
+                break
             del _SHARED_SERVICES[key]
             break
-    service.close()
+    # close() also removes itself from this registry. Do not call it while
+    # holding the non-reentrant registry lock.
+    if should_close:
+        service.close()
 
 
 def _forget_shared_service(service: LocalLlmJobService) -> None:

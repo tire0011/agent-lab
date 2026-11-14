@@ -165,15 +165,15 @@ def _orchestrator(tmp: str, responses):
     _init_repo(tmp)
     registry = _IssueRegistry(str(Path(tmp) / "state.db"), tmp)
     client = _Client(responses)
-    return (
-        NexusTaskOrchestrator(
-            operations_registry=registry,
-            experiment_service=MagicMock(),
-            llama_client=client,
-        ),
-        registry,
-        client,
+    orchestrator = NexusTaskOrchestrator(
+        operations_registry=registry,
+        experiment_service=MagicMock(),
+        llama_client=client,
     )
+    # These are local-controller unit tests. Do not let ambient provider
+    # credentials turn their scripted calls into wall-clock network requests.
+    orchestrator._azure_drives_controller = MagicMock(return_value=False)
+    return orchestrator, registry, client
 
 
 class Issue234CompletionEvidenceTests(unittest.TestCase):
