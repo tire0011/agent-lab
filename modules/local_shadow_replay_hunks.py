@@ -413,11 +413,34 @@ class UnitLogger:
         self.rounds = 0
         self.prompt_tokens = 0
         self.cached_tokens = 0
+        # #694: SR grammar on the patch calls, rounds ending in edit_format /
+        # no_diff, and the generated tokens and milliseconds for output tok/s.
+        self.sr_grammar: bool | None = None
+        self.format_rounds = 0
+        self.generated_tokens = 0
+        self.generation_ms = 0.0
+
+    @property
+    def generation_tokens_per_second(self) -> float | None:
+        if self.generated_tokens <= 0 or self.generation_ms <= 0:
+            return None
+        return self.generated_tokens * 1000.0 / self.generation_ms
 
     def _record(self, _phase: str, event: str, _message: str = "", **fields: Any) -> None:
         if event == "local_patch_round":
             self.rounds += 1
+            if fields.get("outcome") in ("edit_format", "no_diff"):
+                self.format_rounds += 1
+            if isinstance(fields.get("sr_grammar"), bool):
+                self.sr_grammar = bool(self.sr_grammar) or fields["sr_grammar"]
         elif event == "local_model_call":
+            timings = fields.get("timings")
+            if fields.get("call_type") == "patch" and isinstance(timings, dict):
+                n, ms = timings.get("predicted_n"), timings.get("predicted_ms")
+                if (isinstance(n, (int, float)) and isinstance(ms, (int, float))
+                        and not isinstance(n, bool) and not isinstance(ms, bool) and n > 0 and ms > 0):
+                    self.generated_tokens += int(n)
+                    self.generation_ms += float(ms)
             total = fields.get("prompt_tokens_total")
             if not isinstance(total, int) or isinstance(total, bool):
                 total = fields.get("prompt_tokens")
@@ -623,6 +646,16 @@ class UnitOutcome:
     prompt_tokens: int = 0
     cached_tokens: int = 0
     error: str | None = None
+    sr_grammar: bool | None = None
+    format_rounds: int = 0
+    generation_tokens_per_second: float | None = None
+
+
+def _copy_log_fields(outcome: UnitOutcome, log: UnitLogger) -> None:
+    """#694: grammar flag, format-failure rounds and output tok/s of the unit's run."""
+    outcome.sr_grammar = log.sr_grammar
+    outcome.format_rounds = log.format_rounds
+    outcome.generation_tokens_per_second = log.generation_tokens_per_second
 
 
 def _store_unit(conn: sqlite3.Connection, experiment_id: str, variant: str, unit: HunkUnit,
@@ -630,11 +663,15 @@ def _store_unit(conn: sqlite3.Connection, experiment_id: str, variant: str, unit
     conn.execute(
         "UPDATE local_replay_units SET status=?, applied=?, compiled=?, has_tests=?, tests_passed=?, "
         "tests_total=?, tests_ok=?, overlap=?, seconds=?, rounds=?, prompt_tokens=?, cached_tokens=?, "
+        "sr_grammar=?, format_rounds=?, generation_tokens_per_second=?, "
         f"error=?, finished_at=? WHERE {_UNIT_KEY} AND status=?",
         (outcome.status, int(outcome.applied), int(outcome.compiled), int(outcome.has_tests),
          int(outcome.tests_passed), int(outcome.tests_total), int(outcome.tests_ok),
          round(float(outcome.overlap), 6), round(float(outcome.seconds), 3), int(outcome.rounds),
          int(outcome.prompt_tokens), int(outcome.cached_tokens),
+         None if outcome.sr_grammar is None else int(outcome.sr_grammar), int(outcome.format_rounds),
+         (None if outcome.generation_tokens_per_second is None
+          else round(float(outcome.generation_tokens_per_second), 3)),
          outcome.error[:lsr._MAX_ERROR_CHARS] if outcome.error else None, lsr._iso(lsr._utcnow()),
          experiment_id, unit.file, unit.symbol, variant, UNIT_RUNNING),
     )
@@ -644,6 +681,8 @@ def _unit_dict(row: sqlite3.Row) -> dict[str, Any]:
     data = dict(row)
     for key in ("applied", "compiled", "has_tests", "tests_passed"):
         data[key] = bool(data.get(key))
+    if data.get("sr_grammar") is not None:
+        data["sr_grammar"] = bool(data["sr_grammar"])
     return data
 
 
@@ -705,11 +744,13 @@ def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str,
         outcome.seconds = time.monotonic() - started
         outcome.rounds, outcome.prompt_tokens, outcome.cached_tokens = (
             log.rounds, log.prompt_tokens, log.cached_tokens)
+        _copy_log_fields(outcome, log)
         outcome.error = f"local worker raised {type(exc).__name__}: {exc}"
         return outcome
     outcome.seconds = time.monotonic() - started
     outcome.rounds, outcome.prompt_tokens, outcome.cached_tokens = (
         log.rounds, log.prompt_tokens, log.cached_tokens)
+    _copy_log_fields(outcome, log)
     usage = getattr(result, "usage", None)
     if not outcome.prompt_tokens and isinstance(usage, dict):
         outcome.prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
@@ -900,10 +941,14 @@ def unit_variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, An
             "SUM(CASE WHEN status != ? THEN tests_passed ELSE 0 END) passed, "
             "AVG(CASE WHEN status != ? THEN overlap END) overlap, "
             "AVG(CASE WHEN status != ? THEN seconds END) seconds, "
-            "SUM(prompt_tokens) prompt_tokens, SUM(cached_tokens) cached_tokens "
+            "SUM(prompt_tokens) prompt_tokens, SUM(cached_tokens) cached_tokens, "
+            "SUM(CASE WHEN status != ? THEN rounds ELSE 0 END) rounds, "
+            "SUM(CASE WHEN status != ? THEN format_rounds ELSE 0 END) format_rounds, "
+            "SUM(CASE WHEN status != ? AND sr_grammar = 1 THEN 1 ELSE 0 END) sr_grammar_units, "
+            "AVG(CASE WHEN status != ? THEN generation_tokens_per_second END) generation_tps "
             "FROM local_replay_units GROUP BY prompt_variant ORDER BY prompt_variant",
             (UNIT_RUNNING, UNIT_RUNNING, UNIT_SCORED, UNIT_TIMEOUT, UNIT_ERROR,
-             *([UNIT_RUNNING] * 6)),
+             *([UNIT_RUNNING] * 10)),
         ).fetchall()
         runs = {(r["prompt_variant"], r["status"]): int(r["n"]) for r in conn.execute(
             "SELECT prompt_variant, status, COUNT(*) n FROM local_replay_unit_runs "
@@ -936,6 +981,15 @@ def unit_variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, An
             "average_seconds": round(float(row["seconds"] or 0), 3),
             "prompt_tokens": int(row["prompt_tokens"] or 0),
             "cached_tokens": int(row["cached_tokens"] or 0),
+            # #694: the share of patch rounds lost to edit_format / no_diff,
+            # how many units ran with the SR grammar, and the output tok/s.
+            "rounds": int(row["rounds"] or 0),
+            "format_rounds": int(row["format_rounds"] or 0),
+            "format_round_rate": (round(int(row["format_rounds"] or 0) / int(row["rounds"]), 4)
+                                  if row["rounds"] else None),
+            "sr_grammar_units": int(row["sr_grammar_units"] or 0),
+            "generation_tokens_per_second": (round(float(row["generation_tps"]), 3)
+                                             if row["generation_tps"] is not None else None),
             "experiments_without_units": runs.get((row["prompt_variant"], RUN_NO_UNITS), 0),
             "experiment_errors": runs.get((row["prompt_variant"], RUN_ERROR), 0),
         })
