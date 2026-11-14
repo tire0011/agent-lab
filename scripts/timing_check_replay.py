@@ -83,6 +83,8 @@ def verdict(result: str, control: ControlCheckResult | tuple[list[str], list[str
     )
     if drift_only or host_regressions:
         return "failed"
+    if isinstance(control, ControlCheckResult) and control.preexisting_host_failures:
+        return "ok"
     return "needs_review"
 
 

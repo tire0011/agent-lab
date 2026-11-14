@@ -277,6 +277,13 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertEqual(replay.verdict("ok", None), "ok")
         self.assertEqual(replay.verdict("timing_sensitive: a", (["a"], [])), "failed")
         self.assertEqual(replay.verdict("timing_sensitive: a", ([], ["a"])), "needs_review")
+        self.assertEqual(
+            replay.verdict(
+                "timing_sensitive: a",
+                timing_check_module.ControlCheckResult([], ["a"], []),
+            ),
+            "ok",
+        )
         self.assertEqual(replay.verdict("error", None), "needs_review")
         self.assertFalse(replay.is_flagged({"verdict": "ok"}))
         self.assertTrue(replay.is_flagged({"verdict": "needs_review"}))
