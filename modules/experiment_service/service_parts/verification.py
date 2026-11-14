@@ -16,6 +16,7 @@ from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
+from modules import timing_check as timing_check_module
 from modules.verification_runner import (
     VerificationRunResult,
     WatchdogConfig,
@@ -43,6 +44,17 @@ from .core import (
     _is_real_test_id,
     _test_file_for_id,
 )
+
+
+# Slow-machine check (#681/#689): on unless explicitly "0".
+TIMING_CHECK_ENV_VAR = "NEXUS_TIMING_CHECK"
+TIMING_CHECK_HINT = (
+    "inject the clock or compute the value from configured values, not from wall time"
+)
+
+
+def timing_check_enabled() -> bool:
+    return os.environ.get(TIMING_CHECK_ENV_VAR, "1").strip() != "0"
 
 
 class VerificationMixin:
@@ -267,6 +279,87 @@ class VerificationMixin:
                 str(int(total)),
                 updated_at=_utcnow_iso(),
             )
+
+
+    def _run_timing_check(
+        self, experiment_id: str, worktree_path: str, head_diff: str,
+        elog: ExperimentLogger,
+    ) -> tuple[str, str] | None:
+        """Slow-machine check (#689): rerun the affected tests with clock drift.
+
+        Returns None when the change may proceed, else ``(status, error)``.
+        A flagged test fails verification with a hint for the retry; anything
+        without a verdict (a check error, a crash, an interruption) is
+        ``needs_review`` - an enabled check that could not run never approves.
+        """
+        if not timing_check_enabled():
+            elog.info(
+                "verifying", "timing_check_skipped",
+                f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+            )
+            return None
+        try:
+            # The HEAD diff alone misses work a GitHub checkpoint already
+            # committed, so the paths changed since the base count too.
+            base_commit = self.get_experiment(experiment_id).base_commit_sha
+            paths = (
+                self._files_changed_since(base_commit, worktree_path, elog)
+                if base_commit else set()
+            )
+            diff = head_diff + "\n" + "".join(
+                f"diff --git a/{path} b/{path}\n" for path in sorted(paths)
+            )
+            tests = timing_check_module.affected_tests(diff, worktree_path)
+            elog.info(
+                "verifying", "timing_check_started",
+                "Rerunning the affected tests with a sped-up clock",
+                test_files=tests,
+            )
+
+            def track(process: subprocess.Popen[str] | None) -> None:
+                self._track_process(experiment_id, process)
+
+            result = timing_check_module.run_timing_check(
+                worktree_path, tests, on_process=track, python=self.test_python_executable,
+            )
+            control = None
+            flagged = timing_check_module.flagged_tests(result)
+            if flagged:
+                # The normal run may have been GitHub CI, so a flag only counts
+                # when the same test passes here without drift.
+                control = timing_check_module.control_check(
+                    worktree_path, flagged, on_process=track,
+                    python=self.test_python_executable,
+                )
+                if control is None:
+                    result = "error: control run without drift gave no verdict"
+        except (KeyboardInterrupt, SystemExit) as exc:
+            result, control = f"error: interrupted ({type(exc).__name__})", None
+        except Exception as exc:  # noqa: BLE001 - a crashed check is no verdict
+            result, control = f"error: {type(exc).__name__}: {str(exc)[:500]}", None
+
+        if result == "ok":
+            elog.info("verifying", "timing_check_passed", "Slow-machine check passed")
+            return None
+        if control is not None:
+            drift_only, fails_without_drift = control
+            if drift_only:
+                error = (
+                    f"{timing_check_module.TIMING_SENSITIVE_PREFIX}{', '.join(drift_only)}"
+                    f"; hint: {TIMING_CHECK_HINT}"
+                )
+                elog.error(
+                    "verifying", "timing_check_flagged", error,
+                    fails_without_drift=fails_without_drift,
+                )
+                return STATUS_FAILED, error
+            result = (
+                "error: these tests fail on this host without drift too, so there is "
+                "no timing verdict: " + ", ".join(fails_without_drift)
+            )
+        error = f"timing check failed closed: {result}"
+        elog.warning("verifying", "timing_check_failed_closed", error)
+        return STATUS_NEEDS_REVIEW, error
 
 
     def _record_verification_run(
@@ -605,7 +698,17 @@ class VerificationMixin:
             )
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
+            timing_failure = self._run_timing_check(
+                experiment_id, worktree_path, diff_proc.stdout, elog,
+            )
+            if self._ended_from_outside(experiment_id):
+                return self.get_experiment(experiment_id)
+            if timing_failure is not None:
+                final_status, error = timing_failure
 
+        # Every branch above except a fully green run (tests and timing check)
+        # has already moved final_status away from succeeded.
+        if final_status == STATUS_SUCCEEDED:
             # Deterministic quality evaluation (no LLM call): tests passing is necessary but never
             # sufficient - the diff must match what plan and task required. Any failure in this
             # block downgrades to needs_review with the worktree preserved, never a silent "succeeded".
