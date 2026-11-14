@@ -31,6 +31,11 @@ class TimingBaseCompareTests(unittest.TestCase):
             db_path=str(root / "db.sqlite"), repo_root=str(self.repo),
             worktrees_root=str(root / "worktrees"), test_python_executable=sys.executable,
             experiment_log_dir=str(root / "logs"),
+            # This suite exercises the post-verification timing check.  Keep
+            # the preceding normal verification independent of whether the
+            # host's default test runner discovers pytest-style functions in
+            # this deliberately tiny temporary repository.
+            test_command=[sys.executable, "-c", "print('normal tests passed')"],
         )
         quality = patch(
             "modules.experiment_service.evaluate_implementation",
