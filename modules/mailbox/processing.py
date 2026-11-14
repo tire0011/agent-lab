@@ -20,6 +20,7 @@ from .task_ingest import insert_task_approval, resolve_idempotency_key
 
 from .core import (
     COMMAND_TYPE,
+    DEFAULT_AGENT_ID,
     MAX_RETRY,
     STATUS_DEFERRED,
     STATUS_DONE,
@@ -31,12 +32,15 @@ from .core import (
     _git,
     _now_iso,
     _outbox_filename,
+    agent_id_from_env,
     git_add_and_commit,
     git_current_commit,
     git_is_clean,
     git_pull_ff_only,
     git_push,
     init_mailbox_db,
+    is_addressed_to,
+    peek_front_matter,
 )
 
 logger = logging.getLogger(__name__)
@@ -202,7 +206,7 @@ def _default_issue_fetcher(repository: str, issue_number: int) -> dict[str, Any]
     try:
         data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"GitHub issue lookup returned unparsable JSON: {exc}") from exc
+        raise RuntimeError(f"GitHub issue lookup returned unparseable JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("GitHub issue lookup returned an unexpected payload")
     if data.get("pull_request"):
@@ -297,7 +301,7 @@ def _process_issue_approval(
     if decision == issue_approvals.STATUS_APPROVED:
         return (
             f"Issue {repository}#{issue_number} is now **approved** for autonomous "
-            f"execution, bound to content hash `{approval.content_hash[:12]}…`. "
+            f"execution, bound to content hash `{approval.content_hash[:12]}\u2026`. "
             "If the issue is edited, the approval no longer applies and must be renewed.",
             None,
         )
@@ -547,7 +551,7 @@ def _process_operation_chain(
             request_id=request_id,
         )
     except Exception as exc:
-        return _ChainError(f"Operation chain rejected: invalid step definition – {exc}")
+        return _ChainError(f"Operation chain rejected: invalid step definition \u2013 {exc}")
 
     try:
         result = operation_chain_service.start_chain(chain_request)
@@ -593,6 +597,7 @@ class MailboxProcessor:
         mailbox_config: Any = None,
         task_log_dir: str | Path = DEFAULT_LOG_DIR,
         issue_fetcher: Any = None,
+        agent_id: str | None = None,
     ) -> None:
         if mailbox_config is not None:
             self._mailbox_repo_path: Path = mailbox_config.mailbox_repo_path
@@ -615,6 +620,10 @@ class MailboxProcessor:
         self.operation_chain_service = operation_chain_service
         self.issue_fetcher = issue_fetcher
         self.task_log_dir = Path(task_log_dir)
+        # Local receiver id for addressed routing (agent-lab-mailbox issue #7):
+        # messages without ``to`` and messages with ``to: <this id>`` are
+        # processed here; anything else is skipped before any side effect.
+        self.agent_id = (agent_id or agent_id_from_env()).strip().lower() or DEFAULT_AGENT_ID
         self._conn: sqlite3.Connection | None = None
 
     @property
@@ -827,6 +836,24 @@ class MailboxProcessor:
 
     def _process_file(self, file_path: Path) -> dict[str, Any]:
         rel = str(file_path.relative_to(self._mailbox_repo_path))
+
+        # Recipient routing gate (agent-lab-mailbox issue #7): a message that is
+        # positively addressed to other agent(s) must be skipped BEFORE any side
+        # effect - task log, DB row/retry counter, trust evaluation, command
+        # execution, or git cleanup - and must stay untouched in the inbox.
+        # Unparseable front matter (None) falls through to the legacy validation
+        # path so existing behavior for malformed legacy messages is unchanged.
+        peek = peek_front_matter(file_path)
+        if peek is not None and not is_addressed_to(self.agent_id, peek):
+            return {
+                "file": rel,
+                "status": "skipped",
+                "reason": (
+                    f"not addressed to this processor "
+                    f"(agent_id={self.agent_id!r}, to={peek.get('to')!r}); left untouched"
+                ),
+            }
+
         task_log = get_task_logger(
             _transient_mailbox_task_id(rel),
             log_dir=self.task_log_dir,
