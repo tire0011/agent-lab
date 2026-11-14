@@ -11,6 +11,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+from modules.verification_env import build_verification_test_env
+
 
 _DIFF_PATH = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|\+\+\+ b/(\S+))$", re.MULTILINE)
 _FAILED_TEST = re.compile(r"^FAILED\s+(.+?)(?:\s+-\s+.*)?$", re.MULTILINE)
@@ -106,6 +108,30 @@ def _stop(proc: subprocess.Popen[str]) -> None:
 TIMING_SENSITIVE_PREFIX = "timing_sensitive: "
 
 
+class TimingCheckResult(str):
+    """A string-compatible verdict with bounded pytest diagnostics."""
+
+    failure_tails: dict[str, list[str]]
+
+    def __new__(
+        cls, value: str, failure_tails: dict[str, list[str]] | None = None,
+    ) -> "TimingCheckResult":
+        result = super().__new__(cls, value)
+        result.failure_tails = failure_tails or {}
+        return result
+
+
+def _failed_test_tails(output: str, failed: Iterable[str]) -> dict[str, list[str]]:
+    """Return at most the last 40 relevant output lines for each failed node id."""
+    lines = output.splitlines()
+    tails: dict[str, list[str]] = {}
+    for test_id in failed:
+        occurrences = [index for index, line in enumerate(lines) if test_id in line]
+        end = occurrences[-1] + 1 if occurrences else len(lines)
+        tails[test_id] = lines[max(0, end - 40):end]
+    return tails
+
+
 def flagged_tests(result: str) -> list[str]:
     """The test ids of a ``timing_sensitive: ...`` result, else []."""
     if not result.startswith(TIMING_SENSITIVE_PREFIX):
@@ -119,6 +145,7 @@ def control_check(
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
+    results: list[TimingCheckResult] | None = None,
 ) -> tuple[list[str], list[str]] | None:
     """Rerun flagged tests without drift: ``(drift_only, fails_without_drift)``.
 
@@ -130,6 +157,8 @@ def control_check(
     tests = list(flagged)
     # Drift 0 keeps the fixture installed but adds nothing, so the clocks are real.
     control = run_timing_check(repo, tests, 0, on_process=on_process, python=python)
+    if results is not None and isinstance(control, TimingCheckResult):
+        results.append(control)
     if control == "ok":
         return tests, []
     also_failing = set(flagged_tests(control))
@@ -148,7 +177,7 @@ def run_timing_check(
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
-) -> str:
+) -> TimingCheckResult:
     """Run every selected test under clock drift and summarize the outcome.
 
     *python* is the interpreter for the pytest child (default: this one), so
@@ -157,14 +186,16 @@ def run_timing_check(
 
     test_list = list(tests)
     if not test_list:
-        return "ok"
-    env = os.environ.copy()
+        return TimingCheckResult("ok")
+    env = build_verification_test_env()
     env["NEXUS_TEST_CLOCK_DRIFT_MS"] = str(drift_ms)
+    env["PYTHONUNBUFFERED"] = "1"
     proc: subprocess.Popen[str] | None = None
+    output = ""
     result = "error"
     try:
         proc = subprocess.Popen(
-            [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
+            [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=short", "-rf", *test_list],
             cwd=Path(repo),
             env=env,
             stdout=subprocess.PIPE,
@@ -190,4 +221,5 @@ def run_timing_check(
                 on_process(None)
             except Exception:
                 result = "error"
-    return result
+    failed = list(dict.fromkeys(_FAILED_TEST.findall(output or ""))) if proc is not None else []
+    return TimingCheckResult(result, _failed_test_tails(output or "", failed))

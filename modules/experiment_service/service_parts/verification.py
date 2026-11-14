@@ -296,6 +296,7 @@ class VerificationMixin:
             elog.info(
                 "verifying", "timing_check_skipped",
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+                failure_tails={},
             )
             return None
         try:
@@ -314,14 +315,18 @@ class VerificationMixin:
                 "verifying", "timing_check_started",
                 "Rerunning the affected tests with a sped-up clock",
                 test_files=tests,
+                failure_tails={},
             )
 
             def track(process: subprocess.Popen[str] | None) -> None:
                 self._track_process(experiment_id, process)
 
+            timing_results: list[timing_check_module.TimingCheckResult] = []
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
             )
+            if isinstance(result, timing_check_module.TimingCheckResult):
+                timing_results.append(result)
             control = None
             flagged = timing_check_module.flagged_tests(result)
             if flagged:
@@ -330,6 +335,7 @@ class VerificationMixin:
                 control = timing_check_module.control_check(
                     worktree_path, flagged, on_process=track,
                     python=self.test_python_executable,
+                    results=timing_results,
                 )
                 if control is None:
                     result = "error: control run without drift gave no verdict"
@@ -339,7 +345,13 @@ class VerificationMixin:
             result, control = f"error: {type(exc).__name__}: {str(exc)[:500]}", None
 
         if result == "ok":
-            elog.info("verifying", "timing_check_passed", "Slow-machine check passed")
+            elog.info(
+                "verifying", "timing_check_passed", "Slow-machine check passed",
+                failure_tails={
+                    test_id: tail for item in timing_results
+                    for test_id, tail in item.failure_tails.items()
+                },
+            )
             return None
         if control is not None:
             drift_only, fails_without_drift = control
@@ -351,6 +363,10 @@ class VerificationMixin:
                 elog.error(
                     "verifying", "timing_check_flagged", error,
                     fails_without_drift=fails_without_drift,
+                    failure_tails={
+                        test_id: tail for item in timing_results
+                        for test_id, tail in item.failure_tails.items()
+                    },
                 )
                 return STATUS_FAILED, error
             result = (
@@ -358,7 +374,13 @@ class VerificationMixin:
                 "no timing verdict: " + ", ".join(fails_without_drift)
             )
         error = f"timing check failed closed: {result}"
-        elog.warning("verifying", "timing_check_failed_closed", error)
+        elog.warning(
+            "verifying", "timing_check_failed_closed", error,
+            failure_tails={
+                test_id: tail for item in timing_results
+                for test_id, tail in item.failure_tails.items()
+            } if "timing_results" in locals() else {},
+        )
         return STATUS_NEEDS_REVIEW, error
 
 
@@ -817,4 +839,3 @@ class VerificationMixin:
                     error=combined_error,
                 )
         return self.get_experiment(experiment_id)
-
