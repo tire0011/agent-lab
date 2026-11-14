@@ -16,6 +16,7 @@ from modules import issue_approvals
 from modules.central_logging import DEFAULT_LOG_DIR, get_task_logger
 from modules.redaction import redact_outbound
 from .refresh import process_refresh as _process_refresh
+from .routing import is_for_nexus
 from .task_ingest import insert_task_approval, resolve_idempotency_key
 
 from .core import (
@@ -794,6 +795,8 @@ class MailboxProcessor:
         files = [
             f for f in self.inbox.iterdir()
             if f.is_file() and f.suffix == ".md" and f.name != ".gitkeep"
+            # Messages for other agents are not even seen (mailbox issue #9).
+            and is_for_nexus(f)
         ]
         files.sort(key=lambda f: (f.stat().st_mtime, f.name))
         return files
@@ -827,6 +830,10 @@ class MailboxProcessor:
 
     def _process_file(self, file_path: Path) -> dict[str, Any]:
         rel = str(file_path.relative_to(self._mailbox_repo_path))
+        if not is_for_nexus(file_path):
+            # Defense in depth for explicit batches: before any log, record,
+            # retry or command, a message for another agent is left untouched.
+            return {"file": rel, "status": "skipped", "reason": "addressed to another agent"}
         task_log = get_task_logger(
             _transient_mailbox_task_id(rel),
             log_dir=self.task_log_dir,
