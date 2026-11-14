@@ -163,27 +163,35 @@ run continues for as long as tests keep starting and finishing.
   `tests/test_issue_667_llama_streaming.py`, which flagged green `main`
   commits. Tests flagged under drift run once more without drift
   (`control_check`), because the normal run may have been GitHub CI rather
-  than this host. Outcomes:
+  than this host. Tests which still fail are run with the same isolated ids in
+  a temporary detached worktree at the experiment's base commit; the worktree
+  is removed on success, failure, crash, and interruption. Outcomes:
   - `ok` (or no affected test) - verification continues to the quality gate.
   - a test fails only under drift - the experiment `failed` with
     `timing_sensitive: <test ids>; hint: inject the clock or compute the value
     from configured values, not from wall time`; the repair retry receives
     that error as feedback (event `timing_check_flagged`).
+  - a no-drift failure that also fails at the base is a
+    `preexisting_host_failure`, does not block verification, and is logged by
+    `timing_check_preexisting_host_failures`. One which passes at the base is
+    a `host_regression`: verification `failed` with the ids and the final
+    approximately 40 lines of pytest output, which the retry receives.
   - `error` (pytest missing, collection error, no test collected, a crash), an
-    interruption, or flagged tests that fail on this host without drift too
-    (e.g. `pytest-asyncio` missing on the VM, or `test_public_logs_api`
-    reading the host journal) - `needs_review` with
+    interruption, or an inconclusive base run - `needs_review` with
     `timing check failed closed: ...` (event `timing_check_failed_closed`).
     The check fails closed: when it is on and gives no verdict, the change is
     never approved.
-  The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
+  Terminal `timing_check_*` events include `control_failure_tails`, keyed by
+  every test id that failed in the branch control. The test suite itself runs
+  with `NEXUS_TIMING_CHECK=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,
   run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`
   (`--drift-ms`, `--timeout` per commit, default 900 s; `--last` walks HEAD
   unless `--ref` is given, so use `--ref main` from an experiment branch). It
   prints one JSON line per commit whose `verdict` is what verification would
-  conclude (`ok`, `failed` with `drift_only`, `needs_review` with
-  `fails_without_drift`); `--out FILE` appends each line to FILE as soon as
+  conclude (`ok`, `failed`, or `needs_review`) and includes `drift_only`,
+  `preexisting_host_failures`, and `host_regressions`; `--out FILE` appends
+  each line as soon as
   it is measured. A commit whose replay crashes (unknown sha, git failure)
   gets a `needs_review` record and the replay goes on. The last stderr line
   is `{"summary": ...}`: verdict counts and `false_positives` = `failed`

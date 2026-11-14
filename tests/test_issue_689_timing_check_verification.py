@@ -124,18 +124,14 @@ class TimingCheckVerificationTests(unittest.TestCase):
         self.assertIn(HINT, result.error)
 
     def test_test_failing_without_drift_too_gives_needs_review(self) -> None:
-        # E.g. CI passed but this host lacks a test dependency: no timing verdict.
+        # The test does not exist at base, so the base comparison has no verdict.
         self._install_drift_conftest()
         _, result = self._verify(ALWAYS_FAILING_UNDER_PYTEST, "1")
         self.assertEqual(result.status, "needs_review")
-        self.assertIn("fail on this host without drift too", result.error)
-        self.assertIn("tests/test_new.py::T::test_host", result.error)
+        self.assertIn("control run without drift gave no verdict", result.error)
 
     def test_only_drift_only_tests_are_reported(self) -> None:
         self._install_drift_conftest()
-        (self.repo / "tests" / "test_host.py").write_text(
-            ALWAYS_FAILING_UNDER_PYTEST, encoding="utf-8",
-        )
         _, result = self._verify(DRIFT_SENSITIVE, "1")
         self.assertEqual(result.status, "failed")
         self.assertIn("timing_sensitive: tests/test_new.py::T::test_budget; hint:", result.error)
@@ -254,10 +250,9 @@ class ControlCheckTests(unittest.TestCase):
             self.assertEqual(
                 flagged, ["tests/test_x.py::T::test_budget", "tests/test_x.py::U::test_host"],
             )
-            self.assertEqual(
-                timing_check_module.control_check(repo, flagged),
-                (["tests/test_x.py::T::test_budget"], ["tests/test_x.py::U::test_host"]),
-            )
+            control = timing_check_module.control_check(repo, flagged)
+            self.assertEqual(control.drift_only, ["tests/test_x.py::T::test_budget"])
+            self.assertEqual(control.host_regressions, ["tests/test_x.py::U::test_host"])
 
     def test_no_verdict_from_the_control_run_is_none(self) -> None:
         with patch("modules.timing_check.run_timing_check", return_value="error"):
@@ -282,6 +277,13 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertEqual(replay.verdict("ok", None), "ok")
         self.assertEqual(replay.verdict("timing_sensitive: a", (["a"], [])), "failed")
         self.assertEqual(replay.verdict("timing_sensitive: a", ([], ["a"])), "needs_review")
+        self.assertEqual(
+            replay.verdict(
+                "timing_sensitive: a",
+                timing_check_module.ControlCheckResult([], ["a"], []),
+            ),
+            "ok",
+        )
         self.assertEqual(replay.verdict("error", None), "needs_review")
         self.assertFalse(replay.is_flagged({"verdict": "ok"}))
         self.assertTrue(replay.is_flagged({"verdict": "needs_review"}))

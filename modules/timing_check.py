@@ -6,8 +6,11 @@ import ast
 import os
 import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
@@ -106,6 +109,31 @@ def _stop(proc: subprocess.Popen[str]) -> None:
 TIMING_SENSITIVE_PREFIX = "timing_sensitive: "
 
 
+@dataclass(frozen=True)
+class TimingCheckRun:
+    """Machine verdict plus the bounded diagnostic output used to reach it."""
+
+    result: str
+    output: str = ""
+
+
+@dataclass(frozen=True)
+class ControlCheckResult:
+    """Classification of drift failures after branch and base controls."""
+
+    drift_only: list[str]
+    preexisting_host_failures: list[str]
+    host_regressions: list[str]
+    control_failure_tails: dict[str, str] = field(default_factory=dict)
+
+
+def _failure_tails(run: TimingCheckRun) -> dict[str, str]:
+    """Return a bounded pytest diagnostic for every failed test in *run*."""
+    failed = flagged_tests(run.result)
+    tail = "\n".join(run.output.splitlines()[-40:])
+    return {test: tail for test in failed}
+
+
 def flagged_tests(result: str) -> list[str]:
     """The test ids of a ``timing_sensitive: ...`` result, else []."""
     if not result.startswith(TIMING_SENSITIVE_PREFIX):
@@ -117,10 +145,11 @@ def control_check(
     repo: str | os.PathLike[str],
     flagged: Iterable[str],
     *,
+    base_commit: str | None = None,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
-) -> tuple[list[str], list[str]] | None:
-    """Rerun flagged tests without drift: ``(drift_only, fails_without_drift)``.
+) -> ControlCheckResult | None:
+    """Classify flagged tests using no-drift runs on the branch and its base.
 
     A test that also fails without drift is not shown to be timing-sensitive -
     it fails on this host anyway (a missing test dependency, host state), for
@@ -129,16 +158,58 @@ def control_check(
     """
     tests = list(flagged)
     # Drift 0 keeps the fixture installed but adds nothing, so the clocks are real.
-    control = run_timing_check(repo, tests, 0, on_process=on_process, python=python)
-    if control == "ok":
-        return tests, []
-    also_failing = set(flagged_tests(control))
+    control = run_timing_check(
+        repo, tests, 0, on_process=on_process, python=python, details=True,
+    )
+    if isinstance(control, str):  # Friendly to callers/tests mocking the legacy API.
+        control = TimingCheckRun(control)
+    if control.result == "ok":
+        return ControlCheckResult(tests, [], [], {})
+    also_failing = set(flagged_tests(control.result))
     if not also_failing:
         return None
-    return (
-        [test for test in tests if test not in also_failing],
-        [test for test in tests if test in also_failing],
-    )
+    drift_only = [test for test in tests if test not in also_failing]
+    tails = _failure_tails(control)
+    # Kept for the replay tool and direct callers that do not have a meaningful
+    # experiment base. Verification always supplies the base commit.
+    if not base_commit:
+        return ControlCheckResult(drift_only, [], [t for t in tests if t in also_failing], tails)
+
+    parent = Path(tempfile.mkdtemp(prefix="nexus-timing-base-"))
+    worktree = parent / "worktree"
+    try:
+        added = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(worktree), base_commit],
+            cwd=Path(repo), text=True, capture_output=True,
+        )
+        if added.returncode != 0:
+            return None
+        base = run_timing_check(
+            worktree, [t for t in tests if t in also_failing], 0,
+            on_process=on_process, python=python, details=True,
+        )
+        if isinstance(base, str):
+            base = TimingCheckRun(base)
+        if base.result == "ok":
+            base_failing: set[str] = set()
+        else:
+            base_failing = set(flagged_tests(base.result))
+            if not base_failing:
+                return None
+        preexisting = [test for test in tests if test in also_failing & base_failing]
+        regressions = [test for test in tests if test in also_failing - base_failing]
+        return ControlCheckResult(drift_only, preexisting, regressions, tails)
+    finally:
+        # Cleanup must also run for observer interruptions (including Ctrl-C).
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(worktree)],
+            cwd=Path(repo), text=True, capture_output=True,
+        )
+        shutil.rmtree(parent, ignore_errors=True)
+        subprocess.run(
+            ["git", "worktree", "prune"], cwd=Path(repo),
+            text=True, capture_output=True,
+        )
 
 
 def run_timing_check(
@@ -148,7 +219,8 @@ def run_timing_check(
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
-) -> str:
+    details: bool = False,
+) -> str | TimingCheckRun:
     """Run every selected test under clock drift and summarize the outcome.
 
     *python* is the interpreter for the pytest child (default: this one), so
@@ -157,11 +229,12 @@ def run_timing_check(
 
     test_list = list(tests)
     if not test_list:
-        return "ok"
+        return TimingCheckRun("ok") if details else "ok"
     env = os.environ.copy()
     env["NEXUS_TEST_CLOCK_DRIFT_MS"] = str(drift_ms)
     proc: subprocess.Popen[str] | None = None
     result = "error"
+    output = ""
     try:
         proc = subprocess.Popen(
             [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
@@ -190,4 +263,5 @@ def run_timing_check(
                 on_process(None)
             except Exception:
                 result = "error"
-    return result
+    run = TimingCheckRun(result, output or "")
+    return run if details else run.result

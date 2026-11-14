@@ -296,6 +296,7 @@ class VerificationMixin:
             elog.info(
                 "verifying", "timing_check_skipped",
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+                control_failure_tails="{}",
             )
             return None
         try:
@@ -314,6 +315,7 @@ class VerificationMixin:
                 "verifying", "timing_check_started",
                 "Rerunning the affected tests with a sped-up clock",
                 test_files=tests,
+                control_failure_tails="{}",
             )
 
             def track(process: subprocess.Popen[str] | None) -> None:
@@ -329,7 +331,7 @@ class VerificationMixin:
                 # when the same test passes here without drift.
                 control = timing_check_module.control_check(
                     worktree_path, flagged, on_process=track,
-                    python=self.test_python_executable,
+                    python=self.test_python_executable, base_commit=base_commit,
                 )
                 if control is None:
                     result = "error: control run without drift gave no verdict"
@@ -339,26 +341,53 @@ class VerificationMixin:
             result, control = f"error: {type(exc).__name__}: {str(exc)[:500]}", None
 
         if result == "ok":
-            elog.info("verifying", "timing_check_passed", "Slow-machine check passed")
+            elog.info(
+                "verifying", "timing_check_passed", "Slow-machine check passed",
+                control_failure_tails="{}",
+            )
             return None
         if control is not None:
-            drift_only, fails_without_drift = control
-            if drift_only:
+            tails = control.control_failure_tails
+            if control.host_regressions:
+                ids = ", ".join(control.host_regressions)
+                diagnostic = next(
+                    (tails[test] for test in control.host_regressions if tails.get(test)), ""
+                )
+                error = f"host_regression: {ids}"
+                if diagnostic:
+                    error += "\n" + diagnostic
+                elog.error(
+                    "verifying", "timing_check_host_regression", error,
+                    test_ids=control.host_regressions,
+                    control_failure_tails=json.dumps(tails, sort_keys=True),
+                )
+                return STATUS_FAILED, error
+            if control.drift_only:
                 error = (
-                    f"{timing_check_module.TIMING_SENSITIVE_PREFIX}{', '.join(drift_only)}"
+                    f"{timing_check_module.TIMING_SENSITIVE_PREFIX}{', '.join(control.drift_only)}"
                     f"; hint: {TIMING_CHECK_HINT}"
                 )
                 elog.error(
                     "verifying", "timing_check_flagged", error,
-                    fails_without_drift=fails_without_drift,
+                    preexisting_host_failures=control.preexisting_host_failures,
+                    control_failure_tails=json.dumps(tails, sort_keys=True),
                 )
                 return STATUS_FAILED, error
-            result = (
-                "error: these tests fail on this host without drift too, so there is "
-                "no timing verdict: " + ", ".join(fails_without_drift)
+            elog.info(
+                "verifying", "timing_check_preexisting_host_failures",
+                "Only pre-existing host failures remained; slow-machine check passed",
+                test_ids=control.preexisting_host_failures,
+                control_failure_tails=json.dumps(tails, sort_keys=True),
             )
+            return None
         error = f"timing check failed closed: {result}"
-        elog.warning("verifying", "timing_check_failed_closed", error)
+        elog.warning(
+            "verifying", "timing_check_failed_closed", error,
+            control_failure_tails=json.dumps(
+                control.control_failure_tails if control is not None else {},
+                sort_keys=True,
+            ),
+        )
         return STATUS_NEEDS_REVIEW, error
 
 
@@ -817,4 +846,3 @@ class VerificationMixin:
                     error=combined_error,
                 )
         return self.get_experiment(experiment_id)
-
