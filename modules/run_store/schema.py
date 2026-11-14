@@ -1086,6 +1086,9 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         ("file_level", "INTEGER NULL"),
         ("cold_time_limited", "INTEGER NULL"),
         ("lenient_creates", "INTEGER NOT NULL DEFAULT 0"),
+        # #685: prompt tokens the llama-server slot already held, and their share.
+        ("prefix_reuse_tokens", "INTEGER NULL"),
+        ("prefix_reuse_ratio", "REAL NULL"),
     ):
         if column not in existing:
             conn.execute(f"ALTER TABLE local_replays ADD COLUMN {column} {ddl}")
