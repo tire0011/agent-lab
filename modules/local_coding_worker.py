@@ -144,6 +144,11 @@ def _min_useful_patch_tokens() -> int:
 # Import-time default for documentation and tests; the check reads the env.
 MIN_USEFUL_PATCH_TOKENS = _min_useful_patch_tokens()
 FEEDBACK_ERROR_CHARS = 1500
+# #685: the first fit leaves this many tokens free behind the handover so a
+# correction round can append its feedback without shortening the handover.
+# Everything of round 1 before the feedback then stays byte-identical, and the
+# llama-server slot can reuse it as a cached prefix.
+FEEDBACK_RESERVE_TOKENS = 768
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
 _HANDOVER_END_MARKERS = ("\n\nVerification feedback (bounded):\n", "\n\nInstructions:\n1. ")
@@ -393,11 +398,22 @@ class PromptPlan:
     essential: str = field(default="", repr=False)
     files_text: str = field(default="", repr=False)
     handover: str = field(default="", repr=False)
+    # #685: the handover exactly as sent in round 1. Correction rounds reuse it
+    # verbatim (never refit it) so their prompt keeps round 1 as its prefix.
+    handover_kept: str = field(default="", repr=False)
     counter: "TokenCounter | None" = field(default=None, repr=False)
     # Optional renderer for plans whose stable prefix is shared with a parent
     # run while their fresh file state lives in the tail (subtasks).
     prompt_renderer: Callable[[str, str], str] | None = field(default=None, repr=False)
     stable_prefix: str = field(default="", repr=False)
+    # #685: the slot-cached tokens credited to the time budget, and the common
+    # token prefix this prompt shares with the last prompt sent on the slot.
+    cached_prefix_tokens: int = 0
+    prefix_reuse_tokens: int = 0
+
+    @property
+    def prefix_reuse_ratio(self) -> float:
+        return _reuse_ratio(self.prefix_reuse_tokens, self.prompt_tokens)
 
     def log_fields(self) -> dict[str, Any]:
         return {
@@ -411,7 +427,16 @@ class PromptPlan:
             "time_budget_exceeded": self.time_budget_exceeded,
             "cold_time_limited": self.cold_time_limited,
             "output_tokens": self.output_tokens,
+            "cached_prefix_tokens": self.cached_prefix_tokens,
+            "prefix_reuse_tokens": self.prefix_reuse_tokens,
+            "prefix_reuse_ratio": self.prefix_reuse_ratio,
         }
+
+
+def _reuse_ratio(reused: int, total: Any) -> float:
+    if not isinstance(total, (int, float)) or isinstance(total, bool) or total <= 0:
+        return 0.0
+    return round(min(1.0, max(0.0, reused / total)), 4)
 
 
 @dataclass(frozen=True)
@@ -424,8 +449,14 @@ class TimeBudget:
 
 
 def time_budget(timeout: Any, max_output_tokens: int,
-                rates: tuple[float | None, float | None]) -> TimeBudget | None:
+                rates: tuple[float | None, float | None],
+                cached_prefix_tokens: int = 0) -> TimeBudget | None:
     """The prompt/output allowance from measured rates; ``None`` without both rates.
+
+    #685: *cached_prefix_tokens* that llama-server already holds in the slot are
+    not read again, so only the rest of the prompt is charged at the prompt
+    rate: the ``prompt_tokens`` allowance grows by the cached amount. ``0``
+    (the default) is the cold budget exactly as before.
 
     The generation reservation is capped at ``MAX_GENERATION_TIME_SHARE`` of the
     time, and ``output_tokens`` is lowered to what that reservation can produce.
@@ -447,7 +478,68 @@ def time_budget(timeout: Any, max_output_tokens: int,
     # the call budget instead of silently exceeding the 80% target.
     generation_seconds = min(seconds, output_tokens / generation_rate)
     prompt_tokens = max(0, int((seconds - generation_seconds) * prompt_rate))
+    if (isinstance(cached_prefix_tokens, (int, float)) and not isinstance(cached_prefix_tokens, bool)
+            and math.isfinite(cached_prefix_tokens) and cached_prefix_tokens > 0):
+        prompt_tokens += int(cached_prefix_tokens)
     return TimeBudget(prompt_tokens=prompt_tokens, output_tokens=output_tokens, seconds=seconds)
+
+
+@dataclass(frozen=True)
+class SentPrompt:
+    """The last prompt the worker sent to llama-server, for cache-aware admission (#685)."""
+
+    slot: int | None
+    system: str
+    prompt: str
+    tokens_cached: int | None
+    completed: bool
+
+    def reusable_on(self, slot: Any, system: str) -> bool:
+        """Whether the slot plausibly still holds this prompt for a call on *slot*.
+
+        Only when the earlier call went to the same explicit ``id_slot``, ran to
+        the end, used the same system message, and the server reported
+        ``tokens_cached > 0`` (proof that it reuses prompt prefixes at all).
+        """
+        return (isinstance(self.slot, int) and not isinstance(self.slot, bool)
+                and slot == self.slot and self.completed and system == self.system
+                and isinstance(self.tokens_cached, (int, float)) and self.tokens_cached > 0)
+
+
+async def common_prefix_tokens(client: Any, count: "TokenCounter", previous: str, current: str) -> int:
+    """Length of the common token prefix of two prompts.
+
+    With the server's ``/tokenize`` token ids (``client.tokenize``) the ids are
+    compared directly. Otherwise the common text prefix, cut back to its last
+    full line, is counted with *count* minus one boundary token - an
+    under-estimate, so a cached prefix is never over-credited.
+    """
+    if not previous or not current:
+        return 0
+    tokenize = getattr(client, "tokenize", None)
+    if callable(tokenize):
+        try:
+            old, new = await tokenize(previous), await tokenize(current)
+            if isinstance(old, list) and isinstance(new, list):
+                same = 0
+                for a, b in zip(old, new):
+                    if a != b:
+                        break
+                    same += 1
+                return same
+        except Exception as exc:
+            logger.info("llama-server /tokenize ids unavailable (%s); estimating the shared prefix", exc)
+    chars = 0
+    for a, b in zip(previous, current):
+        if a != b:
+            break
+        chars += 1
+    if chars == len(previous) == len(current):
+        return max(0, await count(current))
+    cut = current.rfind("\n", 0, chars)
+    if cut <= 0:
+        return 0
+    return max(0, await count(current[:cut + 1]) - 1)
 
 
 async def _cut_to(text: str, limit: int, count: TokenCounter, marker: str = _CUT_MARKER) -> str:
@@ -503,8 +595,12 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                              counter: TokenCounter | None = None,
                              rates: tuple[float | None, float | None] = (None, None),
-                             admission: bool = True, cold: bool = True) -> PromptPlan:
-    """:func:`build_prompt` for an already split task and an already known ``n_ctx``."""
+                             admission: bool = True, cold: bool = True,
+                             cached_prefix_tokens: int = 0) -> PromptPlan:
+    """:func:`build_prompt` for an already split task and an already known ``n_ctx``.
+
+    *cached_prefix_tokens* (#685) is the part of the prompt the server's slot
+    already holds; it is not charged against the time budget."""
     count = counter or TokenCounter(client)
     # n_ctx is a hard limit; the time budget (#642) is a soft one. It cuts the
     # handover first, then the files, but never refuses the call: if even the
@@ -512,7 +608,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     # (``time_budget_exceeded``). Refusing would stop the worker from ever
     # making the call that measures a better rate - it could never recover.
     context_budget = n_ctx - max_output_tokens - margin_tokens
-    allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates)
+    allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates,
+                            cached_prefix_tokens)
     # #667 admission: a slow generation rate cannot be fixed by a smaller
     # prompt, so a call that cannot afford a useful answer is not made. The
     # Estimates are deliberately eligible here.  A zero-token TTFT stop has no
@@ -586,8 +683,12 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
             budget, exceeded = with_files, True
 
     # 3. The handover, cut from the end, re-checked on the rendered prompt.
+    # #685: it leaves FEEDBACK_RESERVE_TOKENS free, so a correction round never
+    # has to shorten it (which would change the prompt before the feedback and
+    # throw away the slot's cached prefix).
     kept = await _fit_part(
-        handover, budget, lambda h: total(_render_prompt(essential, files_text, h)), count,
+        handover, budget - FEEDBACK_RESERVE_TOKENS,
+        lambda h: total(_render_prompt(essential, files_text, h)), count,
     )
 
     prompt = _render_prompt(essential, files_text, kept)
@@ -610,8 +711,9 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         time_budget_tokens=time_budget_tokens, time_budget_limited=limited,
         time_budget_exceeded=exceeded, cold_time_limited=cold_time_limited,
         output_tokens=output_tokens,
-        essential=essential, files_text=files_text, handover=handover, counter=count,
-        stable_prefix=_render_stable_prefix(files_text),
+        essential=essential, files_text=files_text, handover=handover, handover_kept=kept,
+        counter=count, stable_prefix=_render_stable_prefix(files_text),
+        cached_prefix_tokens=max(0, int(cached_prefix_tokens or 0)) if allowance else 0,
     )
 
 
@@ -625,42 +727,51 @@ class FeedbackPrompt:
 
 
 async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int, error: str,
-                                previous_diff: str) -> FeedbackPrompt:
+                                previous_diff: str, budget: int | None = None) -> FeedbackPrompt:
     """The fitted prompt plus one bounded feedback section, within ``plan.budget_tokens``.
 
-    Priority: instructions+goal and named files exactly as fitted, then the error
-    (at most ``FEEDBACK_ERROR_CHARS``), then the previous diff cut from the end, then
-    whatever handover still fits. ``n_ctx`` is not read again.
+    Priority: instructions+goal, named files and handover exactly as sent in
+    round 1, then the error (at most ``FEEDBACK_ERROR_CHARS``), then the previous
+    diff cut from the end. ``n_ctx`` is not read again. *budget* overrides
+    ``plan.budget_tokens`` (#685: a warm slot affords more); the caller keeps it
+    within ``n_ctx``.
+
+    Layout (#685): the feedback section follows everything of round 1 except the
+    closing format line, and the handover is ``plan.handover_kept`` verbatim -
+    never refitted - so round 1's prompt up to there is always a prefix of this
+    one and llama-server can reuse it. The room for the feedback was reserved
+    by the first fit (``FEEDBACK_RESERVE_TOKENS``); if it still does not fit,
+    the diff and then the error shrink, never the handover.
     """
     count = plan.counter or TokenCounter(client)
-    budget = plan.budget_tokens
+    budget = plan.budget_tokens if budget is None else budget
     system_tokens = await count(_SYSTEM_PROMPT)
+    handover = plan.handover_kept
 
     def render(handover: str, feedback: str) -> str:
         if plan.prompt_renderer is not None:
             return plan.prompt_renderer(handover, feedback)
         return _render_prompt(plan.essential, plan.files_text, handover, feedback)
 
-    async def total(err: str, diff: str, handover: str) -> int:
+    async def total(err: str, diff: str) -> int:
         feedback = _render_feedback(round_no, err, diff) if err else ""
         return system_tokens + await count(render(handover, feedback))
 
     err = error.strip() or "unknown error"
     if len(err) > FEEDBACK_ERROR_CHARS:
         err = err[:FEEDBACK_ERROR_CHARS].rstrip() + _ERROR_CUT_MARKER
-    if await total(err, "", "") > budget:
-        err = await _fit_part(err, budget, lambda e: total(e, "", ""), count, _ERROR_CUT_MARKER)
+    if await total(err, "") > budget:
+        err = await _fit_part(err, budget, lambda e: total(e, ""), count, _ERROR_CUT_MARKER)
     diff = ""
     if err:
-        diff = await _fit_part(previous_diff, budget, lambda d: total(err, d, ""), count, _DIFF_CUT_MARKER)
-    handover = await _fit_part(plan.handover, budget, lambda h: total(err, diff, h), count)
-    tokens = await total(err, diff, handover)
-    if tokens > budget:  # counter not additive: fall back to the smallest feedback that fits
-        diff, handover = "", ""
-        tokens = await total(err, "", "")
+        diff = await _fit_part(previous_diff, budget, lambda d: total(err, d), count, _DIFF_CUT_MARKER)
+    tokens = await total(err, diff)
+    if tokens > budget:  # counter not additive: shrink the feedback, never the handover
+        diff = ""
+        tokens = await total(err, "")
         if tokens > budget:
             err = ""
-            tokens = await total("", "", "")
+            tokens = await total("", "")
     feedback = _render_feedback(round_no, err, diff) if err else ""
     return FeedbackPrompt(
         prompt=render(handover, feedback),
@@ -1468,6 +1579,11 @@ class LocalCodingWorker:
         self.sample_temperatures = tuple(sample_temperatures or DEFAULT_SAMPLE_TEMPERATURES)
         # Where candidates' throwaway copies go (default: the system temp dir).
         self.sample_tmp_root = sample_tmp_root
+        # #685: the last prompt sent on the client's slot and this run's reuse totals.
+        self._last_sent: SentPrompt | None = None
+        self._last_prefix_reuse = 0
+        self._reuse_tokens = 0
+        self._reuse_prompt_tokens = 0
         self._metrics: RunMetrics | None = None
         self._last_call: CallRecord | None = None
         self.last_run_metrics: dict[str, Any] | None = None
@@ -1486,6 +1602,9 @@ class LocalCodingWorker:
         self.last_sample_stats = []
         self.last_run_metrics = None
         self.lenient_creates = 0
+        # #685: another process may use the slot between runs; start cold.
+        self._last_sent = None
+        self._last_prefix_reuse = self._reuse_tokens = self._reuse_prompt_tokens = 0
         self._metrics = RunMetrics.start()
         # Replaced by _plan_subtasks when splitting is on and the task reaches planning.
         self.last_split = SplitOutcome(
@@ -1529,6 +1648,8 @@ class LocalCodingWorker:
             validate_worker_config(task, working_dir, sandbox)
             if self.test_first:
                 ids, content = generate_failing_tests(task, working_dir, self.client)
+                # That call used the slot without going through _model_call.
+                self._last_sent = None
                 target = _generated_test_path(ids, working_dir)
                 if ids and content and target is not None and not target.exists():
                     if _install_generated_test(target, content):
@@ -1777,11 +1898,51 @@ class LocalCodingWorker:
         # Re-read and fit exactly the files that will be sent. This preserves
         # #598 (later subtasks see earlier edits), includes files named only by
         # the subtask, and avoids duplicating a stale parent snapshot.
-        return await build_prompt_parts(
-            essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
-            n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
-            rates=self.rates.medians(), admission=True,
-        )
+        rates = self.rates.medians()
+
+        async def build(cached: int) -> PromptPlan:
+            return await build_prompt_parts(
+                essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
+                n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
+                rates=rates, admission=True, cached_prefix_tokens=cached,
+            )
+
+        return await self._warm_plan(build)
+
+    # Cache-aware admission (#685)
+
+    async def _prefix_reuse(self, system: str, prompt: str, counter: TokenCounter | None = None) -> int:
+        """Tokens of *prompt* the slot still holds from the last call; 0 when unsure."""
+        last = self._last_sent
+        if last is None or not last.reusable_on(getattr(self.client, "id_slot", None), system):
+            return 0
+        try:
+            return await common_prefix_tokens(self.client, counter or TokenCounter(self.client),
+                                              last.prompt, prompt)
+        except Exception:  # measuring must never fail the run
+            logger.debug("prefix reuse measurement failed", exc_info=True)
+            return 0
+
+    async def _warm_plan(self, build: Callable[[int], Awaitable[PromptPlan]]) -> PromptPlan:
+        """The cold plan, or a richer one the slot cache pays for.
+
+        The cold fit is measured against the last prompt on the slot; if the time
+        budget limited it, it is refitted with that prefix credited. The richer
+        prompt is kept only if its own uncached part still costs no more than the
+        cold allowance (or the cold prompt), because more file text can move the
+        point where it departs from the cached prompt forward.
+        """
+        cold = await build(0)
+        cold.prefix_reuse_tokens = await self._prefix_reuse(_SYSTEM_PROMPT, cold.prompt, cold.counter)
+        if (cold.prefix_reuse_tokens <= 0 or cold.time_budget_tokens is None
+                or not cold.time_budget_limited):
+            return cold
+        warm = await build(cold.prefix_reuse_tokens)
+        warm.prefix_reuse_tokens = await self._prefix_reuse(_SYSTEM_PROMPT, warm.prompt, warm.counter)
+        affordable = max(cold.time_budget_tokens, cold.prompt_tokens - cold.prefix_reuse_tokens)
+        if warm.prompt_tokens - warm.prefix_reuse_tokens <= affordable:
+            return warm
+        return cold
 
     # The correction loop (#597)
 
@@ -1820,13 +1981,11 @@ class LocalCodingWorker:
             stats.rounds = round_no
             prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens, **tag}
             if round_no > 1:
-                fb = asyncio.run(build_feedback_prompt(
-                    plan, self.client, round_no=round_no, error=reason, previous_diff=previous_diff,
-                ))
+                fb, credited = asyncio.run(self._feedback_prompt(plan, round_no, reason, previous_diff))
                 prompt = fb.prompt
                 extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
                          "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept,
-                         **tag}
+                         "cached_prefix_tokens": credited, **tag}
             best: tuple[CandidateCheck, int] | None = None
             best_diff = ""
             for index, (temperature, seed) in enumerate(schedule):
@@ -1839,7 +1998,11 @@ class LocalCodingWorker:
                         prompt_tokens=extra["prompt_tokens"], temperature=temperature, seed=seed,
                         **tag, **sample_fields,
                     )
+                    if index == 0:
+                        extra.update(self._reuse_fields(extra["prompt_tokens"]))
                 except Exception as exc:
+                    if index == 0:
+                        extra.update(self._reuse_fields(extra["prompt_tokens"]))
                     self._record_sample(stats, experiment_logger, phase, round_no, index, temperature, seed,
                                         None, 0.0, tag, outcome="model_timeout"
                                         if self._is_model_timeout(exc) else "model_error")
@@ -1919,6 +2082,30 @@ class LocalCodingWorker:
             generated_test_failure = run_named_tests(working_dir, self.generated_tests, timeout)
             self.local_attempt_passed_generated_tests = generated_test_failure is None
         return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
+
+    async def _feedback_prompt(self, plan: PromptPlan, round_no: int, error: str,
+                               previous_diff: str) -> tuple[FeedbackPrompt, int]:
+        """The round's feedback prompt and the cached tokens credited to its budget (#685)."""
+        fb = await build_feedback_prompt(plan, self.client, round_no=round_no, error=error,
+                                         previous_diff=previous_diff)
+        if plan.time_budget_tokens is None:
+            return fb, 0
+        reuse = await self._prefix_reuse(_SYSTEM_PROMPT, fb.prompt, plan.counter)
+        cold_allowance = plan.time_budget_tokens - plan.cached_prefix_tokens
+        context_budget = plan.n_ctx - self.max_tokens - CONTEXT_MARGIN_TOKENS
+        budget = min(context_budget, max(plan.budget_tokens, cold_allowance + reuse))
+        if reuse <= 0 or budget <= plan.budget_tokens:
+            return fb, 0
+        warm = await build_feedback_prompt(plan, self.client, round_no=round_no, error=error,
+                                           previous_diff=previous_diff, budget=budget)
+        warm_reuse = await self._prefix_reuse(_SYSTEM_PROMPT, warm.prompt, plan.counter)
+        if warm.prompt_tokens - warm_reuse <= max(cold_allowance, fb.prompt_tokens - reuse):
+            return warm, reuse
+        return fb, 0
+
+    def _reuse_fields(self, prompt_tokens: Any) -> dict[str, Any]:
+        reused = self._last_prefix_reuse
+        return {"prefix_reuse_tokens": reused, "prefix_reuse_ratio": _reuse_ratio(reused, prompt_tokens)}
 
     def _apply_real(self, patch: str, working_dir: str, timeout: float, allowed_paths: set[str] | None,
                     tests: tuple[str, ...], experiment_logger: Any | None, phase: str, round_no: int,
@@ -2011,6 +2198,9 @@ class LocalCodingWorker:
             winners=[{"index": s.winner_index, "temperature": s.winner_temperature,
                       "round": s.winner_round, "reason": s.winner_reason} for s in winners],
             success=success,
+            # #685: prompt tokens the slot already held, over all calls of the run.
+            prefix_reuse_tokens=self._reuse_tokens,
+            prefix_reuse_ratio=_reuse_ratio(self._reuse_tokens, self._reuse_prompt_tokens),
         )
         if self.last_plan is not None:
             fields.update(file_level=self.last_plan.file_level,
@@ -2045,6 +2235,16 @@ class LocalCodingWorker:
                     temperature: float = 0.0, seed: int | None = None,
                     **fields: Any) -> str:
         """Call the local model and always leave a latency/outcome event."""
+        counter = self.last_plan.counter if self.last_plan is not None else None
+        try:
+            reused = asyncio.run(self._prefix_reuse(system, prompt, counter))
+        except Exception:  # measuring must never fail the call
+            reused = 0
+        self._last_prefix_reuse = reused
+        prompt_tokens_counted = fields.get("prompt_tokens")
+        if isinstance(prompt_tokens_counted, int) and not isinstance(prompt_tokens_counted, bool):
+            self._reuse_tokens += reused
+            self._reuse_prompt_tokens += prompt_tokens_counted
         started = time.monotonic()
         if hasattr(self.client, "last_timings"):
             self.client.last_timings = None
@@ -2070,6 +2270,15 @@ class LocalCodingWorker:
         finally:
             wall_seconds = time.monotonic() - started
             timings = getattr(self.client, "last_timings", None)
+            reported_cached = timings.get("tokens_cached") if isinstance(timings, dict) else None
+            self._last_sent = SentPrompt(
+                slot=getattr(self.client, "id_slot", None)
+                if getattr(self.client, "cache_prompt", True) else None,
+                system=system, prompt=prompt,
+                tokens_cached=reported_cached if isinstance(reported_cached, (int, float))
+                and not isinstance(reported_cached, bool) else None,
+                completed=outcome == "ok",
+            )
             self._last_call = call_record(call_type, outcome, wall_seconds, timings,
                                           fields.get("prompt_tokens"), temperature=temperature, seed=seed)
             if self._metrics is not None:
@@ -2137,6 +2346,8 @@ class LocalCodingWorker:
                 prompt_tokens_cached=prompt_cached,
                 prompt_tokens_total=prompt_total,
                 prompt_cache_ratio=cache_ratio,
+                prefix_reuse_tokens=reused,
+                prefix_reuse_ratio=_reuse_ratio(reused, fields.get("prompt_tokens")),
                 **({"draft_n": self._last_call.draft_n,
                     "draft_n_accepted": self._last_call.draft_n_accepted,
                     "draft_acceptance_rate": self._last_call.draft_acceptance_rate}

@@ -270,6 +270,7 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
                samples=?, samples_requested=?, samples_passed=?, cpu_seconds=?,
                load_average=?, peak_rss_kb=?, tokens_per_second=?, metrics_json=?,
                file_level=?, cold_time_limited=?, lenient_creates=?,
+               prefix_reuse_tokens=?, prefix_reuse_ratio=?,
                claim_token=NULL, lease_expires_at=NULL
            WHERE experiment_id=? AND prompt_variant=? AND claim_token=? AND status=?""",
         (
@@ -289,6 +290,8 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
              if outcome.metrics is not None and isinstance(outcome.metrics.get("cold_time_limited"), bool)
              else None),
             int(outcome.lenient_creates),
+            _metric(outcome.metrics, "prefix_reuse_tokens"),
+            _metric(outcome.metrics, "prefix_reuse_ratio"),
             experiment_id, variant, token, STATUS_PENDING,
         ),
     ).rowcount == 1
@@ -1012,6 +1015,7 @@ _READ_COLUMNS = (
     "merged_commit, created_at, finished_at, samples, samples_requested, samples_passed, "
     "cpu_seconds, load_average, peak_rss_kb, tokens_per_second"
     ", file_level, cold_time_limited, lenient_creates"
+    ", prefix_reuse_tokens, prefix_reuse_ratio"
 )
 
 

@@ -502,8 +502,8 @@ class LlamaCppClient:
                     return value
         raise LlamaCppClientError("llama-cpp /props did not report n_ctx")
 
-    async def count_tokens(self, text: str) -> int:
-        """Token count of *text* by the server's own tokenizer (``POST /tokenize``)."""
+    async def tokenize(self, text: str) -> list[int]:
+        """Token ids of *text* by the server's own tokenizer (``POST /tokenize``)."""
         async with self._http(30.0) as client:
             resp = await client.post(f"{self.server_root}/tokenize", json={"content": text})
         if resp.status_code != 200:
@@ -511,7 +511,11 @@ class LlamaCppClient:
         tokens = resp.json().get("tokens")
         if not isinstance(tokens, list):
             raise LlamaCppClientError("llama-cpp /tokenize returned no token list")
-        return len(tokens)
+        return tokens
+
+    async def count_tokens(self, text: str) -> int:
+        """Token count of *text* by the server's own tokenizer (``POST /tokenize``)."""
+        return len(await self.tokenize(text))
 
     async def is_available(self) -> bool:
         """Return True if the llama-cpp server is reachable."""
