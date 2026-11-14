@@ -233,13 +233,18 @@ class TaskOrchestratorTests(unittest.TestCase):
         return resolve_python_interpreter(self.registry.repo_root)
 
     def _orchestrator(self, client, *, service=None, memory=None, delegation=None):
-        return NexusTaskOrchestrator(
+        orchestrator = NexusTaskOrchestrator(
             operations_registry=self.registry,
             experiment_service=service or MagicMock(),
             llama_client=client,
             memory=memory,
             delegation_service=delegation,
         )
+        # These tests inject a scripted local client. Ambient Azure credentials
+        # must not silently replace it with a network-backed controller whose
+        # latency also makes the clock-drift check environment-dependent.
+        orchestrator._azure_drives_controller = MagicMock(return_value=False)
+        return orchestrator
 
     def test_llm_can_inspect_then_resume_existing_experiment(self):
         experiment = SimpleNamespace(id="bd9720b26ec74f15a2693e5641adf141")
