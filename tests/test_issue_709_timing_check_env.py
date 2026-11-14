@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -14,6 +15,7 @@ from modules.verification_env import VERIFICATION_TEST_API_KEY
 
 
 def test_timing_check_uses_sanitized_verification_environment(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
     (tmp_path / "test_env.py").write_text(
         "import os\n"
         "def test_env():\n"

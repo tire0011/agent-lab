@@ -292,6 +292,7 @@ class VerificationMixin:
         without a verdict (a check error, a crash, an interruption) is
         ``needs_review`` - an enabled check that could not run never approves.
         """
+        timing_results: list[timing_check_module.TimingCheckResult] = []
         if not timing_check_enabled():
             elog.info(
                 "verifying", "timing_check_skipped",
@@ -321,7 +322,6 @@ class VerificationMixin:
             def track(process: subprocess.Popen[str] | None) -> None:
                 self._track_process(experiment_id, process)
 
-            timing_results: list[timing_check_module.TimingCheckResult] = []
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
             )
@@ -379,7 +379,7 @@ class VerificationMixin:
             failure_tails={
                 test_id: tail for item in timing_results
                 for test_id, tail in item.failure_tails.items()
-            } if "timing_results" in locals() else {},
+            },
         )
         return STATUS_NEEDS_REVIEW, error
 

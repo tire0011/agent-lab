@@ -106,6 +106,7 @@ def _stop(proc: subprocess.Popen[str]) -> None:
 
 
 TIMING_SENSITIVE_PREFIX = "timing_sensitive: "
+MAX_FAILURE_TAIL_LINES = 40
 
 
 class TimingCheckResult(str):
@@ -122,13 +123,13 @@ class TimingCheckResult(str):
 
 
 def _failed_test_tails(output: str, failed: Iterable[str]) -> dict[str, list[str]]:
-    """Return at most the last 40 relevant output lines for each failed node id."""
+    """Return a bounded output tail ending at each failed node id's summary."""
     lines = output.splitlines()
     tails: dict[str, list[str]] = {}
     for test_id in failed:
         occurrences = [index for index, line in enumerate(lines) if test_id in line]
         end = occurrences[-1] + 1 if occurrences else len(lines)
-        tails[test_id] = lines[max(0, end - 40):end]
+        tails[test_id] = lines[max(0, end - MAX_FAILURE_TAIL_LINES):end]
     return tails
 
 
