@@ -5,6 +5,7 @@ delegating to the split modules below.
 from __future__ import annotations
 
 from .core import (
+    DEFAULT_AGENT_ID,
     MAX_FILE_SIZE,
     MAX_RETRY,
     MAILBOX_MESSAGE_COLUMNS,
@@ -22,6 +23,7 @@ from .core import (
     _has_secret,
     _now_iso,
     _outbox_filename,
+    agent_id_from_env,
     git_add_and_commit,
     git_current_commit,
     git_dirty_entries,
@@ -29,10 +31,13 @@ from .core import (
     git_pull_ff_only,
     git_push,
     init_mailbox_db,
+    is_addressed_to,
     list_outbox_files,
     list_recent_db_messages,
     parse_front_matter,
+    peek_front_matter,
     read_inbox_preview,
+    recipients_of,
     redact,
 )
 from .processing import (
@@ -45,6 +50,7 @@ from .processing import (
 )
 
 __all__ = [
+    "DEFAULT_AGENT_ID",
     "MAX_FILE_SIZE",
     "MAX_RETRY",
     "MAILBOX_MESSAGE_COLUMNS",
@@ -74,11 +80,15 @@ __all__ = [
     "git_is_clean",
     "git_pull_ff_only",
     "git_push",
+    "agent_id_from_env",
     "init_mailbox_db",
+    "is_addressed_to",
     "list_outbox_files",
     "list_recent_db_messages",
     "parse_front_matter",
+    "peek_front_matter",
     "read_inbox_preview",
+    "recipients_of",
     "redact",
 ]
 
