@@ -148,6 +148,44 @@ run continues for as long as tests keep starting and finishing.
   ends `needs_review` with the classification in
   `baseline_test_classifications_json`; a test that passes on base, or whose
   base run shows nothing about it, is a `regression` and keeps the old outcome.
+- `NEXUS_TIMING_CHECK` (default on; only `0` turns it off, and then there is
+  no second run) - slow-machine check (#681, #689). Once the normal tests are
+  green (locally or on GitHub CI), `modules.timing_check.affected_tests` picks
+  the test files the change adds or edits plus every test file that imports a
+  changed module (changes since the experiment's base commit, uncommitted work
+  included), and `run_timing_check` reruns them with pytest under
+  `NEXUS_TEST_CLOCK_DRIFT_MS=50`: the `tests/conftest.py` fixture then moves
+  every `time.time`/`monotonic`/`perf_counter` read forward by 50 ms per call.
+  A test that by design measures real elapsed time against a fake sleeping in
+  real time requests the `real_clock` fixture (unittest classes:
+  `@pytest.mark.usefixtures("real_clock")`) and is exempt - currently the
+  `StreamingClientTests` and one early-stop test in
+  `tests/test_issue_667_llama_streaming.py`, which flagged green `main`
+  commits. Tests flagged under drift run once more without drift
+  (`control_check`), because the normal run may have been GitHub CI rather
+  than this host. Outcomes:
+  - `ok` (or no affected test) - verification continues to the quality gate.
+  - a test fails only under drift - the experiment `failed` with
+    `timing_sensitive: <test ids>; hint: inject the clock or compute the value
+    from configured values, not from wall time`; the repair retry receives
+    that error as feedback (event `timing_check_flagged`).
+  - `error` (pytest missing, collection error, no test collected, a crash), an
+    interruption, or flagged tests that fail on this host without drift too
+    (e.g. `pytest-asyncio` missing on the VM, or `test_public_logs_api`
+    reading the host journal) - `needs_review` with
+    `timing check failed closed: ...` (event `timing_check_failed_closed`).
+    The check fails closed: when it is on and gives no verdict, the change is
+    never approved.
+  The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
+  `tests/conftest.py`); tests of the check opt in. To replay merged commits,
+  run `python scripts/timing_check_replay.py <sha> ... | --last N`
+  (`--drift-ms`, `--timeout` per commit, default 900 s). It prints one JSON
+  line per commit whose `verdict` is what verification would conclude (`ok`,
+  `failed` with `drift_only`, `needs_review` with `fails_without_drift`); exit
+  0 = all ok, 1 = any other verdict, 130 = interrupted (Ctrl-C or SIGTERM;
+  the temporary worktree is removed either way). Commits older than the drift
+  fixture get it appended to their conftest for the replay; they also predate
+  today's `real_clock` exemptions. Expect ~40-150 s per commit on the VM.
 - `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the
   dedicated per-test logs and heartbeat files are written. They are kept out
   of the global Nexus feed deliberately: the feed would otherwise gain ~3800

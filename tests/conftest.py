@@ -143,3 +143,10 @@ os.environ["LOCAL_MODEL_RATES_PATH"] = str(Path(_LOG_DIR) / "local-model-rates.j
 # suite runs non-streamed unless a test opts in (``stream=True`` or
 # monkeypatch); tests/test_issue_667_llama_streaming.py checks the default.
 os.environ["LOCAL_MODEL_STREAM"] = "0"
+
+# The slow-machine check (#689) is on by default in production verification.
+# Many suite tests drive ``_verify`` against throwaway repositories, where a
+# second, real pytest run would be slow and - with no pytest-collectable test -
+# fail closed to needs_review. Tests of the check itself opt in explicitly.
+# Assigned, not setdefault: a shell that exports it must not change results.
+os.environ["NEXUS_TIMING_CHECK"] = "0"

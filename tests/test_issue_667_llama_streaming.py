@@ -17,6 +17,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 import httpx
+import pytest
 
 from modules import local_shadow_replay as lsr
 from modules.llama_cpp_client import (
@@ -115,6 +116,15 @@ def _complete(client: LlamaCppClient, max_tokens: int = 64) -> str:
     return asyncio.run(client.complete("say hello", system="sys", max_tokens=max_tokens))
 
 
+# The fake server sleeps in real time (asyncio.sleep) while the client measures
+# with the process clocks: under the slow-machine drift (#689) only one side
+# would move, so these tests opt out of it with ``real_clock`` and assert real
+# elapsed times instead. Token budgets computed from clocks stay checked:
+# WorkerTests' admission tests are not exempt.
+_REAL_TIME_FAKE_SERVER = pytest.mark.usefixtures("real_clock")
+
+
+@_REAL_TIME_FAKE_SERVER
 class StreamingClientTests(unittest.TestCase):
     def test_stream_is_on_by_default_and_env_switches_it_off(self):
         with patch.dict("os.environ", {}, clear=False) as env:
@@ -278,6 +288,7 @@ class WorkerTests(unittest.TestCase):
                             sandbox="workspace-write", experiment_logger=log)
         return worker, result, log
 
+    @_REAL_TIME_FAKE_SERVER
     def test_early_stop_stores_measured_partial_rates_not_guesses(self):
         server = FakeLlamaServer(token_delay=0.05, tokens=[f"t{i} " for i in range(200)],
                                  per_token_timings=True)

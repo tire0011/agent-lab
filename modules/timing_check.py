@@ -103,14 +103,57 @@ def _stop(proc: subprocess.Popen[str]) -> None:
         proc.wait()
 
 
+TIMING_SENSITIVE_PREFIX = "timing_sensitive: "
+
+
+def flagged_tests(result: str) -> list[str]:
+    """The test ids of a ``timing_sensitive: ...`` result, else []."""
+    if not result.startswith(TIMING_SENSITIVE_PREFIX):
+        return []
+    return [test for test in result[len(TIMING_SENSITIVE_PREFIX):].split(", ") if test]
+
+
+def control_check(
+    repo: str | os.PathLike[str],
+    flagged: Iterable[str],
+    *,
+    on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
+    python: str | None = None,
+) -> tuple[list[str], list[str]] | None:
+    """Rerun flagged tests without drift: ``(drift_only, fails_without_drift)``.
+
+    A test that also fails without drift is not shown to be timing-sensitive -
+    it fails on this host anyway (a missing test dependency, host state), for
+    instance when the normal run that passed was GitHub CI. Returns None when
+    the control run gives no verdict.
+    """
+    tests = list(flagged)
+    # Drift 0 keeps the fixture installed but adds nothing, so the clocks are real.
+    control = run_timing_check(repo, tests, 0, on_process=on_process, python=python)
+    if control == "ok":
+        return tests, []
+    also_failing = set(flagged_tests(control))
+    if not also_failing:
+        return None
+    return (
+        [test for test in tests if test not in also_failing],
+        [test for test in tests if test in also_failing],
+    )
+
+
 def run_timing_check(
     repo: str | os.PathLike[str],
     tests: Iterable[str],
     drift_ms: int | float = 50,
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
+    python: str | None = None,
 ) -> str:
-    """Run every selected test under clock drift and summarize the outcome."""
+    """Run every selected test under clock drift and summarize the outcome.
+
+    *python* is the interpreter for the pytest child (default: this one), so
+    verification can use the same interpreter as its normal test run.
+    """
 
     test_list = list(tests)
     if not test_list:
@@ -121,7 +164,7 @@ def run_timing_check(
     result = "error"
     try:
         proc = subprocess.Popen(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
+            [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
             cwd=Path(repo),
             env=env,
             stdout=subprocess.PIPE,
@@ -136,7 +179,7 @@ def run_timing_check(
             result = "ok"
         elif proc.returncode == 1:
             failed = list(dict.fromkeys(_FAILED_TEST.findall(output or "")))
-            result = f"timing_sensitive: {', '.join(failed)}" if failed else "error"
+            result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
     except Exception:  # spawning, observers, and malformed process results are check errors
         result = "error"
     finally:
