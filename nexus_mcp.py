@@ -457,6 +457,14 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="Stored local GGUF model bake-off rows (#690)", structured_output=True)
+    def local_model_bakeoffs_list(limit: int = 50) -> dict[str, Any]:
+        from modules.local_model_bakeoff import list_bakeoffs
+
+        limit = _validate_limit(limit, minimum=1, maximum=500)
+        rows = list_bakeoffs(limit, db_path=_api()._resolve_experiment_service().db_path)
+        return {"count": len(rows), "bakeoffs": rows}
+
     @mcp.tool(description="GET /planner/shadow - local/paid planner agreement", structured_output=True)
     def planner_shadow_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
