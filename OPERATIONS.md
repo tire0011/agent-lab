@@ -178,12 +178,20 @@ run continues for as long as tests keep starting and finishing.
     never approved.
   The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,
-  run `python scripts/timing_check_replay.py <sha> ... | --last N`
-  (`--drift-ms`, `--timeout` per commit, default 900 s). It prints one JSON
-  line per commit whose `verdict` is what verification would conclude (`ok`,
-  `failed` with `drift_only`, `needs_review` with `fails_without_drift`); exit
-  0 = all ok, 1 = any other verdict, 130 = interrupted (Ctrl-C or SIGTERM;
-  the temporary worktree is removed either way). Commits older than the drift
+  run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`
+  (`--drift-ms`, `--timeout` per commit, default 900 s; `--last` walks HEAD
+  unless `--ref` is given, so use `--ref main` from an experiment branch). It
+  prints one JSON line per commit whose `verdict` is what verification would
+  conclude (`ok`, `failed` with `drift_only`, `needs_review` with
+  `fails_without_drift`); `--out FILE` appends each line to FILE as soon as
+  it is measured. A commit whose replay crashes (unknown sha, git failure)
+  gets a `needs_review` record and the replay goes on. The last stderr line
+  is `{"summary": ...}`: verdict counts and `false_positives` = `failed`
+  verdicts among the commits given with `--green <sha> ...` (CI-green
+  commits; put `--green` after the commits). Exit 0 = all ok, 1 = any other
+  verdict, 130 = interrupted (Ctrl-C or SIGTERM; the temporary worktree is
+  removed and the summary is still printed). Measured results of the #689
+  replay: `docs/issue-689-timing-check-replay.md`. Commits older than the drift
   fixture get it appended to their conftest for the replay; they also predate
   today's `real_clock` exemptions. Expect ~40-150 s per commit on the VM.
 - `NEXUS_TEST_LOG_DIR` (default `<AGENT_LOG_DIR>/test-runs`) - where the

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import tempfile
@@ -167,6 +168,45 @@ class TimingCheckVerificationTests(unittest.TestCase):
             self.assertEqual(result.status, "needs_review")
             self.assertTrue(result.error.startswith("timing check failed closed: error"))
 
+    def test_interruption_or_crash_in_the_control_run_gives_needs_review(self) -> None:
+        # The first run flagged a test, then the control run without drift breaks.
+        for raised in (KeyboardInterrupt(), RuntimeError("boom")):
+            with self.subTest(raised=type(raised).__name__), \
+                    patch("modules.timing_check.run_timing_check",
+                          return_value="timing_sensitive: tests/test_new.py::T::test_ok"), \
+                    patch("modules.timing_check.control_check", side_effect=raised):
+                _, result = self._verify(PLAIN, "1")
+            self.assertEqual(result.status, "needs_review")
+            self.assertTrue(result.error.startswith("timing check failed closed: error"))
+            self.assertNotIn(HINT, result.error)
+
+    def test_control_run_without_verdict_gives_needs_review(self) -> None:
+        with patch("modules.timing_check.run_timing_check",
+                   return_value="timing_sensitive: tests/test_new.py::T::test_ok"), \
+                patch("modules.timing_check.control_check", return_value=None):
+            _, result = self._verify(PLAIN, "1")
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("control run without drift gave no verdict", result.error)
+
+    def test_crash_while_selecting_tests_gives_needs_review(self) -> None:
+        with patch("modules.timing_check.affected_tests", side_effect=OSError("disk")), \
+                patch("modules.timing_check.run_timing_check") as check:
+            _, result = self._verify(PLAIN, "1")
+        check.assert_not_called()
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("OSError: disk", result.error)
+
+    def test_running_verification_twice_gives_the_same_verdict(self) -> None:
+        self._install_drift_conftest()
+        first_id, first = self._verify(DRIFT_SENSITIVE, "1")
+        with patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1"}):
+            self.service._force_status(first_id, STATUS_VERIFYING)
+            second = self.service._verify(first_id, str(self.repo))
+        self.assertEqual((first.status, first.error), (second.status, second.error))
+        self.assertEqual(second.status, "failed")
+        # No pytest child is left tracked after either run.
+        self.assertNotIn(first_id, self.service._active_processes)
+
     def test_unset_variable_means_on(self) -> None:
         with patch("modules.timing_check.run_timing_check", return_value="ok") as check, \
                 patch.dict("os.environ"):
@@ -266,6 +306,78 @@ class ReplayScriptTests(unittest.TestCase):
                 raise KeyboardInterrupt
 
             self.assertEqual(replay.main(["a"], check_fn=interrupted), replay.EXIT_INTERRUPTED)
+
+    def _replay(self):
+        sys.path.insert(0, str(ROOT / "scripts"))
+        try:
+            import timing_check_replay as replay
+        finally:
+            sys.path.pop(0)
+        return replay
+
+    def test_a_crashing_commit_is_needs_review_and_the_rest_still_runs(self) -> None:
+        replay = self._replay()
+        seen: list[str] = []
+
+        def fake(commit, **_kwargs):
+            seen.append(commit)
+            if commit == "bad":
+                raise subprocess.CalledProcessError(128, ["git", "rev-parse"])
+            return {"commit": commit, "verdict": "ok"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.print"):
+            out = Path(tmp) / "r.jsonl"
+            code = replay.main(["a", "bad", "c", "--out", str(out)], check_fn=fake)
+            lines = [json.loads(line) for line in out.read_text().splitlines()]
+        self.assertEqual(code, replay.EXIT_FLAGGED)
+        self.assertEqual(seen, ["a", "bad", "c"])
+        self.assertEqual([r["verdict"] for r in lines], ["ok", "needs_review", "ok"])
+        self.assertIn("replay crashed: CalledProcessError", lines[1]["result"])
+
+    def test_interrupted_replay_keeps_what_it_measured(self) -> None:
+        replay = self._replay()
+
+        def fake(commit, **_kwargs):
+            if commit == "b":
+                raise KeyboardInterrupt
+            return {"commit": commit, "verdict": "ok"}
+
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.print") as printed:
+            out = Path(tmp) / "r.jsonl"
+            code = replay.main(["a", "b", "c", "--out", str(out)], check_fn=fake)
+            kept = out.read_text().splitlines()
+        self.assertEqual(code, replay.EXIT_INTERRUPTED)
+        self.assertEqual([json.loads(line)["commit"] for line in kept], ["a"])
+        summary = json.loads(printed.call_args_list[-1].args[0])["summary"]
+        self.assertTrue(summary["interrupted"])
+        self.assertEqual(summary["commits"], 1)
+
+    def test_running_the_replay_twice_appends_not_corrupts(self) -> None:
+        replay = self._replay()
+        fake = lambda commit, **_kwargs: {"commit": commit, "verdict": "ok"}  # noqa: E731
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.print"):
+            out = Path(tmp) / "r.jsonl"
+            replay.main(["a", "--out", str(out)], check_fn=fake)
+            replay.main(["a", "--out", str(out)], check_fn=fake)
+            lines = [json.loads(line) for line in out.read_text().splitlines()]
+        self.assertEqual(lines, [{"commit": "a", "verdict": "ok"}] * 2)
+
+    def test_summary_counts_false_positives_only_on_green_commits(self) -> None:
+        replay = self._replay()
+        records = [
+            {"commit": "67c002980411", "verdict": "failed"},
+            {"commit": "a8d1e692979a", "verdict": "failed"},
+            {"commit": "adf8f94cd211", "verdict": "needs_review"},
+            {"commit": "7fd3573676fd", "verdict": "ok"},
+        ]
+        summary = replay.summarize(
+            records, ["a8d1e692979ae41f3eb7f916d99c05e0c9390110", "adf8f94", "7fd3573676fd"],
+        )
+        self.assertEqual(summary["commits"], 4)
+        self.assertEqual(summary["failed"], 2)
+        self.assertEqual(summary["green_commits"], 3)
+        self.assertEqual(summary["false_positives"], 1)
+        self.assertEqual(summary["green_needs_review"], 1)
 
 
 if __name__ == "__main__":
