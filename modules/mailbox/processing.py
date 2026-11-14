@@ -206,7 +206,7 @@ def _default_issue_fetcher(repository: str, issue_number: int) -> dict[str, Any]
     try:
         data = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"GitHub issue lookup returned unparseable JSON: {exc}") from exc
+        raise RuntimeError(f"GitHub issue lookup returned unparsable JSON: {exc}") from exc
     if not isinstance(data, dict):
         raise RuntimeError("GitHub issue lookup returned an unexpected payload")
     if data.get("pull_request"):
@@ -301,7 +301,7 @@ def _process_issue_approval(
     if decision == issue_approvals.STATUS_APPROVED:
         return (
             f"Issue {repository}#{issue_number} is now **approved** for autonomous "
-            f"execution, bound to content hash `{approval.content_hash[:12]}\u2026`. "
+            f"execution, bound to content hash `{approval.content_hash[:12]}…`. "
             "If the issue is edited, the approval no longer applies and must be renewed.",
             None,
         )
@@ -551,7 +551,7 @@ def _process_operation_chain(
             request_id=request_id,
         )
     except Exception as exc:
-        return _ChainError(f"Operation chain rejected: invalid step definition \u2013 {exc}")
+        return _ChainError(f"Operation chain rejected: invalid step definition – {exc}")
 
     try:
         result = operation_chain_service.start_chain(chain_request)
