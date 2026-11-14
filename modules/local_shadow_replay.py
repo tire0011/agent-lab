@@ -118,11 +118,18 @@ def prompt_variant() -> str:
     value = " ".join(os.environ.get(ENV_VARIANT, "").split())[:_MAX_VARIANT_CHARS]
     value = value or DEFAULT_VARIANT
     from modules.local_coding_worker import local_edit_format
+    from modules.sr_grammar import sr_grammar_enabled
     # The historical unsuffixed treatment is unified diff; name the new arm so
     # reports naturally compare ``baseline+sr`` against ``baseline``.
-    if local_edit_format() == "diff" or value.endswith("+sr"):
+    if local_edit_format() == "diff":
         return value
-    return value[:_MAX_VARIANT_CHARS - len("+sr")] + "+sr"
+    # #694: rows stored as ``+sr`` were made without the SR grammar, so the
+    # grammar arm gets its own name and the two arms never share finished units.
+    grammar = sr_grammar_enabled()
+    if value.endswith("+sr+gbnf") or (value.endswith("+sr") and not grammar):
+        return value
+    suffix = "+gbnf" if value.endswith("+sr") else ("+sr+gbnf" if grammar else "+sr")
+    return value[:_MAX_VARIANT_CHARS - len(suffix)] + suffix
 
 
 def _float_env(name: str, default: float) -> float:
@@ -270,7 +277,7 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
                samples=?, samples_requested=?, samples_passed=?, cpu_seconds=?,
                load_average=?, peak_rss_kb=?, tokens_per_second=?, metrics_json=?,
                file_level=?, cold_time_limited=?, lenient_creates=?,
-               prefix_reuse_tokens=?, prefix_reuse_ratio=?,
+               prefix_reuse_tokens=?, prefix_reuse_ratio=?, sr_grammar=?,
                claim_token=NULL, lease_expires_at=NULL
            WHERE experiment_id=? AND prompt_variant=? AND claim_token=? AND status=?""",
         (
@@ -292,6 +299,9 @@ def _finalize(conn: sqlite3.Connection, experiment_id: str, variant: str, token:
             int(outcome.lenient_creates),
             _metric(outcome.metrics, "prefix_reuse_tokens"),
             _metric(outcome.metrics, "prefix_reuse_ratio"),
+            (int(outcome.metrics["sr_grammar"])
+             if outcome.metrics is not None and isinstance(outcome.metrics.get("sr_grammar"), bool)
+             else None),
             experiment_id, variant, token, STATUS_PENDING,
         ),
     ).rowcount == 1
@@ -1015,7 +1025,7 @@ _READ_COLUMNS = (
     "merged_commit, created_at, finished_at, samples, samples_requested, samples_passed, "
     "cpu_seconds, load_average, peak_rss_kb, tokens_per_second"
     ", file_level, cold_time_limited, lenient_creates"
-    ", prefix_reuse_tokens, prefix_reuse_ratio"
+    ", prefix_reuse_tokens, prefix_reuse_ratio, sr_grammar"
 )
 
 
@@ -1025,6 +1035,8 @@ def _row_dict(row: sqlite3.Row) -> dict[str, Any]:
     data["compiled"] = bool(data["compiled"])
     if data.get("cold_time_limited") is not None:
         data["cold_time_limited"] = bool(data["cold_time_limited"])
+    if data.get("sr_grammar") is not None:
+        data["sr_grammar"] = bool(data["sr_grammar"])
     data["full_pass"] = is_full_pass(data)
     return data
 

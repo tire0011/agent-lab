@@ -428,6 +428,28 @@ variant `completion_rate` (finished inside the limit), `unit_pass_rate`,
 experiment by hand: `python3 -c "from modules import local_shadow_replay as l;
 print(l.replay('<experiment id>', repo_root='.', unit='hunk'))"`.
 
+SEARCH/REPLACE grammar (#694): in SEARCH/REPLACE mode every patch call sends
+llama-server a GBNF `grammar` (`modules/sr_grammar.py`), so the 7B can only
+answer with one or more edit blocks on allowed paths: no prose, no fences, no
+missing `>>>>>>> REPLACE`, no marker lines inside a body. Allowed paths are a
+subtask's declared files, or in a one-shot run the files in the prompt, the
+`NEW FILE:` lines and the other file paths the goal names.
+`NEXUS_LOCAL_SR_GRAMMAR=0` turns it off (default on); unified-diff mode
+(`LOCAL_EDIT_FORMAT=diff`) never sends it. `local_model_call` (patch calls),
+`local_patch_round` and `local_run_metrics` carry `sr_grammar`;
+`local_replays.sr_grammar` and `local_replay_units.sr_grammar` store it, and
+the units also store `format_rounds` (rounds ending in `edit_format` /
+`no_diff`) and `generation_tokens_per_second`. The replay variant gets a
+`+gbnf` suffix (`baseline+sr+gbnf`) while the grammar is on, so the two arms
+never share finished units. `unit_variants` adds `format_round_rate`,
+`sr_grammar_units` and `generation_tokens_per_second`. To measure: run the
+fixed hunk set with `NEXUS_SHADOW_REPLAY_UNIT=hunk` once with
+`NEXUS_LOCAL_SR_GRAMMAR=0` and once with `=1` (same seed); keep the default on
+only if `format_round_rate` falls by at least half, and output tok/s does not
+fall by more than 20% unless the pass rate rises. Check a grammar by hand with
+`/opt/llama.cpp/build/bin/test-gbnf-validator <grammar.gbnf> <answer.txt>`
+(it exits 0 either way; read its "valid/invalid" line).
+
 Local model speed (#642): every local plan/patch call logs a `local_model_call`
 event (`call_type`, `outcome` ok/timeout/error, `wall_seconds`, llama-server
 `timings`, median `prompt_tokens_per_second` / `generation_tokens_per_second`).
