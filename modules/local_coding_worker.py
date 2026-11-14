@@ -144,6 +144,11 @@ def _min_useful_patch_tokens() -> int:
 # Import-time default for documentation and tests; the check reads the env.
 MIN_USEFUL_PATCH_TOKENS = _min_useful_patch_tokens()
 FEEDBACK_ERROR_CHARS = 1500
+# #685: the first fit leaves this many tokens free behind the handover so a
+# correction round can append its feedback without shortening the handover.
+# Everything of round 1 before the feedback then stays byte-identical, and the
+# llama-server slot can reuse it as a cached prefix.
+FEEDBACK_RESERVE_TOKENS = 768
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
 _HANDOVER_END_MARKERS = ("\n\nVerification feedback (bounded):\n", "\n\nInstructions:\n1. ")
@@ -393,6 +398,9 @@ class PromptPlan:
     essential: str = field(default="", repr=False)
     files_text: str = field(default="", repr=False)
     handover: str = field(default="", repr=False)
+    # #685: the handover exactly as sent in round 1. Correction rounds reuse it
+    # verbatim (never refit it) so their prompt keeps round 1 as its prefix.
+    handover_kept: str = field(default="", repr=False)
     counter: "TokenCounter | None" = field(default=None, repr=False)
     # Optional renderer for plans whose stable prefix is shared with a parent
     # run while their fresh file state lives in the tail (subtasks).
@@ -675,8 +683,12 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
             budget, exceeded = with_files, True
 
     # 3. The handover, cut from the end, re-checked on the rendered prompt.
+    # #685: it leaves FEEDBACK_RESERVE_TOKENS free, so a correction round never
+    # has to shorten it (which would change the prompt before the feedback and
+    # throw away the slot's cached prefix).
     kept = await _fit_part(
-        handover, budget, lambda h: total(_render_prompt(essential, files_text, h)), count,
+        handover, budget - FEEDBACK_RESERVE_TOKENS,
+        lambda h: total(_render_prompt(essential, files_text, h)), count,
     )
 
     prompt = _render_prompt(essential, files_text, kept)
@@ -699,8 +711,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         time_budget_tokens=time_budget_tokens, time_budget_limited=limited,
         time_budget_exceeded=exceeded, cold_time_limited=cold_time_limited,
         output_tokens=output_tokens,
-        essential=essential, files_text=files_text, handover=handover, counter=count,
-        stable_prefix=_render_stable_prefix(files_text),
+        essential=essential, files_text=files_text, handover=handover, handover_kept=kept,
+        counter=count, stable_prefix=_render_stable_prefix(files_text),
         cached_prefix_tokens=max(0, int(cached_prefix_tokens or 0)) if allowance else 0,
     )
 
@@ -718,45 +730,48 @@ async def build_feedback_prompt(plan: PromptPlan, client: Any, *, round_no: int,
                                 previous_diff: str, budget: int | None = None) -> FeedbackPrompt:
     """The fitted prompt plus one bounded feedback section, within ``plan.budget_tokens``.
 
-    Priority: instructions+goal and named files exactly as fitted, then the error
-    (at most ``FEEDBACK_ERROR_CHARS``), then the previous diff cut from the end, then
-    whatever handover still fits. ``n_ctx`` is not read again. *budget* overrides
+    Priority: instructions+goal, named files and handover exactly as sent in
+    round 1, then the error (at most ``FEEDBACK_ERROR_CHARS``), then the previous
+    diff cut from the end. ``n_ctx`` is not read again. *budget* overrides
     ``plan.budget_tokens`` (#685: a warm slot affords more); the caller keeps it
     within ``n_ctx``.
 
     Layout (#685): the feedback section follows everything of round 1 except the
-    closing format line, so round 1's prompt up to there is a prefix of this one
-    whenever the handover is kept whole, and llama-server reuses it.
+    closing format line, and the handover is ``plan.handover_kept`` verbatim -
+    never refitted - so round 1's prompt up to there is always a prefix of this
+    one and llama-server can reuse it. The room for the feedback was reserved
+    by the first fit (``FEEDBACK_RESERVE_TOKENS``); if it still does not fit,
+    the diff and then the error shrink, never the handover.
     """
     count = plan.counter or TokenCounter(client)
     budget = plan.budget_tokens if budget is None else budget
     system_tokens = await count(_SYSTEM_PROMPT)
+    handover = plan.handover_kept
 
     def render(handover: str, feedback: str) -> str:
         if plan.prompt_renderer is not None:
             return plan.prompt_renderer(handover, feedback)
         return _render_prompt(plan.essential, plan.files_text, handover, feedback)
 
-    async def total(err: str, diff: str, handover: str) -> int:
+    async def total(err: str, diff: str) -> int:
         feedback = _render_feedback(round_no, err, diff) if err else ""
         return system_tokens + await count(render(handover, feedback))
 
     err = error.strip() or "unknown error"
     if len(err) > FEEDBACK_ERROR_CHARS:
         err = err[:FEEDBACK_ERROR_CHARS].rstrip() + _ERROR_CUT_MARKER
-    if await total(err, "", "") > budget:
-        err = await _fit_part(err, budget, lambda e: total(e, "", ""), count, _ERROR_CUT_MARKER)
+    if await total(err, "") > budget:
+        err = await _fit_part(err, budget, lambda e: total(e, ""), count, _ERROR_CUT_MARKER)
     diff = ""
     if err:
-        diff = await _fit_part(previous_diff, budget, lambda d: total(err, d, ""), count, _DIFF_CUT_MARKER)
-    handover = await _fit_part(plan.handover, budget, lambda h: total(err, diff, h), count)
-    tokens = await total(err, diff, handover)
-    if tokens > budget:  # counter not additive: fall back to the smallest feedback that fits
-        diff, handover = "", ""
-        tokens = await total(err, "", "")
+        diff = await _fit_part(previous_diff, budget, lambda d: total(err, d), count, _DIFF_CUT_MARKER)
+    tokens = await total(err, diff)
+    if tokens > budget:  # counter not additive: shrink the feedback, never the handover
+        diff = ""
+        tokens = await total(err, "")
         if tokens > budget:
             err = ""
-            tokens = await total("", "", "")
+            tokens = await total("", "")
     feedback = _render_feedback(round_no, err, diff) if err else ""
     return FeedbackPrompt(
         prompt=render(handover, feedback),

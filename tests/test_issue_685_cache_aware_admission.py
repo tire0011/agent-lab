@@ -18,11 +18,15 @@ from modules.local_coding_worker import (
     _DIFF_CLOSING,
     _SR_CLOSING,
     _SYSTEM_PROMPT,
+    FEEDBACK_RESERVE_TOKENS,
     MAX_GENERATION_TIME_SHARE,
     TIME_BUDGET_FRACTION,
     LocalCodingWorker,
     SentPrompt,
+    Subtask,
     TokenCounter,
+    build_feedback_prompt,
+    build_prompt,
     build_prompt_parts,
     common_prefix_tokens,
     local_edit_format,
@@ -267,28 +271,305 @@ class WorkerRoundTests(unittest.TestCase):
             self.assertTrue(result.success, result.error)
             self.assertEqual([0, 0], [c["prefix_reuse_tokens"] for c in log.fields("local_model_call")])
 
-    def test_warm_round_2_budget_keeps_more_handover(self):
-        from modules.experiment_handover import HANDOVER_HEADING
-
+    def test_warm_round_2_budget_keeps_the_handover_and_more_previous_answer(self):
         server = _Server([])
         worker = LocalCodingWorker(client=server, max_tokens=512)
-        handover = f"{HANDOVER_HEADING}\n" + "".join(f"note {i}: earlier finding\n" for i in range(400))
-        task = "Edit value.txt\n\n" + handover
+        task = "Edit value.txt\n\n" + _handover(400)
         rates = (10.0, 10.0)
-        with patch.object(worker.rates, "medians", return_value=rates):
-            from modules.local_coding_worker import build_prompt
-            plan = asyncio.run(build_prompt(task, str(self.repo), server, max_output_tokens=512,
-                                            rates=rates, admission=False))
+        plan = asyncio.run(build_prompt(task, str(self.repo), server, max_output_tokens=512,
+                                        rates=rates, admission=False))
         self.assertTrue(plan.handover_cut)
-        cold, credited_cold = asyncio.run(worker._feedback_prompt(plan, 2, "does not apply", "x"))
+        previous = "".join(f"value.txt line {i} of a long previous answer\n" for i in range(600))
+        cold, credited_cold = asyncio.run(worker._feedback_prompt(plan, 2, "does not apply", previous))
         self.assertEqual(0, credited_cold)  # nothing sent yet: no credit
         worker._last_sent = SentPrompt(0, _SYSTEM_PROMPT, plan.prompt, 50, True)
-        warm, credited = asyncio.run(worker._feedback_prompt(plan, 2, "does not apply", "x"))
+        warm, credited = asyncio.run(worker._feedback_prompt(plan, 2, "does not apply", previous))
         self.assertGreater(credited, 0)
-        self.assertGreater(warm.handover_tokens_kept, cold.handover_tokens_kept)
+        shared = _shared(plan.prompt)
+        # The warm budget never buys more handover: that would move the point
+        # where round 2 departs from round 1 and lose the cached prefix.
+        for fb in (cold, warm):
+            self.assertTrue(fb.prompt.startswith(shared))
+            self.assertEqual(plan.handover_tokens_kept, fb.handover_tokens_kept)
+        self.assertTrue(cold.diff_cut)
+        self.assertGreater(len(warm.prompt), len(cold.prompt))  # more of the previous answer
         self.assertGreater(warm.prompt_tokens, plan.budget_tokens)
         context_budget = plan.n_ctx - 512 - 256
         self.assertLessEqual(warm.prompt_tokens, context_budget)
+
+
+def _handover(lines: int, label: str = "note") -> str:
+    from modules.experiment_handover import HANDOVER_HEADING
+
+    return f"{HANDOVER_HEADING}\nFIRST-FINDING\n" + "".join(
+        f"{label} {i}: an earlier finding about the code\n" for i in range(lines))
+
+
+def _shared(round_1_prompt: str) -> str:
+    """Round 1's prompt up to where a correction round inserts its feedback."""
+    assert round_1_prompt.endswith(_closing())
+    return round_1_prompt[:-len(_closing())]
+
+
+class _NonAdditiveCounter:
+    """Counts like the server but charges every feedback section heavily.
+
+    Models a tokenizer/counter whose parts do not add up, so the feedback that
+    ``_fit_part`` sized still overflows and the last-resort fallback runs.
+    """
+
+    source = "tokenize"
+
+    def __init__(self, server: _Server) -> None:
+        self.server = server
+
+    async def __call__(self, text: str) -> int:
+        tokens = await self.server.count_tokens(text)
+        return tokens + (100_000 if "Correction (round" in text else 0)
+
+
+class HandoverPrefixTests(unittest.TestCase):
+    """#685 review blocker: a round must never refit the handover before its feedback."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for args in (("init", "-q"), ("config", "user.email", "t@example.com"), ("config", "user.name", "T")):
+            subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "value.txt").write_text("original\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True, capture_output=True)
+
+    def _run(self, server: _Server, task: str, rates=(None, None), **worker_kw):
+        log = _Logger()
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.root / "rates.json",
+                                   **worker_kw)
+        with patch.object(worker.rates, "medians", return_value=rates):
+            result = worker.run(task=task, working_dir=str(self.repo), sandbox="workspace-write",
+                                experiment_logger=log)
+        return worker, result, log
+
+    def _assert_rounds_share_round_1(self, server: _Server, plan) -> None:
+        first = server.calls[0]["prompt"]
+        shared = _shared(first)
+        self.assertIn(plan.handover_kept, first)
+        for later in server.calls[1:]:
+            self.assertTrue(later["prompt"].startswith(shared))
+            self.assertTrue(later["prompt"][len(shared):].startswith("Correction (round "))
+
+    def test_handover_cut_by_n_ctx_is_resent_verbatim_in_rounds_2_and_3(self):
+        bad, good = _answers()
+        # A long error each round: the old code took the room for it out of the handover.
+        huge_bad = bad + "".join(f"junk line {i} {'x' * 50}\n" for i in range(300))
+        server = _Server([huge_bad, huge_bad, good], n_ctx=4096)
+        worker, result, log = self._run(server, "Edit value.txt\n\n" + _handover(3000))
+        self.assertTrue(result.success, result.error)
+        plan = worker.last_plan
+        self.assertTrue(plan.handover_cut)
+        self.assertGreater(plan.handover_tokens_kept, 0)
+        self.assertEqual(3, len(server.calls))
+        self._assert_rounds_share_round_1(server, plan)
+        rounds = log.fields("local_patch_round")
+        self.assertEqual([plan.handover_tokens_kept] * 2, [r["handover_tokens_kept"] for r in rounds[1:]])
+        context_budget = 4096 - 1024 - 256
+        for call in server.calls:
+            self.assertLessEqual(asyncio.run(server.count_tokens(_SYSTEM_PROMPT))
+                                 + asyncio.run(server.count_tokens(call["prompt"])), context_budget)
+
+    def test_handover_cut_by_the_time_budget_is_resent_verbatim(self):
+        server = _Server(list(_answers()))
+        worker, result, _log = self._run(server, "Edit value.txt\n\n" + _handover(800), rates=(20.0, 20.0))
+        self.assertTrue(result.success, result.error)
+        self.assertTrue(worker.last_plan.handover_cut)
+        self.assertTrue(worker.last_plan.time_budget_limited)
+        self._assert_rounds_share_round_1(server, worker.last_plan)
+
+    def test_both_edit_formats(self):
+        for fmt in ("diff", "search_replace"):
+            with self.subTest(fmt=fmt), patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": fmt}):
+                subprocess.run(["git", "checkout", "--", "value.txt"], cwd=self.repo, check=True)
+                server = _Server(list(_answers()), n_ctx=4096)
+                worker, result, _log = self._run(server, "Edit value.txt\n\n" + _handover(3000))
+                self.assertTrue(result.success, result.error)
+                self._assert_rounds_share_round_1(server, worker.last_plan)
+
+    def test_first_fit_reserves_room_for_the_feedback(self):
+        server = _Server([], n_ctx=4096)
+        plan = asyncio.run(build_prompt("Edit value.txt\n\n" + _handover(3000), str(self.repo), server,
+                                        max_output_tokens=1024, admission=False))
+        self.assertTrue(plan.handover_cut)
+        self.assertLessEqual(plan.prompt_tokens, plan.budget_tokens - FEEDBACK_RESERVE_TOKENS)
+        # A handover that fits with the reserve to spare is not cut at all.
+        small = asyncio.run(build_prompt("Edit value.txt\n\n" + _handover(5), str(self.repo), server,
+                                         max_output_tokens=1024, admission=False))
+        self.assertFalse(small.handover_cut)
+        self.assertEqual(small.handover, small.handover_kept)
+
+    def test_fallback_shrinks_feedback_never_the_handover(self):
+        server = _Server([], n_ctx=4096)
+        plan = asyncio.run(build_prompt("Edit value.txt\n\n" + _handover(3000), str(self.repo), server,
+                                        max_output_tokens=1024, admission=False))
+        plan.counter = _NonAdditiveCounter(server)
+        fb = asyncio.run(build_feedback_prompt(plan, server, round_no=2, error="does not apply",
+                                               previous_diff="a previous answer\n"))
+        # Nothing of the feedback fits, so round 2 is round 1 again - never a
+        # prompt with a shorter handover.
+        self.assertEqual(plan.prompt, fb.prompt)
+        self.assertEqual(0, fb.error_chars)
+        self.assertEqual(plan.handover_tokens_kept, fb.handover_tokens_kept)
+
+    def test_feedback_prompt_is_deterministic_when_built_twice(self):
+        server = _Server([], n_ctx=4096)
+        plan = asyncio.run(build_prompt("Edit value.txt\n\n" + _handover(3000), str(self.repo), server,
+                                        max_output_tokens=1024, admission=False))
+        kw = dict(round_no=2, error="does not apply", previous_diff="x\n" * 2000)
+        first = asyncio.run(build_feedback_prompt(plan, server, **kw))
+        again = asyncio.run(build_feedback_prompt(plan, server, **kw))
+        self.assertEqual(first, again)
+        # Building it must not mutate the plan a later round depends on.
+        self.assertEqual(plan.prompt, asyncio.run(build_prompt(
+            "Edit value.txt\n\n" + _handover(3000), str(self.repo), server,
+            max_output_tokens=1024, admission=False)).prompt)
+
+    def test_subtask_context_is_resent_verbatim(self):
+        server = _Server([], n_ctx=4096)
+        worker = LocalCodingWorker(client=server, max_tokens=1024)
+        parent = asyncio.run(build_prompt("Edit value.txt", str(self.repo), server,
+                                          max_output_tokens=1024, admission=False))
+        earlier = ["".join(f"+earlier change {i} {'y' * 40}\n" for i in range(800))]
+        sub = asyncio.run(worker._subtask_plan(parent, Subtask("edit it", ("value.txt",)), 2, 2,
+                                               earlier, str(self.repo)))
+        self.assertTrue(sub.handover_cut)
+        fb = asyncio.run(build_feedback_prompt(sub, server, round_no=2, error="does not apply\n" * 80,
+                                               previous_diff="z\n" * 3000))
+        self.assertTrue(fb.prompt.startswith(_shared(sub.prompt)))
+        self.assertGreater(fb.error_chars, 0)
+
+
+class ResilienceTests(unittest.TestCase):
+    """Interrupted, crashed, half-measured and repeated steps never over-credit the cache."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        for args in (("init", "-q"), ("config", "user.email", "t@example.com"), ("config", "user.name", "T")):
+            subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True)
+        (self.repo / "value.txt").write_text("original\n")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-qm", "base"], cwd=self.repo, check=True, capture_output=True)
+
+    def _run(self, worker: LocalCodingWorker, rates=(None, None)):
+        log = _Logger()
+        subprocess.run(["git", "checkout", "--", "value.txt"], cwd=self.repo, check=True)
+        with patch.object(worker.rates, "medians", return_value=rates):
+            result = worker.run(task="Edit value.txt", working_dir=str(self.repo),
+                                sandbox="workspace-write", experiment_logger=log)
+        return result, log
+
+    def test_failed_call_is_never_credited_to_the_next_one(self):
+        class Crashing(_Server):
+            async def complete(self, prompt, **kw):
+                await super().complete(prompt, **kw)
+                raise RuntimeError("server crashed mid-generation")
+
+        server = Crashing([])
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.root / "rates.json")
+        result, _log = self._run(worker)
+        self.assertFalse(result.success)
+        self.assertIsNotNone(worker._last_sent)
+        self.assertFalse(worker._last_sent.completed)
+        self.assertEqual(0, asyncio.run(worker._prefix_reuse(_SYSTEM_PROMPT, server.calls[0]["prompt"])))
+
+    def test_timeout_mid_call_records_no_reuse_and_next_run_starts_cold(self):
+        import httpx
+
+        class TimesOut(_Server):
+            fail = True
+
+            async def complete(self, prompt, **kw):
+                text = await super().complete(prompt, **kw)
+                if self.fail:
+                    self.last_timings = None  # interrupted: the server reported nothing
+                    raise httpx.ReadTimeout("timed out")
+                return text
+
+        server = TimesOut(list(_answers()))
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.root / "rates.json")
+        result, log = self._run(worker)
+        self.assertFalse(result.success)
+        self.assertFalse(worker._last_sent.completed)
+        server.fail = False
+        server.calls.clear()
+        server.responses = list(_answers())
+        result, log = self._run(worker)
+        self.assertTrue(result.success, result.error)
+        calls = log.fields("local_model_call")
+        self.assertEqual(0, calls[0]["prefix_reuse_tokens"])  # nothing credited after the timeout
+        self.assertGreater(calls[1]["prefix_reuse_tokens"], 0)
+
+    def test_tokenize_crash_halfway_falls_back_without_failing_the_run(self):
+        class FlakyTokenize(_Server):
+            calls_to_tokenize = 0
+
+            async def tokenize(self, text):
+                FlakyTokenize.calls_to_tokenize += 1
+                if FlakyTokenize.calls_to_tokenize > 1:  # the second of the pair fails
+                    raise RuntimeError("/tokenize went away")
+                return await super().tokenize(text)
+
+            async def count_tokens(self, text):
+                return len(await _Server.tokenize(self, text))
+
+        server = FlakyTokenize(list(_answers()))
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.root / "rates.json")
+        result, log = self._run(worker)
+        self.assertTrue(result.success, result.error)
+        calls = log.fields("local_model_call")
+        # The estimate under-counts, it never claims more than the real prefix.
+        real = asyncio.run(_Server([]).count_tokens(_shared(server.calls[0]["prompt"])))
+        self.assertLessEqual(calls[1]["prefix_reuse_tokens"], real + 1)
+        self.assertGreaterEqual(calls[1]["prefix_reuse_tokens"], 0)
+
+    def test_measuring_errors_give_zero_not_a_failure(self):
+        worker = LocalCodingWorker(client=_Server([]))
+        worker._last_sent = SentPrompt(0, _SYSTEM_PROMPT, "abc\n" * 100, 5, True)
+
+        async def broken(_text):
+            raise RuntimeError("counter crashed")
+
+        with patch("modules.local_coding_worker.common_prefix_tokens", side_effect=RuntimeError("boom")):
+            self.assertEqual(0, asyncio.run(worker._prefix_reuse(_SYSTEM_PROMPT, "abc\n" * 100)))
+        self.assertEqual(0, asyncio.run(common_prefix_tokens(object(), broken, "", "x")))
+
+    def test_running_twice_starts_cold_and_does_not_accumulate(self):
+        server = _Server(list(_answers()))
+        worker = LocalCodingWorker(client=server, max_tokens=1024, rates_path=self.root / "rates.json")
+        _result, first_log = self._run(worker)
+        server.calls.clear()
+        server.responses = list(_answers())
+        _result, second_log = self._run(worker)
+        first, = first_log.fields("local_run_metrics")
+        second, = second_log.fields("local_run_metrics")
+        # Another process may have used the slot between runs: no credit for the first call.
+        self.assertEqual(0, second_log.fields("local_model_call")[0]["prefix_reuse_tokens"])
+        self.assertEqual(first["prefix_reuse_tokens"], second["prefix_reuse_tokens"])
+        self.assertEqual(first["prefix_reuse_ratio"], second["prefix_reuse_ratio"])
+
+    def test_schema_migration_runs_twice(self):
+        db = str(self.root / "agent.db")
+        init_db(db).close()
+        init_db(db).close()
+        conn = sqlite3.connect(db)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(local_replays)")]
+        conn.close()
+        self.assertEqual(1, columns.count("prefix_reuse_tokens"))
+        self.assertEqual(1, columns.count("prefix_reuse_ratio"))
 
 
 class ReplayRecordTests(unittest.TestCase):

@@ -214,8 +214,10 @@ class Issue597CorrectionLoopTests(unittest.TestCase):
         self.assertTrue(rounds[1]["feedback_diff_cut"])
         self.assertLessEqual(rounds[1]["feedback_error_chars"], FEEDBACK_ERROR_CHARS + 20)
         self.assertLessEqual(rounds[1]["prompt_tokens"], worker.last_plan.budget_tokens)
-        # Room for the feedback came out of the handover.
-        self.assertLess(rounds[1]["handover_tokens_kept"], worker.last_plan.handover_tokens_kept)
+        # #685: room for the feedback was reserved by the first fit; the handover
+        # of round 1 is resent verbatim so the slot's cached prefix stays valid.
+        self.assertEqual(rounds[1]["handover_tokens_kept"], worker.last_plan.handover_tokens_kept)
+        self.assertIn(worker.last_plan.handover_kept, second)
 
     def test_failed_rollback_stops_without_another_round(self):
         from unittest import mock
