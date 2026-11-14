@@ -461,3 +461,60 @@ class MailboxLock:
 
     def __exit__(self, *_: Any) -> None:
         self.release()
+
+
+DEFAULT_AGENT_ID = "nexus"
+
+
+def recipients_of(meta: dict[str, str]) -> frozenset[str] | None:
+    """Recipient set of a message's front matter.
+
+    ``None`` means "legacy message without ``to``" - implicitly addressed to
+    ``DEFAULT_AGENT_ID`` only. An empty frozenset means a malformed/empty
+    ``to`` value, which matches nobody. Otherwise the lowercased recipient
+    tokens (comma-separated list supported).
+    """
+    if "to" not in meta:
+        return None
+    raw = meta["to"].strip()
+    if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+        raw = raw[1:-1].strip()
+    if not raw:
+        return frozenset()
+    return frozenset(token.strip().lower() for token in raw.split(",") if token.strip())
+
+
+def is_addressed_to(agent_id: str, meta: dict[str, str]) -> bool:
+    """True if a processor with ``agent_id`` must handle a message with ``meta``."""
+    recipients = recipients_of(meta)
+    if recipients is None:
+        return agent_id.strip().lower() == DEFAULT_AGENT_ID
+    return agent_id.strip().lower() in recipients
+
+
+def peek_front_matter(file_path: Path) -> dict[str, str] | None:
+    """Front matter of an inbox file without full validation.
+
+    Returns None when the file is unreadable or unparseable; callers that need
+    a routing decision then fall back to legacy handling (the file is left to
+    the normal validation path) instead of guessing a recipient.
+    """
+    try:
+        if file_path.is_symlink() or not file_path.is_file():
+            return None
+        raw = file_path.read_bytes()
+        if _is_binary(raw):
+            return None
+        meta, _ = parse_front_matter(raw.decode("utf-8", errors="replace"))
+        return meta
+    except (OSError, ValueError, UnicodeDecodeError):
+        return None
+
+
+def agent_id_from_env() -> str:
+    """Local receiver id of this mailbox processor (default ``nexus``)."""
+    for name in ("NEXUS_MAILBOX_AGENT_ID", "MAILBOX_AGENT_ID"):
+        value = os.environ.get(name)
+        if value and value.strip():
+            return value.strip()
+    return DEFAULT_AGENT_ID
