@@ -7,7 +7,6 @@ import argparse
 import asyncio
 import json
 import re
-import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -22,7 +21,12 @@ if str(ROOT) not in sys.path:
 
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_file_localizer import localize
-from modules.run_store import DEFAULT_DB_PATH, init_db
+from modules.run_store import (
+    DEFAULT_DB_PATH,
+    init_db,
+    list_local_localizations,
+    upsert_local_localization,
+)
 
 _ISSUE_RE = re.compile(r"#(\d+)")
 
@@ -40,20 +44,11 @@ def store_localization(*, commit_sha: str, issue_number: int | None, predicted: 
     recall, precision = metrics(predicted, actual)
     conn = init_db(db_path)
     try:
-        conn.execute(
-            """INSERT INTO local_localizations
-               (created_at, commit_sha, issue_number, predicted_json, actual_json,
-                recall_at_5, precision_at_5, seconds)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(commit_sha) DO UPDATE SET
-                 created_at=excluded.created_at, issue_number=excluded.issue_number,
-                 predicted_json=excluded.predicted_json, actual_json=excluded.actual_json,
-                 recall_at_5=excluded.recall_at_5, precision_at_5=excluded.precision_at_5,
-                 seconds=excluded.seconds""",
-            (datetime.now(timezone.utc).isoformat(), commit_sha, issue_number,
-             json.dumps(predicted), json.dumps(actual), recall, precision, seconds),
+        upsert_local_localization(
+            conn, created_at=datetime.now(timezone.utc).isoformat(), commit_sha=commit_sha,
+            issue_number=issue_number, predicted=predicted, actual=actual,
+            recall_at_5=recall, precision_at_5=precision, seconds=seconds,
         )
-        conn.commit()
     finally:
         conn.close()
     return {"commit_sha": commit_sha, "issue_number": issue_number, "predicted": predicted,
@@ -63,16 +58,8 @@ def store_localization(*, commit_sha: str, issue_number: int | None, predicted: 
 
 def list_localizations(limit: int = 20, *, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, Any]]:
     conn = init_db(db_path)
-    conn.row_factory = sqlite3.Row
     try:
-        rows = conn.execute(
-            "SELECT * FROM local_localizations ORDER BY created_at DESC, id DESC LIMIT ?", (limit,)
-        ).fetchall()
-        result = [dict(row) for row in rows]
-        for row in result:
-            row["predicted"] = json.loads(row.pop("predicted_json"))
-            row["actual"] = json.loads(row.pop("actual_json"))
-        return result
+        return list_local_localizations(conn, limit)
     finally:
         conn.close()
 

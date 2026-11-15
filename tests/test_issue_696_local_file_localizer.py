@@ -5,6 +5,7 @@ import subprocess
 from pathlib import Path
 
 from modules.local_file_localizer import add_likely_files, localize, repo_map
+from modules.local_coding_worker import split_handover, _named_files
 from scripts.localization_replay import list_localizations, replay_commit
 
 
@@ -40,6 +41,19 @@ def test_flag_off_is_noop(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("NEXUS_LOCAL_LOCALIZE", raising=False)
     client = FakeLlama('{"paths":["a.py"]}')
     assert add_likely_files("unchanged", tmp_path, client) == "unchanged"
+    assert client.calls == []
+
+
+def test_existing_hint_is_reused_and_selects_first_round_files(monkeypatch, tmp_path: Path):
+    (tmp_path / "target.py").write_text("value = 1\n")
+    monkeypatch.setenv("NEXUS_LOCAL_LOCALIZE", "1")
+    task = "Fix it\n\nWhat Nexus already found (handover):\nnotes\n\nLikely files: target.py"
+    client = FakeLlama('{"paths":["other.py"]}')
+    assert add_likely_files(task, tmp_path, client) == task
+    essential, handover = split_handover(task)
+    assert "Likely files: target.py" in essential
+    assert handover.endswith("notes")
+    assert [path for path, _ in _named_files(essential, str(tmp_path))] == ["target.py"]
     assert client.calls == []
 
 

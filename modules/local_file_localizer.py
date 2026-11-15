@@ -17,6 +17,7 @@ DEFAULT_PROMPT_RATE = 7.0
 DEFAULT_OUTPUT_RATE = 2.6
 _FALSE = {"", "0", "false", "no", "off"}
 _SKIP_PARTS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+LIKELY_FILES_HEADING = "Likely files:"
 
 
 def enabled() -> bool:
@@ -43,7 +44,8 @@ def repo_map(repo: str | Path, *, token_budget: int) -> str:
     remaining = max(0, token_budget) * 4  # conservative, tokenizer-free estimate
     lines: list[str] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or any(part in _SKIP_PARTS for part in path.relative_to(root).parts):
+        if (not path.is_file() or path.is_symlink()
+                or any(part in _SKIP_PARTS for part in path.relative_to(root).parts)):
             continue
         rel = path.relative_to(root).as_posix()
         line = rel
@@ -109,10 +111,13 @@ async def localize(issue_text: str, repo: str | Path, client: Any, k: int = 5) -
 
 def add_likely_files(task: str, repo: str | Path, client: Any) -> str:
     """Flag-gated synchronous boundary used by coding workers/handovers."""
-    if not enabled():
+    # The launcher adds the hint for every coder.  A local worker sees that
+    # same goal later and must reuse it, rather than spending a second local
+    # call on the identical localization request.
+    if not enabled() or f"\n{LIKELY_FILES_HEADING}" in task:
         return task
     try:
         paths = asyncio.run(localize(task, repo, client))
     except RuntimeError:
         return task
-    return task if not paths else task + "\n\nLikely files: " + ", ".join(paths)
+    return task if not paths else task + f"\n\n{LIKELY_FILES_HEADING} " + ", ".join(paths)

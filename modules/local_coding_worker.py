@@ -151,7 +151,13 @@ FEEDBACK_ERROR_CHARS = 1500
 FEEDBACK_RESERVE_TOKENS = 768
 # Where the handover ends inside the experiment prompt templates
 # (modules/experiment_service/prompts.py).
-_HANDOVER_END_MARKERS = ("\n\nVerification feedback (bounded):\n", "\n\nInstructions:\n1. ")
+_HANDOVER_END_MARKERS = (
+    "\n\nVerification feedback (bounded):\n",
+    "\n\nInstructions:\n1. ",
+    # #696: localization is appended after the handover.  Treat it as
+    # essential so _named_files() uses the predictions for round-one excerpts.
+    "\n\nLikely files:",
+)
 # Excerpt levels for named files, from whole file to the essential minimum:
 # (lines of context around each relevant line, head lines when none matches).
 _FILE_LEVELS: tuple[tuple[int | None, int], ...] = ((None, 0), (40, 120), (15, 60), (5, 25))
