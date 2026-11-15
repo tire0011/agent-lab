@@ -259,6 +259,7 @@ class OperationsRegistry:
             "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
             "local_replays_list": OperationSpec("local_replays_list", "Lokale Shadow-Replays gemergter Experimente mit lokaler Test-Passrate je Prompt-Variante.", [limit10], ["local", "replay", "benchmark", "pass rate", "variant", "local model"], mutates_state=False),
             "local_model_bakeoffs_list": OperationSpec("local_model_bakeoffs_list", "Ergebnisse der lokalen GGUF-Modell-Bake-offs mit Geschwindigkeit und Hunk-Passrate.", [limit10], ["local", "model", "bakeoff", "gguf", "winner", "benchmark"], mutates_state=False),
+            "local_localizations_list": OperationSpec("local_localizations_list", "Lokale Dateilokalisierungs-Replays.", [limit10], ["local", "localization", "files", "recall", "precision"], mutates_state=False),
             "git_log": OperationSpec("git_log", "Kurze Git-Historie des Haupt-Repositories.", [limit10], ["git", "commits", "history", "repository"], mutates_state=False),
             "git_status": OperationSpec("git_status", "Git-Status des Haupt-Repositories.", tags=["git", "status", "repository", "changes", "local changes", "working tree"], mutates_state=False),
             "git_worktrees": OperationSpec("git_worktrees", "Liste der registrierten Git-Worktrees.", tags=["git", "worktree", "repository", "checkout"], mutates_state=False),
@@ -806,6 +807,19 @@ class OperationsRegistry:
             )
         return OperationResult("local_model_bakeoffs_list", True,
                                lines or ["(no local model bake-offs stored)"], 0)
+
+    def _op_local_localizations_list(self, args: dict[str, Any]) -> OperationResult:
+        from scripts.localization_replay import list_localizations
+
+        limit = self._limit(args, default=20, maximum=500)
+        lines = [
+            f"localization {row['commit_sha'][:12]} issue #{row['issue_number'] or '-'}: "
+            f"recall@5 {row['recall_at_5']:.0%}, precision@5 {row['precision_at_5']:.0%}, "
+            f"{row['seconds']:.1f}s; {', '.join(row['predicted']) or '(none)'}"
+            for row in list_localizations(limit, db_path=self.db_path)
+        ]
+        return OperationResult("local_localizations_list", True,
+                               lines or ["(no local localizations stored)"], 0)
 
     def _op_branch_drift(self, args: dict[str, Any]) -> OperationResult:
         experiment = self._experiment(args)

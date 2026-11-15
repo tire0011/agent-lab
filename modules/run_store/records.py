@@ -1,5 +1,60 @@
+import json
 import sqlite3
 from typing import Any
+
+
+def upsert_local_localization(
+    conn: sqlite3.Connection,
+    *,
+    created_at: str,
+    commit_sha: str,
+    issue_number: int | None,
+    predicted: list[str],
+    actual: list[str],
+    recall_at_5: float,
+    precision_at_5: float,
+    seconds: float,
+) -> None:
+    """Persist one #696 replay result, replacing a prior run for the commit."""
+    conn.execute(
+        """INSERT INTO local_localizations
+           (created_at, commit_sha, issue_number, predicted_json, actual_json,
+            recall_at_5, precision_at_5, seconds)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(commit_sha) DO UPDATE SET
+             created_at=excluded.created_at, issue_number=excluded.issue_number,
+             predicted_json=excluded.predicted_json, actual_json=excluded.actual_json,
+             recall_at_5=excluded.recall_at_5, precision_at_5=excluded.precision_at_5,
+             seconds=excluded.seconds""",
+        (created_at, commit_sha, issue_number, json.dumps(predicted), json.dumps(actual),
+         recall_at_5, precision_at_5, seconds),
+    )
+    conn.commit()
+
+
+def list_local_localizations(conn: sqlite3.Connection, limit: int = 20) -> list[dict[str, Any]]:
+    """Read recent #696 localization replay results, newest first."""
+    rows = conn.execute(
+        """SELECT id, created_at, commit_sha, issue_number, predicted_json, actual_json,
+                  recall_at_5, precision_at_5, seconds
+           FROM local_localizations ORDER BY created_at DESC, id DESC LIMIT ?""",
+        (max(0, int(limit)),),
+    ).fetchall()
+
+    def paths(raw: Any) -> list[str]:
+        try:
+            value = json.loads(raw)
+        except (TypeError, ValueError):
+            return []
+        return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+    return [
+        {"id": row[0], "created_at": row[1], "commit_sha": row[2],
+         "issue_number": row[3], "predicted": paths(row[4]),
+         "actual": paths(row[5]), "recall_at_5": row[6],
+         "precision_at_5": row[7], "seconds": row[8]}
+        for row in rows
+    ]
 
 
 def get_applicable_price(
@@ -242,5 +297,3 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str, *, updated_at: s
         (key, value, updated_at),
     )
     conn.commit()
-
-

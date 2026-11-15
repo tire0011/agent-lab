@@ -18,7 +18,9 @@ from .records import (
     insert_run,
     insert_tool_calls,
     list_activity,
+    list_local_localizations,
     set_setting,
+    upsert_local_localization,
 )
 
 DEFAULT_DB_PATH = os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db")
@@ -64,5 +66,7 @@ __all__ = [
     "insert_run",
     "insert_tool_calls",
     "list_activity",
+    "list_local_localizations",
     "set_setting",
+    "upsert_local_localization",
 ]
