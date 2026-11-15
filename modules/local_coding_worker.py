@@ -93,6 +93,7 @@ from modules.local_edit_format import EditDiff, EditFormatError, edits_to_diff
 from modules.local_model_rates import LocalModelRates, rates_from_timings
 from modules.local_run_metrics import CallRecord, RunMetrics, call_record, summary_line
 from modules.local_test_first import generate_failing_tests
+from modules.sr_grammar import build_sr_grammar, sr_grammar_enabled, usable_path
 
 logger = logging.getLogger(__name__)
 
@@ -901,6 +902,39 @@ def local_edit_format() -> str:
     return "diff" if configured == "diff" else "search_replace"
 
 
+_NEW_FILE_RE = re.compile(r"(?m)^NEW FILE:\s*(\S+)")
+MAX_GRAMMAR_PATHS = 64
+
+
+def sr_grammar_paths(plan: PromptPlan, working_dir: str,
+                     allowed_paths: set[str] | None = None) -> list[str]:
+    """Return the bounded repository paths a generated SR answer may edit."""
+    if allowed_paths is not None:
+        candidates = list(allowed_paths)
+    else:
+        candidates = list(plan.named_files) + _NEW_FILE_RE.findall(plan.essential)
+        candidates += [match.group(1) for match in _PATH_RE.finditer(plan.essential)]
+    root = Path(working_dir).resolve()
+    paths: list[str] = []
+    for path in candidates:
+        if path in paths or not usable_path(path):
+            continue
+        full = (root / path).resolve()
+        if root not in full.parents or full.is_dir():
+            continue
+        paths.append(path)
+    return paths[:MAX_GRAMMAR_PATHS]
+
+
+def patch_grammar(plan: PromptPlan, working_dir: str,
+                  allowed_paths: set[str] | None = None) -> str | None:
+    """Build the grammar only for enabled SEARCH/REPLACE patch generation."""
+    if local_edit_format() != "search_replace" or not sr_grammar_enabled():
+        return None
+    paths = sr_grammar_paths(plan, working_dir, allowed_paths)
+    return build_sr_grammar(paths) if paths else None
+
+
 def test_first_enabled() -> bool:
     """``LOCAL_TEST_FIRST`` (default off); explicit truthy values enable it."""
     return os.environ.get(ENV_TEST_FIRST, "").strip().lower() in {"1", "true", "yes", "on"}
@@ -1589,6 +1623,7 @@ class LocalCodingWorker:
         self.last_run_metrics: dict[str, Any] | None = None
         self.last_sample_stats: list[SampleStats] = []
         self.lenient_creates = 0
+        self.sr_grammar = False
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
@@ -1602,6 +1637,7 @@ class LocalCodingWorker:
         self.last_sample_stats = []
         self.last_run_metrics = None
         self.lenient_creates = 0
+        self.sr_grammar = False
         # #685: another process may use the slot between runs; start cold.
         self._last_sent = None
         self._last_prefix_reuse = self._reuse_tokens = self._reuse_prompt_tokens = 0
@@ -1977,6 +2013,15 @@ class LocalCodingWorker:
         tag: dict[str, Any] = {"subtask": subtask} if subtask is not None else {}
         sampling = self.samples > 1
         schedule = sample_schedule(self.samples, self.sample_temperatures)
+        try:
+            grammar = patch_grammar(plan, working_dir, allowed_paths)
+        except Exception:
+            logger.debug("SR grammar could not be built; sending none", exc_info=True)
+            grammar = None
+        if grammar is not None and not _accepts_option(self.client, "grammar"):
+            grammar = None
+        if grammar is not None:
+            self.sr_grammar = True
         for round_no in range(1, MAX_PATCH_ROUNDS + 1):
             stats.rounds = round_no
             prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens, **tag}
@@ -1986,6 +2031,7 @@ class LocalCodingWorker:
                 extra = {"prompt_tokens": fb.prompt_tokens, "feedback_error_chars": fb.error_chars,
                          "feedback_diff_cut": fb.diff_cut, "handover_tokens_kept": fb.handover_tokens_kept,
                          "cached_prefix_tokens": credited, **tag}
+            extra["sr_grammar"] = grammar is not None
             best: tuple[CandidateCheck, int] | None = None
             best_diff = ""
             for index, (temperature, seed) in enumerate(schedule):
@@ -1996,7 +2042,7 @@ class LocalCodingWorker:
                         prompt, _SYSTEM_PROMPT, plan.output_tokens or self.max_tokens, experiment_logger, phase,
                         call_type="patch", round=round_no,
                         prompt_tokens=extra["prompt_tokens"], temperature=temperature, seed=seed,
-                        **tag, **sample_fields,
+                        grammar=grammar, **tag, **sample_fields,
                     )
                     if index == 0:
                         extra.update(self._reuse_fields(extra["prompt_tokens"]))
@@ -2202,6 +2248,7 @@ class LocalCodingWorker:
             # #685: prompt tokens the slot already held, over all calls of the run.
             prefix_reuse_tokens=self._reuse_tokens,
             prefix_reuse_ratio=_reuse_ratio(self._reuse_tokens, self._reuse_prompt_tokens),
+            sr_grammar=self.sr_grammar,
         )
         if self.last_plan is not None:
             fields.update(file_level=self.last_plan.file_level,
@@ -2234,7 +2281,7 @@ class LocalCodingWorker:
     def _model_call(self, prompt: str, system: str, max_tokens: int,
                     experiment_logger: Any | None, phase: str, *, call_type: str,
                     temperature: float = 0.0, seed: int | None = None,
-                    **fields: Any) -> str:
+                    grammar: str | None = None, **fields: Any) -> str:
         """Call the local model and always leave a latency/outcome event."""
         counter = self.last_plan.counter if self.last_plan is not None else None
         try:
@@ -2254,6 +2301,10 @@ class LocalCodingWorker:
         options: dict[str, Any] = {}
         if seed is not None and _accepts_seed(self.client):
             options["seed"] = seed
+        if grammar is not None and _accepts_option(self.client, "grammar"):
+            options["grammar"] = grammar
+        if call_type == "patch":
+            fields["sr_grammar"] = "grammar" in options
         try:
             answer = asyncio.run(self.client.complete(
                 prompt, system=system, temperature=temperature, max_tokens=max_tokens, **options,
@@ -2405,13 +2456,18 @@ def _prompt_bound_timings(prompt_tokens: Any, stop: dict[str, Any]) -> dict[str,
     return {"prompt_n": prompt_tokens, "prompt_ms": float(elapsed) * 1000.0}
 
 
-def _accepts_seed(client: Any) -> bool:
-    """Whether ``client.complete`` takes a ``seed`` (llama-server does; test doubles may not)."""
+def _accepts_option(client: Any, name: str) -> bool:
+    """Return whether ``client.complete`` accepts *name* or arbitrary keywords."""
     try:
         parameters = inspect.signature(client.complete).parameters
     except (TypeError, ValueError, AttributeError):
         return False
-    return "seed" in parameters or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+    return name in parameters or any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+
+
+def _accepts_seed(client: Any) -> bool:
+    return _accepts_option(client, "seed")
 
 
 def is_context_too_small(error: str | None) -> bool:

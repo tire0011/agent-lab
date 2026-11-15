@@ -192,6 +192,8 @@ class LlamaCppClient:
         messages: list[dict[str, str]],
         temperature: float = 0.0,
         max_tokens: int = 1024,
+        *,
+        grammar: str | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         """Send a chat-completion request and return the raw response dict; extra
@@ -205,6 +207,8 @@ class LlamaCppClient:
             "id_slot": self.id_slot,
             **kwargs,
         }
+        if grammar is not None:
+            payload["grammar"] = grammar
 
         self.last_timings = None
         self.last_stream = None
@@ -449,6 +453,7 @@ class LlamaCppClient:
         max_tokens: int = 1024,
         response_format: dict[str, Any] | None = None,
         seed: int | None = None,
+        grammar: str | None = None,
     ) -> str:
         """Convenience wrapper that returns the assistant's reply as a string.
 
@@ -465,6 +470,8 @@ class LlamaCppClient:
             completion_options["response_format"] = response_format
         if seed is not None:
             completion_options["seed"] = int(seed)
+        if grammar is not None:
+            completion_options["grammar"] = grammar
         data = await self.chat_completion(
             messages,
             temperature=temperature,
