@@ -7,7 +7,14 @@ from unittest.mock import patch
 
 from modules.local_file_localizer import _prompt_budget, add_likely_files, localize, repo_map
 from modules.run_store import init_db
-from scripts.localization_replay import candidate_commits, list_localizations, replay, replay_commit
+from scripts.localization_replay import (
+    candidate_commits,
+    list_localizations,
+    metrics,
+    replay,
+    replay_commit,
+    store_localization,
+)
 
 
 class FakeLlama:
@@ -106,6 +113,16 @@ def test_test_only_commit_is_skipped_and_not_stored(tmp_path: Path):
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
     db = str(tmp_path / "runs.db")
     assert asyncio.run(replay_commit(sha, "tests", repo, FakeLlama('{"paths":[]}'), db_path=db)) is None
+    assert list_localizations(db_path=db) == []
+
+
+def test_empty_change_set_is_not_scored_or_stored(tmp_path: Path):
+    db = str(tmp_path / "runs.db")
+    assert metrics([], []) is None
+    assert store_localization(
+        commit_sha="test-only", issue_number=None, predicted=[], actual=[],
+        seconds=0.1, db_path=db,
+    ) is None
     assert list_localizations(db_path=db) == []
 
 

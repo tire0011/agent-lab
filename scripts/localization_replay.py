@@ -35,17 +35,24 @@ _LINKED_ISSUE_RE = re.compile(
 logger = logging.getLogger(__name__)
 
 
-def metrics(predicted: list[str], actual: list[str], k: int = 5) -> tuple[float, float]:
+def metrics(predicted: list[str], actual: list[str], k: int = 5) -> tuple[float, float] | None:
+    """Score a non-empty change set; empty sets are not replay observations."""
     predictions = list(dict.fromkeys(predicted))[:k]
     expected = set(actual)
+    if not expected:
+        return None
     hits = len(set(predictions) & expected)
-    return (hits / len(expected) if expected else 1.0,
-            hits / len(predictions) if predictions else (1.0 if not expected else 0.0))
+    return hits / len(expected), hits / len(predictions) if predictions else 0.0
 
 
 def store_localization(*, commit_sha: str, issue_number: int | None, predicted: list[str],
-                       actual: list[str], seconds: float, db_path: str = DEFAULT_DB_PATH) -> dict[str, Any]:
-    recall, precision = metrics(predicted, actual)
+                       actual: list[str], seconds: float,
+                       db_path: str = DEFAULT_DB_PATH) -> dict[str, Any] | None:
+    scores = metrics(predicted, actual)
+    if scores is None:
+        logger.info("localization replay skipped %s: no non-test changes", commit_sha)
+        return None
+    recall, precision = scores
     conn = init_db(db_path)
     try:
         upsert_local_localization(
