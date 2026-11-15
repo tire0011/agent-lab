@@ -79,7 +79,11 @@ os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
 # won the race with a *different* key and ~90 authenticated tests answered 401
 # instead of 200. A suite that passes only under the one environment that
 # happens to override it is not passing.
-os.environ.setdefault("AGENT_API_KEY", "test-key")
+#
+# Assigned, not setdefault: the timing check runs the suite with the service
+# environment, which carries the real key, and then every authenticated test
+# answered 401 again. Tests must never use the real key anyway.
+os.environ["AGENT_API_KEY"] = "test-key"
 
 # The services default to AGENT_DB_PATH or /var/lib/nexus/agent.db. The coding
 # agent runs this suite inside an experiment worktree on the VM, where a
