@@ -465,6 +465,14 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         rows = list_bakeoffs(limit, db_path=_api()._resolve_experiment_service().db_path)
         return {"count": len(rows), "bakeoffs": rows}
 
+    @mcp.tool(description="Stored local file-localization replay rows (#696)", structured_output=True)
+    def local_localizations_list(limit: int = 20) -> dict[str, Any]:
+        from scripts.localization_replay import list_localizations
+
+        limit = _validate_limit(limit, minimum=1, maximum=500)
+        rows = list_localizations(limit, db_path=_api()._resolve_experiment_service().db_path)
+        return {"count": len(rows), "localizations": rows}
+
     @mcp.tool(description="GET /planner/shadow - local/paid planner agreement", structured_output=True)
     def planner_shadow_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()

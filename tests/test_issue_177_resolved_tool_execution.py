@@ -22,8 +22,9 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-
 from unittest.mock import MagicMock
+
+import pytest
 
 from modules.nexus_tool_router import bind_resolved_arguments
 from modules.operations_registry import OperationArgSpec
@@ -349,7 +350,12 @@ class ControllerResolvedToolTests(unittest.TestCase):
         self.assertEqual(len(client.prompts), 3, client.prompts)
         self.assertTrue(client.prompts[1].startswith("TOOL RESOLVER MODE."))
 
+    @pytest.mark.usefixtures("real_clock")
     def test_an_unbound_goal_is_not_executed_by_the_controller_either(self):
+        # The controller owns a background local-LLM job worker.  Its real
+        # scheduling cannot be made deterministic by advancing the process
+        # clock on every read; under host load that can expire worker timing
+        # before this synchronous fake-client turn has completed.
         result, _client = self._run(
             "inspect service_status of llama-server",
             json.dumps({

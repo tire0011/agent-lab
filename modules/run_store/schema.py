@@ -328,6 +328,21 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             seconds REAL NOT NULL,
             error TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS local_localizations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            commit_sha TEXT NOT NULL,
+            issue_number INTEGER NULL,
+            predicted_json TEXT NOT NULL,
+            actual_json TEXT NOT NULL,
+            recall_at_5 REAL NOT NULL,
+            precision_at_5 REAL NOT NULL,
+            seconds REAL NOT NULL,
+            UNIQUE(commit_sha)
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_localizations_created
+            ON local_localizations(created_at DESC, id DESC);
         """
     )
     _migrate_experiments_columns(conn)
