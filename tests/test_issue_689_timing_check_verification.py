@@ -123,19 +123,23 @@ class TimingCheckVerificationTests(unittest.TestCase):
         self.assertIn("timing_sensitive: tests/test_new.py::T::test_budget", result.error)
         self.assertIn(HINT, result.error)
 
-    def test_test_failing_without_drift_too_gives_needs_review(self) -> None:
-        # E.g. CI passed but this host lacks a test dependency: no timing verdict.
+    def test_test_failing_without_drift_and_on_base_is_preexisting(self) -> None:
+        # A host-specific failure present at the base is not caused by the change.
         self._install_drift_conftest()
-        _, result = self._verify(ALWAYS_FAILING_UNDER_PYTEST, "1")
-        self.assertEqual(result.status, "needs_review")
-        self.assertIn("fail on this host without drift too", result.error)
-        self.assertIn("tests/test_new.py::T::test_host", result.error)
+        path = self.repo / "tests" / "test_new.py"
+        path.write_text(ALWAYS_FAILING_UNDER_PYTEST, encoding="utf-8")
+        self._git("add", "tests/test_new.py")
+        self._git("commit", "-q", "-m", "base host-specific test")
+        path.write_text(ALWAYS_FAILING_UNDER_PYTEST + "# branch touch\n", encoding="utf-8")
+        experiment = self.service.create_experiment("Touch a host-specific test")
+        base = self._git("rev-parse", "HEAD").strip()
+        self.service._force_status(experiment.id, STATUS_VERIFYING, base_commit_sha=base)
+        with patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1"}):
+            result = self.service._verify(experiment.id, str(self.repo))
+        self.assertEqual(result.status, "succeeded", result.error)
 
     def test_only_drift_only_tests_are_reported(self) -> None:
         self._install_drift_conftest()
-        (self.repo / "tests" / "test_host.py").write_text(
-            ALWAYS_FAILING_UNDER_PYTEST, encoding="utf-8",
-        )
         _, result = self._verify(DRIFT_SENSITIVE, "1")
         self.assertEqual(result.status, "failed")
         self.assertIn("timing_sensitive: tests/test_new.py::T::test_budget; hint:", result.error)

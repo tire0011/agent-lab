@@ -162,17 +162,25 @@ run continues for as long as tests keep starting and finishing.
   `StreamingClientTests` and one early-stop test in
   `tests/test_issue_667_llama_streaming.py`, which flagged green `main`
   commits. Tests flagged under drift run once more without drift
-  (`control_check`), because the normal run may have been GitHub CI rather
-  than this host. Outcomes:
+  (`control_check`) in the same isolated verification environment, because
+  the normal run may have been GitHub CI rather than this host. Tests still
+  failing are rerun by the same test ids in a temporary detached worktree at
+  the experiment's base commit. The worktree is removed after every outcome,
+  including a crash or interruption. Outcomes:
   - `ok` (or no affected test) - verification continues to the quality gate.
   - a test fails only under drift - the experiment `failed` with
     `timing_sensitive: <test ids>; hint: inject the clock or compute the value
     from configured values, not from wall time`; the repair retry receives
     that error as feedback (event `timing_check_flagged`).
+  - a test that fails without drift on both the branch and base is a
+    `preexisting_host_failure`. If only these remain, verification continues
+    (event `timing_check_preexisting_host_failures`). A test that passes on
+    base but fails on the branch is a `host_regression`; verification fails
+    with `host_regression: <test ids>` plus the branch no-drift output tail,
+    and the same text is supplied to the repair retry.
   - `error` (pytest missing, collection error, no test collected, a crash), an
-    interruption, or flagged tests that fail on this host without drift too
-    (e.g. `pytest-asyncio` missing on the VM, or `test_public_logs_api`
-    reading the host journal) - `needs_review` with
+    interruption, or a base run that crashes or collects no tests -
+    `needs_review` with
     `timing check failed closed: ...` (event `timing_check_failed_closed`).
     The check fails closed: when it is on and gives no verdict, the change is
     never approved.

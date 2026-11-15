@@ -292,10 +292,19 @@ class VerificationMixin:
         without a verdict (a check error, a crash, an interruption) is
         ``needs_review`` - an enabled check that could not run never approves.
         """
+        timing_results: list[timing_check_module.TimingCheckResult] = []
+
+        def failure_tails() -> dict[str, list[str]]:
+            return {
+                test_id: tail for item in timing_results
+                for test_id, tail in item.failure_tails.items()
+            }
+
         if not timing_check_enabled():
             elog.info(
                 "verifying", "timing_check_skipped",
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+                failure_tails={},
             )
             return None
         try:
@@ -314,14 +323,20 @@ class VerificationMixin:
                 "verifying", "timing_check_started",
                 "Rerunning the affected tests with a sped-up clock",
                 test_files=tests,
+                failure_tails={},
             )
 
             def track(process: subprocess.Popen[str] | None) -> None:
                 self._track_process(experiment_id, process)
 
+            from modules.verification_env import build_verification_test_env
+            timing_env = build_verification_test_env()
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
+                env=timing_env,
             )
+            if isinstance(result, timing_check_module.TimingCheckResult):
+                timing_results.append(result)
             control = None
             flagged = timing_check_module.flagged_tests(result)
             if flagged:
@@ -330,6 +345,8 @@ class VerificationMixin:
                 control = timing_check_module.control_check(
                     worktree_path, flagged, on_process=track,
                     python=self.test_python_executable,
+                    base_commit=base_commit, env=timing_env,
+                    results=timing_results,
                 )
                 if control is None:
                     result = "error: control run without drift gave no verdict"
@@ -339,10 +356,27 @@ class VerificationMixin:
             result, control = f"error: {type(exc).__name__}: {str(exc)[:500]}", None
 
         if result == "ok":
-            elog.info("verifying", "timing_check_passed", "Slow-machine check passed")
+            elog.info(
+                "verifying", "timing_check_passed", "Slow-machine check passed",
+                failure_tails=failure_tails(),
+            )
             return None
         if control is not None:
             drift_only, fails_without_drift = control
+            host_regressions = getattr(control, "host_regressions", [])
+            preexisting = getattr(control, "preexisting_host_failures", [])
+            if host_regressions:
+                error = f"host_regression: {', '.join(host_regressions)}"
+                if control.no_drift_output_tail:
+                    error += f"\n{control.no_drift_output_tail}"
+                elog.error(
+                    "verifying", "timing_check_host_regression", error,
+                    host_regressions=host_regressions,
+                    preexisting_host_failures=preexisting,
+                    drift_only=drift_only,
+                    failure_tails=failure_tails(),
+                )
+                return STATUS_FAILED, error
             if drift_only:
                 error = (
                     f"{timing_check_module.TIMING_SENSITIVE_PREFIX}{', '.join(drift_only)}"
@@ -351,14 +385,21 @@ class VerificationMixin:
                 elog.error(
                     "verifying", "timing_check_flagged", error,
                     fails_without_drift=fails_without_drift,
+                    failure_tails=failure_tails(),
                 )
                 return STATUS_FAILED, error
-            result = (
-                "error: these tests fail on this host without drift too, so there is "
-                "no timing verdict: " + ", ".join(fails_without_drift)
+            elog.info(
+                "verifying", "timing_check_preexisting_host_failures",
+                "Only pre-existing host failures remain; slow-machine check passed",
+                preexisting_host_failures=preexisting,
+                failure_tails=failure_tails(),
             )
+            return None
         error = f"timing check failed closed: {result}"
-        elog.warning("verifying", "timing_check_failed_closed", error)
+        elog.warning(
+            "verifying", "timing_check_failed_closed", error,
+            failure_tails=failure_tails(),
+        )
         return STATUS_NEEDS_REVIEW, error
 
 
@@ -817,4 +858,3 @@ class VerificationMixin:
                     error=combined_error,
                 )
         return self.get_experiment(experiment_id)
-

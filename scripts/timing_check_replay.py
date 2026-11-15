@@ -49,6 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from modules.timing_check import (  # noqa: E402
+    ControlCheckResult,
     affected_tests,
     control_check,
     flagged_tests,
@@ -69,12 +70,18 @@ _PLUGIN_PRESENT = "NEXUS_TEST_CLOCK_DRIFT_MS"
 _PLUGIN_IMPORTS = "import os\nimport time\nfrom types import SimpleNamespace\nimport pytest\n\n"
 
 
-def verdict(result: str, control: tuple[list[str], list[str]] | None) -> str:
+def verdict(result: str, control: tuple[list[str], list[str]] | ControlCheckResult | None) -> str:
     """What verification would conclude: ``ok``, ``failed`` or ``needs_review``."""
     if result == "ok":
         return "ok"
-    if control is not None and control[0]:
-        return "failed"
+    if control is not None:
+        if isinstance(control, ControlCheckResult):
+            if control.drift_only or control.host_regressions:
+                return "failed"
+            if control.preexisting_host_failures:
+                return "ok"
+        elif control[0]:
+            return "failed"
     return "needs_review"
 
 
@@ -192,7 +199,10 @@ def check_commit(commit: str, *, timeout: float, drift_ms: float) -> dict:
         flagged = flagged_tests(result)
         if flagged:
             # A replay has no normal run, so this is its only control.
-            control = control_check(worktree, flagged, on_process=on_process)
+            control = control_check(
+                worktree, flagged, on_process=on_process,
+                base_commit=f"{sha}^",
+            )
             if timed_out.is_set():
                 record["result"] = result = f"error: timed out after {timeout:g}s"
                 control = None
@@ -200,6 +210,8 @@ def check_commit(commit: str, *, timeout: float, drift_ms: float) -> dict:
                 record["result"] = "error: control run without drift gave no verdict"
             else:
                 record["drift_only"], record["fails_without_drift"] = control
+                record["preexisting_host_failures"] = control.preexisting_host_failures
+                record["host_regressions"] = control.host_regressions
         record["verdict"] = verdict(record["result"], control)
         record["seconds"] = round(time.monotonic() - started, 1)
         return record
