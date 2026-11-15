@@ -5,7 +5,15 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from modules.local_file_localizer import _prompt_budget, add_likely_files, localize, repo_map
+from modules.local_coding_worker import TIME_BUDGET_FRACTION
+from modules.local_file_localizer import (
+    MAX_OUTPUT_TOKENS,
+    _prompt_budget,
+    add_likely_files,
+    localize,
+    measured_rates,
+    repo_map,
+)
 from modules.run_store import init_db
 from scripts.localization_replay import (
     candidate_commits,
@@ -34,7 +42,7 @@ def test_invalid_duplicate_and_cap(tmp_path: Path):
         (tmp_path / name).write_text("pass\n")
     client = FakeLlama('{"paths":["a.py","missing.py","a.py","b.py","c.py"]}')
     assert asyncio.run(localize("issue", tmp_path, client, k=2)) == ["a.py", "b.py"]
-    assert client.calls[0]["max_tokens"] <= 150
+    assert client.calls[0]["max_tokens"] <= MAX_OUTPUT_TOKENS
     assert client.calls[0]["response_format"]["type"] == "json_schema"
 
 
@@ -149,10 +157,10 @@ def test_linked_issue_text_replaces_message_and_pr_suffix_is_not_issue(tmp_path:
         "b\x00Refactor only (#99)\x00\x1e"
     )
     with patch("scripts.localization_replay._git", return_value=log):
-        rows = candidate_commits(
+        rows = list(candidate_commits(
             tmp_path,
             issue_fetcher=lambda number: {"number": number, "title": "Issue title", "body": "Issue body"},
-        )
+        ))
     assert rows == [
         ("a", "Issue title\n\nIssue body", 7),
         ("b", "Refactor only (#99)", None),
@@ -172,3 +180,75 @@ def test_malformed_stored_json_reads_as_empty_lists(tmp_path: Path):
     row = list_localizations(db_path=db)[0]
     assert row["predicted"] == []
     assert row["actual"] == []
+
+
+def _git_repo(path: Path) -> Path:
+    path.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=path, check=True)
+    return path
+
+
+def test_map_fits_45_seconds_at_7_tokens_per_second(tmp_path: Path):
+    for index in range(400):
+        (tmp_path / f"module_{index:03d}.py").write_text(
+            f'"""Module {index} with a fairly long docstring summary line."""\n',
+        )
+    client = FakeLlama('{"paths":[]}')
+    client.timeout = 9999  # must not enlarge the map
+    asyncio.run(localize("issue", tmp_path, client, rates=(7.0, 2.6)))
+    call = client.calls[0]
+    # Same tokenizer-free estimate the localizer uses (4 bytes per token).
+    map_text = call["prompt"].split("Repository map:\n", 1)[1].split("\n\nReturn JSON", 1)[0]
+    map_tokens = len(map_text.encode("utf-8")) / 4
+    issue_overhead = max(64, len(b"issue") // 4 + 90)
+    seconds = (map_tokens + issue_overhead) / 7.0 + call["max_tokens"] / 2.6
+    assert map_text  # some map still fits
+    assert seconds <= 45 * TIME_BUDGET_FRACTION
+    assert call["max_tokens"] < MAX_OUTPUT_TOKENS  # the answer is shortened to fit
+
+
+def test_rates_object_medians_are_used_and_missing_rates_fall_back():
+    class Rates:
+        def medians(self):
+            return 70.0, None
+
+    assert measured_rates(Rates()) == (70.0, 2.6)
+    assert measured_rates(None) == (7.0, 2.6)
+    assert measured_rates((0, float("nan"))) == (7.0, 2.6)
+    assert _prompt_budget(45, Rates()) == _prompt_budget(45, (70.0, 2.6))
+    assert _prompt_budget(45, Rates()) > _prompt_budget(45, None)
+
+
+def test_candidates_are_lazy_and_lookup_errors_are_skipped(tmp_path: Path):
+    log = "".join(f"c{n}\x00Change\n\nFixes #{n}\x00\x1e" for n in range(1, 4))
+    seen: list[int] = []
+
+    def fetch(number):
+        seen.append(number)
+        if number == 1:
+            raise RuntimeError("gh down")
+        return {"number": number, "title": f"Issue {number}", "body": ""}
+
+    with patch("scripts.localization_replay._git", return_value=log):
+        commits = candidate_commits(tmp_path, issue_fetcher=fetch)
+        assert next(commits) == ("c1", "Change\n\nFixes #1", None)
+        assert next(commits) == ("c2", "Issue 2", 2)
+    assert seen == [1, 2]
+
+
+def test_root_commit_is_logged_and_skipped(tmp_path: Path):
+    repo = _git_repo(tmp_path / "repo")
+    (repo / "a.py").write_text("old\n")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "root"], cwd=repo, check=True)
+    (repo / "a.py").write_text("new\n")
+    subprocess.run(["git", "commit", "-qam", "change a"], cwd=repo, check=True)
+    db = str(tmp_path / "runs.db")
+    rows = asyncio.run(replay(
+        repo, limit=5, client=FakeLlama('{"paths":["a.py"]}'), db_path=db,
+        issue_fetcher=lambda _number: None,
+    ))
+    assert [row["actual"] for row in rows] == [["a.py"]]
+    assert len(list_localizations(db_path=db)) == 1

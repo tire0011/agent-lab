@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -60,18 +61,64 @@ def repo_map(repo: str | Path, *, token_budget: int) -> str:
     return "\n".join(lines)
 
 
-def _prompt_budget(seconds_budget: float, rates: tuple[float | None, float | None] | None) -> int:
-    """Return the admission allowance for this call, using measured rates when supplied."""
-    from modules.local_coding_worker import time_budget
+def _usable_rate(value: Any, fallback: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return fallback
+    return float(value) if math.isfinite(value) and value > 0 else fallback
 
-    measured = rates or (DEFAULT_PROMPT_RATE, DEFAULT_OUTPUT_RATE)
-    allowance = time_budget(seconds_budget, MAX_OUTPUT_TOKENS, measured)
-    if allowance is None and rates is not None:
-        allowance = time_budget(
-            seconds_budget, MAX_OUTPUT_TOKENS,
-            (DEFAULT_PROMPT_RATE, DEFAULT_OUTPUT_RATE),
-        )
-    return allowance.prompt_tokens if allowance else 0
+
+def measured_rates(rates: Any = None) -> tuple[float, float]:
+    """``(prompt, generation)`` tokens/s from *rates*, falling back per rate.
+
+    *rates* is either the worker's ``(prompt, generation)`` medians tuple or a
+    ``LocalModelRates``-like object with ``medians()``.  The hard-coded
+    7.0/2.6 only fill in a rate that was not measured.  The client's timeout
+    is deliberately never consulted (#719).
+    """
+    if rates is not None and callable(getattr(rates, "medians", None)):
+        try:
+            rates = rates.medians()
+        except Exception:
+            rates = None
+    try:
+        prompt_rate, generation_rate = rates if rates is not None else (None, None)
+    except (TypeError, ValueError):
+        prompt_rate = generation_rate = None
+    return (_usable_rate(prompt_rate, DEFAULT_PROMPT_RATE),
+            _usable_rate(generation_rate, DEFAULT_OUTPUT_RATE))
+
+
+def _call_budget(seconds_budget: float, rates: Any = None) -> tuple[int, int]:
+    """``(prompt tokens, output tokens)`` one call can afford in *seconds_budget*.
+
+    The answer is capped to the generation share of the budget first: at the
+    fallback 2.6 tok/s the full 150-token answer alone would take ~58 s and
+    leave no room for any map inside 45 s.
+    """
+    from modules.local_coding_worker import (
+        MAX_GENERATION_TIME_SHARE,
+        TIME_BUDGET_FRACTION,
+        time_budget,
+    )
+
+    measured = measured_rates(rates)
+    try:
+        seconds = float(seconds_budget) * TIME_BUDGET_FRACTION
+    except (TypeError, ValueError):
+        return 0, 0
+    if not math.isfinite(seconds) or seconds <= 0:
+        return 0, 0
+    max_output = max(1, min(MAX_OUTPUT_TOKENS,
+                            int(seconds * MAX_GENERATION_TIME_SHARE * measured[1])))
+    allowance = time_budget(seconds_budget, max_output, measured)
+    if allowance is None:
+        return 0, max_output
+    return allowance.prompt_tokens, allowance.output_tokens
+
+
+def _prompt_budget(seconds_budget: float, rates: Any = None) -> int:
+    """Prompt-token admission allowance for *seconds_budget* at the measured rates."""
+    return _call_budget(seconds_budget, rates)[0]
 
 
 async def localize(
@@ -81,17 +128,20 @@ async def localize(
     k: int = 5,
     *,
     seconds_budget: float = 45,
-    rates: tuple[float | None, float | None] | None = None,
+    rates: Any = None,
 ) -> list[str]:
-    """Ask llama-server for at most *k* existing repository paths."""
+    """Ask llama-server for at most *k* existing repository paths.
+
+    The repository map is sized from *seconds_budget* and *rates* (the
+    worker's ``rates.medians()`` or the rates object itself), never from
+    ``client.timeout``.
+    """
     k = max(0, int(k))
     if not k:
         return []
+    prompt_budget, output_budget = _call_budget(seconds_budget, rates)
     overhead = max(64, len(issue_text.encode("utf-8")) // 4 + 90)
-    mapping = repo_map(
-        repo,
-        token_budget=max(0, _prompt_budget(seconds_budget, rates) - overhead),
-    )
+    mapping = repo_map(repo, token_budget=max(0, prompt_budget - overhead))
     prompt = (
         f"Issue:\n{issue_text}\n\nRepository map:\n{mapping}\n\n"
         f"Return JSON {{\"paths\": [...]}} with at most {k} paths most likely to change."
@@ -103,7 +153,7 @@ async def localize(
     }
     try:
         raw = await client.complete(
-            prompt=prompt, temperature=0.0, max_tokens=MAX_OUTPUT_TOKENS,
+            prompt=prompt, temperature=0.0, max_tokens=output_budget,
             response_format=json_schema_response_format("file_localization", schema),
         )
         start, end = raw.find("{"), raw.rfind("}")

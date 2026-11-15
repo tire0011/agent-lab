@@ -14,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -94,10 +94,13 @@ def _issue(repo: Path, number: int) -> dict[str, Any] | None:
     return value if isinstance(value, dict) and value.get("number") else None
 
 
-def candidate_commits(repo: Path, *, issue_fetcher: Any = None) -> list[tuple[str, str, int | None]]:
-    """Return first-parent commits in replay order, with linked issue text where available."""
+def candidate_commits(repo: Path, *, issue_fetcher: Any = None) -> Iterator[tuple[str, str, int | None]]:
+    """Yield first-parent commits in replay order, with linked issue text where available.
+
+    Lazy on purpose: the replay pulls candidates until N commits are scored,
+    so issues are only resolved for commits that are actually replayed.
+    """
     raw = _git(repo, "log", "--first-parent", "--format=%H%x00%B%x00%x1e")
-    result: list[tuple[str, str, int | None]] = []
     fetch = issue_fetcher or (lambda number: _issue(repo, number))
     for record in raw.split("\x1e"):
         parts = record.strip().split("\x00", 1)
@@ -106,14 +109,17 @@ def candidate_commits(repo: Path, *, issue_fetcher: Any = None) -> list[tuple[st
         message = parts[1].strip("\x00 \r\n\t")
         match = _LINKED_ISSUE_RE.search(message)
         number = int(match.group(1)) if match else None
-        issue = fetch(number) if number is not None else None
+        try:
+            issue = fetch(number) if number is not None else None
+        except Exception as exc:  # one bad lookup must not stop the replay
+            logger.warning("localization replay: issue #%s lookup failed: %s", number, exc)
+            issue = None
         if issue:
             text = f"{issue.get('title') or ''}\n\n{issue.get('body') or ''}".strip()
-            result.append((parts[0], text, number))
+            yield parts[0], text, number
         else:
             # A squash suffix such as ``(#123)`` identifies the PR, not an issue.
-            result.append((parts[0], message, None))
-    return result
+            yield parts[0], message, None
 
 
 async def replay_commit(commit_sha: str, issue_text: str, repo: str | Path, client: Any, *,
