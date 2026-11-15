@@ -64,6 +64,22 @@ class ApiKeyAgreementTests(unittest.TestCase):
         )
 
 
+class RealKeyInEnvironmentTests(unittest.TestCase):
+    """The timing check runs pytest with the service environment, real key included."""
+
+    def test_api_tests_pass_with_a_real_key_exported(self):
+        import subprocess
+        import sys
+
+        env = dict(os.environ, AGENT_API_KEY="the-real-service-key")
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+             "tests/test_suite_environment.py::ApiKeyAgreementTests"],
+            cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-2000:])
+
+
 class IsolationTests(unittest.TestCase):
     """conftest's other guarantees, which are about not touching real state."""
 
