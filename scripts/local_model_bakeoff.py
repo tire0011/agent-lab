@@ -169,7 +169,9 @@ def score_candidate(
 ) -> dict[str, Any]:
     speed = bench_fn(url, seed=seed, timeout=timeout)
     _record_benchmark_rates(model, speed, rates_path)
-    replay_client = client or SeededReplayClient(model=model, seed=seed, timeout=timeout)
+    # ``timeout`` becomes the hunk unit timeout in _replay_environment below.
+    call_timeout = min(lsr.offline_local_call_timeout_seconds(), timeout)
+    replay_client = client or SeededReplayClient(model=model, seed=seed, timeout=call_timeout)
     # Test doubles and injected transports are supported, but admission must
     # still key rates by the candidate that was actually switched in.
     replay_client.model = model

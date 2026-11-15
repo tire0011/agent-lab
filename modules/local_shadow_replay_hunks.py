@@ -100,6 +100,11 @@ def unit_timeout_seconds() -> float:
     return lsr._float_env(ENV_UNIT_TIMEOUT, DEFAULT_UNIT_TIMEOUT_SECONDS)
 
 
+def default_hunk_replay_client() -> lsr._UsageCountingClient:
+    return lsr._UsageCountingClient(
+        timeout=min(lsr.offline_local_call_timeout_seconds(), unit_timeout_seconds()))
+
+
 # ---- text and symbols --------------------------------------------------------
 
 def _lines(text: str) -> list[str]:
@@ -807,7 +812,7 @@ def replay_hunks(
             summary = lsr._git(repo_root, ["show", "-s", "--format=%s", new]).stdout.strip()
             title = issue_title(str(row["goal"] or ""))
             test_changes = lsr.merged_test_changes(repo_root, old, new)
-            client = client if client is not None else lsr._UsageCountingClient()
+            client = client if client is not None else default_hunk_replay_client()
             model = str(getattr(client, "model", "") or "")
             factory = worker_factory or hunk_worker_factory
             baseline: dict[str, lsr.MergedTestRun] = {}

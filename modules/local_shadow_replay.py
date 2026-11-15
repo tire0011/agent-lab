@@ -71,10 +71,12 @@ DEFAULT_VARIANT = "baseline"
 ENV_ENABLED = "NEXUS_SHADOW_REPLAY"
 SETTING_ENABLED = "nexus.shadow_replay_enabled"
 ENV_WORKER_TIMEOUT = "NEXUS_SHADOW_REPLAY_TIMEOUT_SECONDS"
+ENV_OFFLINE_LOCAL_CALL_TIMEOUT = "NEXUS_OFFLINE_LOCAL_CALL_TIMEOUT_SECONDS"
 ENV_TEST_TIMEOUT = "NEXUS_SHADOW_REPLAY_TEST_TIMEOUT_SECONDS"
 ENV_LEASE = "NEXUS_SHADOW_REPLAY_LEASE_SECONDS"
 ENV_WORKTREE_DIR = "NEXUS_SHADOW_REPLAY_DIR"
 DEFAULT_WORKER_TIMEOUT_SECONDS = 1800.0
+DEFAULT_OFFLINE_LOCAL_CALL_TIMEOUT_SECONDS = 900.0
 DEFAULT_TEST_TIMEOUT_SECONDS = 600.0
 _COLLECT_TIMEOUT_SECONDS = 120.0
 _GIT_TIMEOUT_SECONDS = 60.0
@@ -135,6 +137,17 @@ def _float_env(name: str, default: float) -> float:
 
 def worker_timeout_seconds() -> float:
     return _float_env(ENV_WORKER_TIMEOUT, DEFAULT_WORKER_TIMEOUT_SECONDS)
+
+
+def offline_local_call_timeout_seconds() -> float:
+    """Per-call budget for free offline work, bounded by its enclosing run."""
+    return _float_env(ENV_OFFLINE_LOCAL_CALL_TIMEOUT,
+                      DEFAULT_OFFLINE_LOCAL_CALL_TIMEOUT_SECONDS)
+
+
+def default_replay_client() -> "_UsageCountingClient":
+    return _UsageCountingClient(
+        timeout=min(offline_local_call_timeout_seconds(), worker_timeout_seconds()))
 
 
 def tests_timeout_seconds() -> float:
@@ -686,6 +699,15 @@ class _RoundCounter:
     info = warning = error = _record
 
 
+def _replay_metrics(metrics: dict[str, Any] | None, client: Any) -> dict[str, Any]:
+    """Keep the admission timeout visible even for injected/fake workers."""
+    fields = dict(metrics or {})
+    timeout = getattr(client, "timeout", None)
+    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool):
+        fields["call_timeout_seconds"] = float(timeout)
+    return fields
+
+
 def _usage_tokens(usage: Any) -> int:
     if not isinstance(usage, dict):
         return 0
@@ -773,12 +795,12 @@ def _run_replay(repo: str, row: sqlite3.Row, adoption: sqlite3.Row, outcome: Rep
         except Exception as exc:
             outcome.seconds = time.monotonic() - started
             outcome.rounds = counter.rounds
-            outcome.metrics = counter.metrics
+            outcome.metrics = _replay_metrics(counter.metrics, client)
             outcome.lenient_creates = _lenient_creates(worker)
             raise ReplayError(f"local worker raised {type(exc).__name__}: {exc}") from exc
         outcome.seconds = time.monotonic() - started
         outcome.rounds = counter.rounds
-        outcome.metrics = counter.metrics
+        outcome.metrics = _replay_metrics(counter.metrics, client)
         outcome.lenient_creates = _lenient_creates(worker)
         outcome.tokens = int(getattr(client, "tokens_used", 0) or 0) or _usage_tokens(getattr(result, "usage", None))
         worker_error = None if getattr(result, "success", False) else (
@@ -855,9 +877,10 @@ def replay(
             return None
         finalized = False
         try:
-            client = client if client is not None else _UsageCountingClient()
+            client = client if client is not None else default_replay_client()
             outcome = ReplayOutcome(issue=_issue_number(conn, row),
-                                    model=str(getattr(client, "model", "") or ""))
+                                    model=str(getattr(client, "model", "") or ""),
+                                    metrics=_replay_metrics(None, client))
             try:
                 _run_replay(repo_root, row, adoption, outcome, client,
                             worker_factory or default_worker_factory, test_runner or run_merged_tests,
@@ -989,7 +1012,13 @@ def replay_next(
         if experiment_id is None:
             return {"ran": False, "reason": "no merged paid experiment left to replay",
                     "experiment_id": None, "replay": None}
-        client = client if client is not None else _UsageCountingClient()
+        if client is None:
+            if unit == "hunk":
+                from modules.local_shadow_replay_hunks import default_hunk_replay_client
+
+                client = default_hunk_replay_client()
+            else:
+                client = default_replay_client()
         idle, reason = server_state(client, db_path)
         if not idle:
             return {"ran": False, "reason": reason, "experiment_id": experiment_id, "replay": None}

@@ -2191,6 +2191,7 @@ class LocalCodingWorker:
             return
         winners = [s for s in self.last_sample_stats if s.winner_index is not None]
         fields.update(
+            call_timeout_seconds=getattr(self.client, "timeout", None),
             samples_setting=self.samples,
             sample_temperatures=list(self.sample_temperatures) if self.samples > 1 else [0.0],
             samples_requested=sum(s.requested for s in self.last_sample_stats),
