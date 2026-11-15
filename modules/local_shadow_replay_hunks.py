@@ -429,15 +429,24 @@ class UnitLogger:
             return None
         return self.generated_tokens * 1000.0 / self.generation_ms
 
+    def _note_grammar(self, value: Any) -> None:
+        # True once any patch call carried the grammar; a later call without it
+        # (or a repeated event) never turns a recorded True back into False.
+        if isinstance(value, bool):
+            self.sr_grammar = bool(self.sr_grammar) or value
+
     def _record(self, _phase: str, event: str, _message: str = "", **fields: Any) -> None:
         if event == "local_patch_round":
             self.rounds += 1
             if fields.get("outcome") in ("edit_format", "no_diff"):
                 self.format_rounds += 1
-            if isinstance(fields.get("sr_grammar"), bool):
-                self.sr_grammar = bool(self.sr_grammar) or fields["sr_grammar"]
+            self._note_grammar(fields.get("sr_grammar"))
         elif event == "local_model_call":
             timings = fields.get("timings")
+            if fields.get("call_type") == "patch":
+                # The worker logs every patch call in a ``finally``, also when the
+                # call raises before a ``local_patch_round`` exists (#706 review).
+                self._note_grammar(fields.get("sr_grammar"))
             if fields.get("call_type") == "patch" and isinstance(timings, dict):
                 generated, elapsed = timings.get("predicted_n"), timings.get("predicted_ms")
                 if (isinstance(generated, (int, float)) and not isinstance(generated, bool)

@@ -10,6 +10,8 @@ import httpx
 
 from modules.llama_cpp_client import LlamaCppClient
 from modules.local_coding_worker import PromptPlan, patch_grammar, sr_grammar_paths
+from modules import local_shadow_replay as lsr
+from modules import local_shadow_replay_hunks as lsh
 from modules.local_shadow_replay_hunks import UnitLogger
 from modules.run_store.schema import init_db
 from modules.sr_grammar import ENV_SR_GRAMMAR, build_sr_grammar, sr_grammar_enabled
@@ -88,6 +90,29 @@ class ReplayMetricsTests(unittest.TestCase):
         self.assertEqual(logger.format_rounds, 1)
         self.assertEqual(logger.generation_tokens_per_second, 3.0)
 
+    def test_patch_model_call_alone_records_the_grammar_flag(self):
+        # #706 review: a patch call that raises leaves only local_model_call.
+        logger = UnitLogger()
+        logger.info("phase", "local_model_call", call_type="patch", outcome="error", sr_grammar=True)
+        self.assertTrue(logger.sr_grammar)
+        self.assertEqual(logger.rounds, 0)
+
+    def test_non_patch_calls_and_missing_flags_do_not_set_it(self):
+        logger = UnitLogger()
+        logger.info("phase", "local_model_call", call_type="test_first", sr_grammar=True)
+        logger.info("phase", "local_model_call", call_type="patch")
+        logger.info("phase", "local_model_call", call_type="patch", sr_grammar="yes")
+        self.assertIsNone(logger.sr_grammar)
+        logger.info("phase", "local_model_call", call_type="patch", sr_grammar=False)
+        self.assertIs(logger.sr_grammar, False)
+
+    def test_repeated_events_never_turn_a_sent_grammar_back_off(self):
+        logger = UnitLogger()
+        for value in (True, False, True, False):
+            logger.warning("phase", "local_model_call", call_type="patch", sr_grammar=value)
+            logger.warning("phase", "local_patch_round", outcome="model_error", sr_grammar=value)
+        self.assertTrue(logger.sr_grammar)
+
     def test_schema_has_replay_columns(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = init_db(str(Path(tmp) / "test.db"))
@@ -98,6 +123,105 @@ class ReplayMetricsTests(unittest.TestCase):
                 conn.close()
         self.assertIn("sr_grammar", replay)
         self.assertTrue({"sr_grammar", "format_rounds", "generation_tokens_per_second"} <= units)
+
+
+class _FailingClient:
+    """A llama-server stand-in whose completion fails with a non-timeout error."""
+
+    model = "fake-local-model"
+
+    def __init__(self, error):
+        self.error = error
+        self.grammars = []
+
+    async def is_available(self):
+        return True
+
+    async def busy_slots(self):
+        return 0
+
+    async def complete(self, prompt, *, system=None, temperature=0.0, max_tokens=1024,
+                       seed=None, grammar=None):
+        self.grammars.append(grammar)
+        raise self.error
+
+
+class _RaisingWorker:
+    """The real worker, then a crash out of ``run`` (the ``_score_unit`` except path)."""
+
+    def __init__(self, client):
+        self.inner = lsh.hunk_worker_factory(client)
+
+    def run(self, **kwargs):
+        self.inner.run(**kwargs)
+        raise RuntimeError("worker crashed after the patch call")
+
+
+class HunkReplayGrammarTests(unittest.TestCase):
+    """#706 review: unit rows keep sr_grammar when the patch call raises."""
+
+    def setUp(self):
+        from tests.test_issue_649_hunk_replay import HunkFixture
+
+        self.fx = HunkFixture(self)
+        env = patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "search_replace", ENV_SR_GRAMMAR: "1"})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def replay(self, client, factory=lsh.hunk_worker_factory, variant="v1"):
+        return lsr.replay("exp-1", repo_root=self.fx.repo, db_path=self.fx.db_path, variant=variant,
+                          client=client, worker_factory=factory, unit="hunk")
+
+    def test_model_error_before_any_patch_round_still_stores_the_flag(self):
+        client = _FailingClient(RuntimeError("server said 500"))
+        self.replay(client)
+        self.assertTrue(client.grammars and all(g for g in client.grammars))
+        for key, row in self.fx.units().items():
+            self.assertEqual(row["rounds"], 0, key)  # no local_patch_round was logged
+            self.assertEqual(row["sr_grammar"], 1, key)
+            self.assertIn("server said 500", row["error"])
+
+    def test_worker_exception_path_stores_the_flag(self):
+        client = _FailingClient(RuntimeError("server said 500"))
+        summary = self.replay(client, factory=_RaisingWorker)
+        rows = self.fx.units()
+        self.assertEqual(summary["status"], lsh.RUN_DONE)
+        for key, row in rows.items():
+            self.assertEqual(row["status"], "error", key)
+            self.assertIn("worker crashed", row["error"])
+            self.assertEqual(row["sr_grammar"], 1, key)
+        self.assertEqual(lsh.unit_variant_summary(db_path=self.fx.db_path)[0]["sr_grammar_units"], 2)
+
+    def test_disabled_flag_stores_false_and_sends_no_grammar(self):
+        client = _FailingClient(RuntimeError("server said 500"))
+        with patch.dict(os.environ, {ENV_SR_GRAMMAR: "0"}):
+            self.replay(client)
+        self.assertTrue(client.grammars)
+        self.assertEqual(set(client.grammars), {None})
+        self.assertEqual({row["sr_grammar"] for row in self.fx.units().values()}, {0})
+
+    def test_interrupted_unit_rerun_stores_only_the_rerun_flag(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.replay(_FailingClient(KeyboardInterrupt()))
+        area = self.fx.units()[("pkg/shapes.py", "area")]
+        self.assertEqual(area["status"], "running")
+        self.assertIsNone(area["sr_grammar"])  # nothing half-written on interruption
+
+        # The rerun has grammar off: the interrupted attempt must not leak True in.
+        with patch.dict(os.environ, {ENV_SR_GRAMMAR: "0"}):
+            self.replay(_FailingClient(RuntimeError("server said 500")))
+        rows = self.fx.units()
+        self.assertNotIn("running", {row["status"] for row in rows.values()})
+        self.assertEqual({row["sr_grammar"] for row in rows.values()}, {0})
+
+    def test_second_replay_is_a_no_op_and_keeps_the_stored_flag(self):
+        self.replay(_FailingClient(RuntimeError("server said 500")))
+        again = _FailingClient(RuntimeError("server said 500"))
+        with patch.dict(os.environ, {ENV_SR_GRAMMAR: "0"}):
+            summary = self.replay(again)
+        self.assertEqual(again.grammars, [])
+        self.assertEqual(summary["ran_units"], 0)
+        self.assertEqual({row["sr_grammar"] for row in self.fx.units().values()}, {1})
 
 
 if __name__ == "__main__":
