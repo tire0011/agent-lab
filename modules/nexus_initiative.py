@@ -1173,15 +1173,28 @@ class NexusInitiativeService:
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError:
-            with_adoption = False
             try:
                 rows = self._conn.execute(
-                    "SELECT id, goal, status, error FROM experiments "
-                    "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                    "SELECT e.id, e.goal, e.status, e.error, "
+                    "a.status AS adoption_status, a.reason AS adoption_reason, "
+                    "'' AS reverification_verdict "
+                    "FROM experiments e "
+                    "LEFT JOIN experiment_adoptions a ON a.rowid = ("
+                    "  SELECT a2.rowid FROM experiment_adoptions a2 "
+                    "  WHERE a2.experiment_id = e.id ORDER BY a2.rowid DESC LIMIT 1) "
+                    "WHERE e.ended_at IS NOT NULL ORDER BY e.ended_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
             except sqlite3.OperationalError:
-                return []
+                with_adoption = False
+                try:
+                    rows = self._conn.execute(
+                        "SELECT id, goal, status, error FROM experiments "
+                        "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    return []
         recent = []
         for row in rows:
             lines = str(row["goal"] or "").strip().splitlines()
