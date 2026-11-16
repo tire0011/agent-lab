@@ -78,6 +78,8 @@ def _merge_label(status: str, reason: str) -> str:
 
 def _history_line(r: dict[str, Any]) -> str:
     """One recent experiment; with its merge outcome when that is known."""
+    if r.get("reverification_verdict") == "passes_now":
+        return f"- ready, no paid start needed: {r.get('title', '')}"
     if "adoption_status" not in r:
         detail = r.get("error") or ""
         head = f"- {r.get('status', '')}"
