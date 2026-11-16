@@ -24,6 +24,28 @@ from modules.task_orchestrator import (
     TaskOrchestratorError,
 )
 
+import pytest
+
+
+# The controller computes its prompt budget from the live /proc/meminfo on
+# every turn. On a loaded host (the VM swapping while llama-server and a
+# coding agent run, #714 verification) MemAvailable dropped below the
+# inference headroom mid-run: `low_memory` flipped, the budget was logged a
+# second time and the routing changed - failures that had nothing to do with
+# the code under test and vanished once the load was gone. Tests that want
+# memory pressure patch the reading explicitly; everything else sees one
+# steady, comfortable host.
+_STEADY_MEMINFO_KB = {"MemAvailable": 8_000_000, "SwapFree": 8_000_000, "SwapTotal": 8_000_000}
+
+
+@pytest.fixture(autouse=True)
+def _steady_host_memory():
+    with patch(
+        "modules.prompt_budget._read_meminfo_field",
+        side_effect=lambda _path, field: _STEADY_MEMINFO_KB.get(field),
+    ):
+        yield
+
 
 # modules.task_orchestrator was split into modules/task_orchestrator_parts/ (#572):
 # a patched name is looked up in the parts module that uses it, so one mock is

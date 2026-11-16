@@ -47,6 +47,8 @@ from modules.experiment_adoption_parts.core import (
 
 
 class PipelineMixin:
+    """The adoption pipeline of :class:`ExperimentAdoptionService`."""
+
     def _recheck_switched_off_gates(self, experiment_id: str, elog) -> None:
         """After a merged repair, run a switched-off gate once on main (#714)."""
         from modules import gate_self_repair
@@ -75,8 +77,6 @@ class PipelineMixin:
                 f"Gate {decision.gate} after merge of {experiment_id}: {decision.action} ({decision.detail})",
                 issue_number=decision.issue_number,
             )
-
-    """The adoption pipeline of :class:`ExperimentAdoptionService`."""
 
     def _run_adoption_pipeline(
         self, adoption_id: str, experiment_id: str, *, resume: bool = False

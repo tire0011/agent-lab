@@ -35,6 +35,9 @@ from modules.failure_analysis_service import (
 )
 
 from tests.test_task_orchestrator import _Client, _MultiRegistry, _NamedSpec
+# Autouse: the controller turns here must not depend on the host's live
+# MemAvailable either (see the fixture).
+from tests.test_task_orchestrator import _steady_host_memory  # noqa: F401
 from tests.test_issue_172_failure_analysis_tools import (
     _ScriptedClient,
     _diagnosis_json,
