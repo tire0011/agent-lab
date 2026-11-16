@@ -11,9 +11,48 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+from modules.verification_env import build_verification_test_env
+
 
 _DIFF_PATH = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|\+\+\+ b/(\S+))$", re.MULTILINE)
 _FAILED_TEST = re.compile(r"^FAILED\s+(.+?)(?:\s+-\s+.*)?$", re.MULTILINE)
+_FAILURE_HEADER = re.compile(r"^_{2,}\s+(.+?)\s+_{2,}$")
+_SHORT_SUMMARY = re.compile(r"^={2,}\s+short test summary info\s+={2,}$")
+_MAX_FAILURE_TAIL_LINES = 40
+
+
+class TimingCheckResult(str):
+    """String-compatible timing verdict with bounded pytest diagnostics."""
+
+    failure_tails: dict[str, list[str]]
+
+    def __new__(cls, value: str, failure_tails: dict[str, list[str]] | None = None):
+        result = super().__new__(cls, value)
+        result.failure_tails = failure_tails or {}
+        return result
+
+
+def _failure_tails(output: str, failed: Iterable[str]) -> dict[str, list[str]]:
+    """Return the last 40 lines of each failed test's pytest failure section."""
+    lines = output.splitlines()
+    summary_at = next((i for i, line in enumerate(lines) if _SHORT_SUMMARY.match(line)), len(lines))
+    headers = [i for i, line in enumerate(lines[:summary_at]) if _FAILURE_HEADER.match(line)]
+    tails: dict[str, list[str]] = {}
+    for test_id in failed:
+        test_name = test_id.rsplit("::", 1)[-1].split("[", 1)[0]
+        start = next(
+            (i for i in headers if test_name in (_FAILURE_HEADER.match(lines[i]).group(1))),
+            None,
+        )
+        if start is None:
+            # Collection failures and unusual plugins may not emit a normal
+            # failure header. Keep bounded output rather than losing the cause.
+            section = lines[:summary_at]
+        else:
+            end = next((i for i in headers if i > start), summary_at)
+            section = lines[start:end]
+        tails[test_id] = section[-_MAX_FAILURE_TAIL_LINES:]
+    return tails
 
 
 def _changed_paths(diff: str) -> set[str]:
@@ -158,13 +197,17 @@ def run_timing_check(
     test_list = list(tests)
     if not test_list:
         return "ok"
-    env = os.environ.copy()
+    env = build_verification_test_env()
     env["NEXUS_TEST_CLOCK_DRIFT_MS"] = str(drift_ms)
+    env["PYTHONUNBUFFERED"] = "1"
     proc: subprocess.Popen[str] | None = None
     result = "error"
     try:
         proc = subprocess.Popen(
-            [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
+            [
+                python or sys.executable, "-m", "pytest", "-q", "-p",
+                "no:cacheprovider", "--tb=short", "-rf", *test_list,
+            ],
             cwd=Path(repo),
             env=env,
             stdout=subprocess.PIPE,
@@ -176,10 +219,11 @@ def run_timing_check(
             on_process(proc)
         output, _ = proc.communicate()
         if proc.returncode == 0:
-            result = "ok"
+            result = TimingCheckResult("ok")
         elif proc.returncode == 1:
             failed = list(dict.fromkeys(_FAILED_TEST.findall(output or "")))
-            result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
+            value = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
+            result = TimingCheckResult(value, _failure_tails(output or "", failed))
     except Exception:  # spawning, observers, and malformed process results are check errors
         result = "error"
     finally:
