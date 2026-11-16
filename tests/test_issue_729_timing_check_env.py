@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 
 from modules.experiment_service.service_parts.verification import VerificationMixin
 from modules.timing_check import TimingCheckResult, run_timing_check
-from modules.verification_env import VERIFICATION_TEST_API_KEY
+from modules.verification_env import VERIFICATION_TEST_API_KEY, build_verification_test_env
 
 
 def test_timing_check_uses_isolated_verification_environment(tmp_path: Path) -> None:
@@ -19,6 +19,7 @@ def test_timing_check_uses_isolated_verification_environment(tmp_path: Path) -> 
         f"    assert os.environ['AGENT_API_KEY'] == {VERIFICATION_TEST_API_KEY!r}\n"
         "    assert 'GITHUB_TOKEN' not in os.environ\n"
         "    assert 'AZURE_OPENAI_API_KEY' not in os.environ\n"
+        "    assert os.environ['NEXUS_TEST_CLOCK_DRIFT_MS'] == '0'\n"
         "    assert os.environ['PYTHONUNBUFFERED'] == '1'\n",
         encoding="utf-8",
     )
@@ -26,9 +27,17 @@ def test_timing_check_uses_isolated_verification_environment(tmp_path: Path) -> 
         "AGENT_API_KEY": "parent-secret",
         "GITHUB_TOKEN": "github-secret",
         "AZURE_OPENAI_API_KEY": "azure-secret",
+        "NEXUS_TEST_CLOCK_DRIFT_MS": "999",
     }
     with patch.dict(os.environ, parent):
         assert run_timing_check(tmp_path, ["test_env.py"], 0) == "ok"
+
+
+def test_normal_verification_environment_drops_outer_timing_drift() -> None:
+    env = build_verification_test_env({"NEXUS_TEST_CLOCK_DRIFT_MS": "50", "PATH": "/bin"})
+
+    assert "NEXUS_TEST_CLOCK_DRIFT_MS" not in env
+    assert env["PATH"] == "/bin"
 
 
 def test_failed_test_has_a_bounded_failure_tail(tmp_path: Path) -> None:

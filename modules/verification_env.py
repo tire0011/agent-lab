@@ -35,6 +35,7 @@ _SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|autho
 # tests/*.py). Verification subprocesses must always get exactly this
 # value, never whatever real key the parent ``agent-api`` process holds.
 VERIFICATION_TEST_API_KEY = "test-key"
+_TIMING_CHECK_DRIFT_ENV_VAR = "NEXUS_TEST_CLOCK_DRIFT_MS"
 
 
 def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -50,5 +51,12 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     """
     source: Mapping[str, str] = base_env if base_env is not None else os.environ
     env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
+    # This is a test-harness control rather than ordinary test configuration.
+    # In particular, a timing check can run tests which themselves start a
+    # normal verification subprocess.  Letting the outer drift value leak into
+    # that nested subprocess makes its baseline test run drifted too and can
+    # prevent the timing-check code under test from running at all.  The timing
+    # check adds its own requested value after building this clean environment.
+    env.pop(_TIMING_CHECK_DRIFT_ENV_VAR, None)
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
     return env
