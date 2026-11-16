@@ -1540,6 +1540,13 @@ class GitHubWorkTrackingService:
         """Comment on an issue or pull request (#396: review results)."""
         self._request("POST", f"/repos/{self.repository}/issues/{number}/comments", {"body": body[:60000]})
 
+    def close_issue(self, number: int) -> None:
+        """Close an issue as completed (#714: a resolved "Nexus needs" issue)."""
+        self._request(
+            "PATCH", f"/repos/{self.repository}/issues/{number}",
+            {"state": "closed", "state_reason": "completed"},
+        )
+
     def issue_comment_contains(self, number: int, marker: str) -> bool:
         """Return whether a recent issue comment contains *marker*.
 

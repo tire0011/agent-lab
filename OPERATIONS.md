@@ -176,6 +176,23 @@ run continues for as long as tests keep starting and finishing.
     `timing check failed closed: ...` (event `timing_check_failed_closed`).
     The check fails closed: when it is on and gives no verdict, the change is
     never approved.
+  **Host-blocker self-repair (#714, `modules/gate_self_repair.py`).** When 3
+  experiments in a row, on different issues, end with the same gate failure
+  reason (the test list is ignored), the gate runs once on unchanged
+  `origin/main` with the tests they named. If it fails there too, that is
+  `host_blocker:<gate>`: an allowlisted gate (only `timing_check`) is switched
+  off persistently in `service_settings` (`gate_self_repair:state:timing_check`,
+  same effect as `NEXUS_TIMING_CHECK=0`, survives restarts), a "Nexus needs"
+  issue lists gate, reason and experiment ids, and the status issue and
+  `mailbox_status` show the switched-off gate. Repairs then run with the gate
+  off; tests and review still apply. After the next merged experiment the gate
+  runs once on `main`: a pass switches it on and closes the issue; a failure
+  leaves it off (`off_needs_owner`) with a comment on the issue and no further
+  automatic retry - the owner switches it on with
+  `GateSelfRepair.switch_on_by_owner("timing_check")`. Review, the test suite,
+  the quality gate, the main guard and the safeguards are never switched off;
+  at most one gate is off at a time; every switch is logged (journal and
+  `gate_self_repair:history`).
   The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,
   run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`

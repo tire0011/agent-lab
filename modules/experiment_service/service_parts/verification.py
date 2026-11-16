@@ -16,6 +16,7 @@ from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
+from modules import gate_self_repair
 from modules import timing_check as timing_check_module
 from modules.verification_runner import (
     VerificationRunResult,
@@ -296,6 +297,19 @@ class VerificationMixin:
             elog.info(
                 "verifying", "timing_check_skipped",
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+            )
+            return None
+        with self._lock:
+            switched_off = gate_self_repair.gate_state(
+                self._conn, gate_self_repair.TIMING_CHECK_GATE,
+            )
+        if switched_off is not None:
+            # Persisted switch-off by the host-blocker self-repair (#714).
+            elog.warning(
+                "verifying", "timing_check_skipped",
+                f"Slow-machine check switched off as host_blocker:"
+                f"{gate_self_repair.TIMING_CHECK_GATE} ({TIMING_CHECK_ENV_VAR}=0 persisted): "
+                f"{switched_off.get('reason')}",
             )
             return None
         try:
