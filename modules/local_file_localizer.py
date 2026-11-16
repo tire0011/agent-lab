@@ -7,6 +7,7 @@ import asyncio
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,12 @@ DEFAULT_OUTPUT_RATE = 2.6
 _FALSE = {"", "0", "false", "no", "off"}
 _SKIP_PARTS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
 LIKELY_FILES_HEADING = "Likely files:"
+# #720: the local worker's own localization call gets this many seconds.
+LOCALIZE_SECONDS = 45.0
+# Below these the call cannot show the model a useful map or let it name a path.
+MIN_MAP_TOKENS = 128
+MIN_ANSWER_TOKENS = 24
+_HINT_RE = re.compile(r"(?m)^" + re.escape(LIKELY_FILES_HEADING) + r"[ \t]*(.*)$")
 
 
 def enabled() -> bool:
@@ -121,6 +128,52 @@ def _prompt_budget(seconds_budget: float, rates: Any = None) -> int:
     return _call_budget(seconds_budget, rates)[0]
 
 
+def _overhead(issue_text: str) -> int:
+    """Estimated tokens of the localization prompt besides the repository map."""
+    return max(64, len(issue_text.encode("utf-8")) // 4 + 90)
+
+
+def unaffordable_reason(issue_text: str, rates: Any = None, *,
+                        seconds_budget: float = LOCALIZE_SECONDS) -> str | None:
+    """Why one localization call does not fit *seconds_budget*; ``None`` when it does (#720).
+
+    Uses the same rates and the same allowance as :func:`localize`, so a call
+    that passes here gets at least ``MIN_MAP_TOKENS`` of map and
+    ``MIN_ANSWER_TOKENS`` of answer.
+    """
+    prompt_budget, output_budget = _call_budget(seconds_budget, rates)
+    prompt_rate, generation_rate = measured_rates(rates)
+    detail = f"prompt {prompt_rate:.2f} tok/s, generation {generation_rate:.2f} tok/s, {seconds_budget:g}s budget"
+    if output_budget < MIN_ANSWER_TOKENS:
+        return f"answer budget {output_budget} < {MIN_ANSWER_TOKENS} tokens ({detail})"
+    map_tokens = prompt_budget - _overhead(issue_text)
+    if map_tokens < MIN_MAP_TOKENS:
+        return f"repository map budget {max(0, map_tokens)} < {MIN_MAP_TOKENS} tokens ({detail})"
+    return None
+
+
+def parse_likely_files(text: str) -> list[str]:
+    """Paths of the first ``Likely files:`` line in *text* (empty without one)."""
+    match = _HINT_RE.search(text or "")
+    if not match:
+        return []
+    paths = [part.strip().strip("`").replace("\\", "/").removeprefix("./")
+             for part in match.group(1).split(",")]
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def hint_line(paths: list[str] | tuple[str, ...]) -> str:
+    """The one ``Likely files:`` line every coder gets ("" without paths)."""
+    return f"{LIKELY_FILES_HEADING} " + ", ".join(paths) if paths else ""
+
+
+def with_hint(task: str, hint: str) -> str:
+    """*task* with *hint* appended once; an existing hint is never duplicated."""
+    if not hint or parse_likely_files(task):
+        return task
+    return task.rstrip() + "\n\n" + hint
+
+
 async def localize(
     issue_text: str,
     repo: str | Path,
@@ -140,7 +193,7 @@ async def localize(
     if not k:
         return []
     prompt_budget, output_budget = _call_budget(seconds_budget, rates)
-    overhead = max(64, len(issue_text.encode("utf-8")) // 4 + 90)
+    overhead = _overhead(issue_text)
     mapping = repo_map(repo, token_budget=max(0, prompt_budget - overhead))
     prompt = (
         f"Issue:\n{issue_text}\n\nRepository map:\n{mapping}\n\n"
@@ -185,4 +238,4 @@ def add_likely_files(task: str, repo: str | Path, client: Any) -> str:
         paths = asyncio.run(localize(task, repo, client))
     except RuntimeError:
         return task
-    return task if not paths else task + f"\n\n{LIKELY_FILES_HEADING} " + ", ".join(paths)
+    return task if not paths else task + "\n\n" + hint_line(paths)

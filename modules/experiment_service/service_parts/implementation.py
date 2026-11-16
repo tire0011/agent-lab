@@ -20,6 +20,7 @@ from modules.coding_provider import (
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_handover import model_written_tests_block, with_model_written_tests
 from modules.local_coding_worker import local_not_called_reason
+from modules.local_file_localizer import with_hint as with_likely_files_hint
 
 from ..git_utils import _run_git
 from ..models import (
@@ -347,6 +348,11 @@ class ImplementationMixin:
                     experiment_id, STATUS_IMPLEMENTING,
                     model_written_tests=model_written_tests,
                 )
+            # #720: the paid coder gets the same ``Likely files:`` line the
+            # local worker used (never a second localization call).
+            implementation_prompt = with_likely_files_hint(
+                implementation_prompt, getattr(worker, "likely_files_hint", "") or ""
+            )
             worker = self.worker_factory(worktree_path)
             implementation_provider = provider_of(worker)
             elog.warning(
