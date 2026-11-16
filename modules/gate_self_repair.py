@@ -273,11 +273,23 @@ class GateSelfRepair:
             same = [e for e in streak if e.get("gate") == failure.gate and e.get("reason") == failure.reason]
             if len(same) != len(streak):
                 streak = []
-            if not any(e.get("issue_number") == issue_number for e in streak):
-                streak.append({
-                    "experiment_id": experiment_id, "issue_number": issue_number,
-                    "gate": failure.gate, "reason": failure.reason, "tests": list(failure.tests),
-                })
+            entry = {
+                "experiment_id": experiment_id, "issue_number": issue_number,
+                "gate": failure.gate, "reason": failure.reason, "tests": list(failure.tests),
+            }
+            # The evidence must be consecutive experiments, not merely three
+            # distinct issues found somewhere in a longer run.  A repeated
+            # issue therefore replaces the older occurrence and becomes the
+            # start of the candidate suffix; it is not silently ignored.
+            duplicate = next(
+                (index for index, prior in enumerate(streak)
+                 if prior.get("issue_number") == issue_number),
+                None,
+            )
+            if duplicate is not None:
+                streak = streak[duplicate + 1:]
+            streak.append(entry)
+            streak = streak[-STREAK_LENGTH:]
             _save_json(self._conn, _STREAK_KEY, streak)
         decision = GateDecision(
             "streak", failure.gate, failure.reason,

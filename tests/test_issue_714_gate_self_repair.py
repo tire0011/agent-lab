@@ -137,7 +137,21 @@ class GateSelfRepairTests(unittest.TestCase):
             ("e1", 1, host_failure()), ("e2", 1, host_failure()), ("e3", 2, host_failure()),
         ])
         self.assertEqual(decisions[-1].action, "streak")
+        self.assertEqual(decisions[-1].experiment_ids, ["e2", "e3"])
         self.assertEqual(self.main_calls, [])
+
+    def test_trigger_uses_the_consecutive_suffix_after_a_repeated_issue(self) -> None:
+        self.main_results = [(True, "fails on main")]
+        decisions = self._feed(self._repair(), [
+            ("e1", 1, host_failure()), ("e2", 1, host_failure()),
+            ("e3", 2, host_failure()), ("e4", 3, host_failure()),
+        ])
+        self.assertEqual(decisions[-1].action, "switched_off")
+        self.assertEqual(decisions[-1].experiment_ids, ["e2", "e3", "e4"])
+        self.assertEqual(
+            gsr.gate_state(self.conn, "timing_check")["experiment_ids"],
+            ["e2", "e3", "e4"],
+        )
 
     def test_gate_passing_on_main_does_nothing(self) -> None:
         self.main_results = [(False, "timing check passed on main")]
