@@ -65,6 +65,15 @@ tests, then lowest index) feeds the next correction round. Every patch sample
 is logged as ``local_patch_sample``, every subtask/one-shot as
 ``local_samples_result`` and every run as ``local_run_metrics`` (wall time,
 llama-server CPU time, load, peak memory, tokens; :mod:`modules.local_run_metrics`).
+
+Localization (#720, ``NEXUS_LOCAL_LOCALIZE``, default off): an existing
+``Likely files:`` line in the task is reused; otherwise one bounded local call
+(:mod:`modules.local_file_localizer`) runs only when the measured rates afford
+its own ``LOCALIZE_SECONDS`` budget, and its elapsed time is taken off the run's
+``timeout_seconds``. One ``local_localization`` event records the paths and
+seconds, or the skip reason. The hint narrows the round-one files: files both
+named and predicted first, then predicted ones, at most ``_MAX_FILES``; files
+only the task names are dropped. A paid fallback gets the same hint line.
 """
 
 from __future__ import annotations
@@ -185,6 +194,13 @@ def split_handover(task: str) -> tuple[str, str]:
     return essential, handover
 
 
+def _goal_text(task: str) -> str:
+    """The task before the handover and earlier attempts (what localization reads)."""
+    from modules.experiment_handover import EARLIER_ATTEMPTS_HEADING
+
+    return task.split(HANDOVER_HEADING, 1)[0].split(EARLIER_ATTEMPTS_HEADING, 1)[0].strip()
+
+
 def _named_files(text: str, working_dir: str) -> list[tuple[str, str]]:
     root = Path(working_dir).resolve()
     files: list[tuple[str, str]] = []
@@ -199,6 +215,31 @@ def _named_files(text: str, working_dir: str) -> list[tuple[str, str]]:
         if len(files) >= _MAX_FILES:
             break
     return files
+
+
+def _hinted_files(text: str, working_dir: str, likely_files: tuple[str, ...] | list[str]) -> list[tuple[str, str]]:
+    """Round-one files narrowed by a ``Likely files:`` hint (#720).
+
+    Without a hint this is exactly :func:`_named_files`. With one, the files
+    the task names *and* the hint predicts come first, then the predicted
+    files the task does not name; files only the task names are dropped, and
+    the list stays within ``_MAX_FILES``. When no predicted path exists the
+    named files are used unchanged.
+    """
+    if not likely_files:
+        return _named_files(text, working_dir)
+    from modules.local_file_localizer import LIKELY_FILES_HEADING
+
+    unhinted = "\n".join(line for line in text.splitlines()
+                         if not line.startswith(LIKELY_FILES_HEADING))
+    predicted = _named_files("\n".join(likely_files), working_dir)
+    if not predicted:
+        return _named_files(text, working_dir)
+    predicted_paths = {path for path, _ in predicted}
+    both = [item for item in _named_files(unhinted, working_dir) if item[0] in predicted_paths]
+    seen = {path for path, _ in both}
+    rest = [item for item in predicted if item[0] not in seen]
+    return (both + rest)[:_MAX_FILES]
 
 
 def _keywords(goal: str) -> set[str]:
@@ -579,15 +620,18 @@ async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[i
 async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_tokens: int,
                        margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                        rates: tuple[float | None, float | None] = (None, None),
-                       admission: bool = True, cold: bool = True) -> PromptPlan:
+                       admission: bool = True, cold: bool = True,
+                       likely_files: tuple[str, ...] = ()) -> PromptPlan:
     """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`
-    (or :class:`LocalTooSlowError` when *admission* is on and the rates cannot afford a patch)."""
+    (or :class:`LocalTooSlowError` when *admission* is on and the rates cannot afford a patch).
+
+    *likely_files* (#720) narrows the named files, see :func:`_hinted_files`."""
     n_ctx, n_ctx_source = await discover_context_size(client)
     essential, handover = split_handover(task)
     return await build_prompt_parts(
         essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
         margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source, rates=rates,
-        admission=admission, cold=cold,
+        admission=admission, cold=cold, likely_files=likely_files,
     )
 
 
@@ -597,7 +641,8 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              counter: TokenCounter | None = None,
                              rates: tuple[float | None, float | None] = (None, None),
                              admission: bool = True, cold: bool = True,
-                             cached_prefix_tokens: int = 0) -> PromptPlan:
+                             cached_prefix_tokens: int = 0,
+                             likely_files: tuple[str, ...] = ()) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``.
 
     *cached_prefix_tokens* (#685) is the part of the prompt the server's slot
@@ -635,7 +680,7 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     output_tokens = allowance.output_tokens if allowance else max_output_tokens
     budget = context_budget if time_budget_tokens is None else min(context_budget, time_budget_tokens)
     exceeded = False
-    files = _named_files(essential, working_dir)
+    files = _hinted_files(essential, working_dir, likely_files)
     keywords = _keywords(essential)
     names = [path for path, _ in files]
 
@@ -1624,6 +1669,9 @@ class LocalCodingWorker:
         self.last_sample_stats: list[SampleStats] = []
         self.lenient_creates = 0
         self.sr_grammar = False
+        # #720: the ``Likely files:`` line of this run, for the paid handover.
+        self.likely_files: tuple[str, ...] = ()
+        self.likely_files_hint = ""
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
@@ -1638,6 +1686,8 @@ class LocalCodingWorker:
         self.last_run_metrics = None
         self.lenient_creates = 0
         self.sr_grammar = False
+        self.likely_files = ()
+        self.likely_files_hint = ""
         # #685: another process may use the slot between runs; start cold.
         self._last_sent = None
         self._last_prefix_reuse = self._reuse_tokens = self._reuse_prompt_tokens = 0
@@ -1700,12 +1750,17 @@ class LocalCodingWorker:
                     local_attempt_passed_generated_tests=None, paid_fallback_used=False,
                     tests=list(self.generated_tests),
                 )
+            # #720: optional localization, charged to this run's time budget.
+            prompt_task, spent = self._localize(task, working_dir, timeout_seconds,
+                                                experiment_logger, phase)
+            timeout_seconds = max(0.0, float(timeout_seconds) - spent)
             try:
                 # n_ctx is read once here and holds for this whole run.
-                plan = asyncio.run(build_prompt(task, working_dir, self.client,
+                plan = asyncio.run(build_prompt(prompt_task, working_dir, self.client,
                                                 max_output_tokens=self.max_tokens,
                                                 rates=self.rates.medians(),
-                                                admission=True))
+                                                admission=True,
+                                                likely_files=self.likely_files))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
@@ -1740,10 +1795,11 @@ class LocalCodingWorker:
                         # prompt. Refit now instead of repeating the same full
                         # prompt for the patch in this run.
                         plan = asyncio.run(build_prompt(
-                            task, working_dir, self.client,
+                            prompt_task, working_dir, self.client,
                             max_output_tokens=self.max_tokens,
                             rates=self.rates.medians(),
                             admission=True,
+                            likely_files=self.likely_files,
                         ))
                         self.last_plan = plan
                         self._log(
@@ -1770,6 +1826,60 @@ class LocalCodingWorker:
             # An httpx timeout stringifies to "" - never record an empty error (#642).
             error = str(exc).strip() or f"{type(exc).__name__} (no message)"
             return self._result(task, working_dir, "", error, started, success=False, exit_code=1)
+
+    # Localization (#720)
+
+    def _localize(self, task: str, working_dir: str, timeout_seconds: float,
+                  experiment_logger: Any | None, phase: str) -> tuple[str, float]:
+        """``(task for the prompt, seconds spent)`` behind ``NEXUS_LOCAL_LOCALIZE``.
+
+        Off: the task is returned unchanged, nothing is called or logged. On:
+        an existing ``Likely files:`` hint is reused; otherwise one bounded
+        local call runs only when the measured rates afford its own
+        ``LOCALIZE_SECONDS`` budget. Exactly one ``local_localization`` event
+        records the paths and seconds, or the skip reason.
+        """
+        from modules import local_file_localizer as lfl
+
+        if not lfl.enabled():
+            return task, 0.0
+        event = "local_localization"
+        existing = lfl.parse_likely_files(task)
+        if existing:
+            self.likely_files = tuple(existing)
+            self.likely_files_hint = lfl.hint_line(existing)
+            self._log(experiment_logger, phase, event,
+                      f"Reused the existing hint: {', '.join(existing)}",
+                      paths=list(existing), seconds=0.0, skipped=False, reused=True, reason=None)
+            return task, 0.0
+        issue = _goal_text(task)
+        rates = self.rates.medians()
+        reason = lfl.unaffordable_reason(issue, rates, seconds_budget=lfl.LOCALIZE_SECONDS)
+        if reason is None and not float(timeout_seconds) > lfl.LOCALIZE_SECONDS:
+            reason = (f"remaining run budget {float(timeout_seconds):g}s does not exceed the "
+                      f"{lfl.LOCALIZE_SECONDS:g}s localization budget")
+        if reason is not None:
+            self._log(experiment_logger, phase, event, f"Localization skipped: {reason}",
+                      paths=[], seconds=0.0, skipped=True, reused=False, reason=reason)
+            return task, 0.0
+        started = time.monotonic()
+        try:
+            paths = asyncio.run(lfl.localize(issue, working_dir, self.client,
+                                             seconds_budget=lfl.LOCALIZE_SECONDS, rates=rates))
+        except Exception as exc:  # localization is optional; the patch still runs
+            logger.info("local localization failed: %s", exc)
+            paths = []
+        finally:
+            # That call used the slot without going through _model_call.
+            self._last_sent = None
+        seconds = round(time.monotonic() - started, 3)
+        self.likely_files = tuple(paths)
+        self.likely_files_hint = lfl.hint_line(paths)
+        self._log(experiment_logger, phase, event,
+                  f"Localized {len(paths)} file(s) in {seconds:g}s"
+                  + (f": {', '.join(paths)}" if paths else ""),
+                  paths=list(paths), seconds=seconds, skipped=False, reused=False, reason=None)
+        return lfl.with_hint(task, self.likely_files_hint), seconds
 
     # Splitting (#598)
 
