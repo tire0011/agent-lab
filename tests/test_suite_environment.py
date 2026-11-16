@@ -80,6 +80,33 @@ class RealKeyInEnvironmentTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout[-2000:] + result.stderr[-2000:])
 
 
+class ProviderCredentialsTests(unittest.TestCase):
+    """Tests must never reach a real provider, whatever the service env exports."""
+
+    def test_provider_credentials_are_removed(self):
+        import subprocess
+        import sys
+
+        env = dict(
+            os.environ,
+            AZURE_OPENAI_API_KEY="real-looking", AZURE_OPENAI_ENDPOINT="https://x.invalid",
+            GEMINI_API_KEY="real-looking", MISTRAL_API_KEY="real-looking",
+            CLAUDE_CODE_OAUTH_TOKEN="real-looking", GITHUB_TOKEN="real-looking",
+        )
+        probe = (
+            "import os, sys; sys.path.insert(0, 'tests'); import conftest; "
+            "names = ['AZURE_OPENAI_API_KEY', 'AZURE_OPENAI_ENDPOINT', 'GEMINI_API_KEY', "
+            "'MISTRAL_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'GITHUB_TOKEN']; "
+            "left = [n for n in names if n in os.environ]; "
+            "print(left); sys.exit(1 if left or os.environ['AGENT_API_KEY'] != 'test-key' else 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+
+
 class IsolationTests(unittest.TestCase):
     """conftest's other guarantees, which are about not touching real state."""
 

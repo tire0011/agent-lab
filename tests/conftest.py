@@ -83,6 +83,20 @@ os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
 # Assigned, not setdefault: the timing check runs the suite with the service
 # environment, which carries the real key, and then every authenticated test
 # answered 401 again. Tests must never use the real key anyway.
+#
+# The same environment also carries the real provider credentials (Azure,
+# Gemini, Mistral, Claude, GitHub). With Azure configured, the controller
+# sends its turns to the real Azure API (#337), so orchestrator tests made
+# paid calls and failed on the VM only. Drop the provider credentials; a test
+# that needs one sets it itself.
+_PROVIDER_CREDENTIALS = (
+    "AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_DEPLOYMENT",
+    "AZURE_OPENAI_API_VERSION", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN", "GEMINI_API_KEY", "MISTRAL_API_KEY",
+    "GITHUB_TOKEN", "GH_TOKEN", "AGENT_GITHUB_WEBHOOK_SECRET",
+)
+for _name in _PROVIDER_CREDENTIALS:
+    os.environ.pop(_name, None)
 os.environ["AGENT_API_KEY"] = "test-key"
 
 # The services default to AGENT_DB_PATH or /var/lib/nexus/agent.db. The coding
