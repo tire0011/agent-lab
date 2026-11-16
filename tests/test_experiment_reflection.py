@@ -159,16 +159,26 @@ def test_reflection_setting_disables_sweep(tmp_path):
 def test_slow_reflector_does_not_hold_up_tick(tmp_path):
     path = _db(tmp_path)
 
+    # Deterministic instead of a wall-clock bound (a loaded CI runner once
+    # needed 0.23 s for the tick itself): the reflector blocks until the test
+    # releases it, so the tick can only return while the reflector still runs.
+    release = threading.Event()
+    entered = threading.Event()
+    finished = threading.Event()
+
     def slow(**_kwargs):
-        time.sleep(0.3)
+        entered.set()
+        release.wait(timeout=30)
+        finished.set()
 
     initiative = _initiative(path, slow, reflection_timeout_seconds=0.02)
-    started = time.monotonic()
     try:
         initiative.tick()
+        assert entered.wait(timeout=5)
+        assert not finished.is_set()
     finally:
+        release.set()
         initiative.close()
-    assert time.monotonic() - started < 0.2
 
 
 def test_zero_suggestions_and_compact_prompt(tmp_path):
