@@ -176,6 +176,12 @@ run continues for as long as tests keep starting and finishing.
     `timing check failed closed: ...` (event `timing_check_failed_closed`).
     The check fails closed: when it is on and gives no verdict, the change is
     never approved.
+  Both events carry `tails: {node_id: text}` - at most 40 lines of each
+  failing test's failure/error text, read from pytest's `--junitxml` report
+  and matched by the exact node id, parameters included (`test_x[b]`, not
+  `test_x`). `timing_check_flagged` has the drift run's text for the drift-only
+  tests; `timing_check_failed_closed` has the control run's text for tests
+  that fail without drift too, else the drift run's (#737).
   The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,
   run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`

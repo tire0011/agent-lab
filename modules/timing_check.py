@@ -8,6 +8,8 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
@@ -16,6 +18,9 @@ from modules.verification_env import CLOCK_DRIFT_ENV, build_verification_test_en
 
 _DIFF_PATH = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|\+\+\+ b/(\S+))$", re.MULTILINE)
 _FAILED_TEST = re.compile(r"^FAILED\s+(.+?)(?:\s+-\s+.*)?$", re.MULTILINE)
+_SUMMARY_HEADER = re.compile(r"^=+ short test summary info =+$", re.MULTILINE)
+# At most this many lines of failure or error text are kept per test (#737).
+TAIL_MAX_LINES = 40
 
 
 def _changed_paths(diff: str) -> set[str]:
@@ -121,17 +126,20 @@ def control_check(
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
+    tails: dict[str, str] | None = None,
 ) -> tuple[list[str], list[str]] | None:
     """Rerun flagged tests without drift: ``(drift_only, fails_without_drift)``.
 
     A test that also fails without drift is not shown to be timing-sensitive -
     it fails on this host anyway (a missing test dependency, host state), for
     instance when the normal run that passed was GitHub CI. Returns None when
-    the control run gives no verdict.
+    the control run gives no verdict. *tails* receives the control run's
+    failure tails, as in ``run_timing_check``.
     """
     tests = list(flagged)
     # Drift 0 keeps the fixture installed but adds nothing, so the clocks are real.
-    control = run_timing_check(repo, tests, 0, on_process=on_process, python=python)
+    kwargs = {"tails": tails} if tails is not None else {}
+    control = run_timing_check(repo, tests, 0, on_process=on_process, python=python, **kwargs)
     if control == "ok":
         return tests, []
     also_failing = set(flagged_tests(control))
@@ -143,6 +151,89 @@ def control_check(
     )
 
 
+def _junit_key(node_id: str) -> tuple[str, str]:
+    """``(classname, name)`` pytest's junitxml writes for *node_id*.
+
+    The same mangling as ``_pytest.junitxml.mangle_test_address``: the path
+    loses ``.py`` and its slashes become dots, the classes follow, and the last
+    part (parameters included) is the name.
+    """
+    # Parameter ids may contain "::" or "/" themselves, so split only before "[".
+    bracket = node_id.find("[")
+    head, params = (node_id[:bracket], node_id[bracket:]) if bracket >= 0 else (node_id, "")
+    path, *names = head.split("::")
+    names = [name for name in names if name != "()"]
+    if names:
+        names[-1] += params
+    parts = path.replace("\\", "/").split("/")
+    parts[-1] = parts[-1][:-3] if parts[-1].endswith(".py") else parts[-1]
+    names = [".".join(parts), *names]
+    return ".".join(names[:-1]), names[-1]
+
+
+def _resolve_node_id(repo: Path, classname: str, name: str) -> str | None:
+    """Node id of a testcase that is not among the known ids: find its file."""
+    parts = classname.split(".") if classname else []
+    for split in range(len(parts), 0, -1):
+        candidate = "/".join(parts[:split]) + ".py"
+        if (repo / candidate).is_file():
+            return "::".join([candidate, *parts[split:], name])
+    return None
+
+
+def _cap(text: str) -> str:
+    """The last TAIL_MAX_LINES lines of *text* (the assertion is at the end)."""
+    lines = text.strip("\n").splitlines()
+    return "\n".join(lines[-TAIL_MAX_LINES:])
+
+
+def failure_tails(
+    junit_xml: str | os.PathLike[str],
+    known_ids: Iterable[str] = (),
+    repo: str | os.PathLike[str] | None = None,
+) -> dict[str, str]:
+    """``{node_id: text}`` for every failed or erroring ``<testcase>`` (#737).
+
+    A testcase maps to its full node id, parameters included, by exact
+    ``(classname, name)`` - never by function name alone - so ``test_x[b]``
+    gets only its own text and two classes with the same method name each get
+    theirs. *known_ids* (the ids pytest printed) are matched first; any other
+    testcase is resolved by finding its file under *repo*, and skipped when
+    there is none. Each text is capped at TAIL_MAX_LINES lines.
+    """
+    by_key: dict[tuple[str, str], str] = {}
+    for node_id in known_ids:
+        by_key.setdefault(_junit_key(node_id), node_id)
+    root = ElementTree.parse(junit_xml).getroot()
+    tails: dict[str, str] = {}
+    for case in root.iter("testcase"):
+        texts = []
+        for child in case:
+            if child.tag not in ("failure", "error"):
+                continue
+            text = (child.text or "").strip("\n") or child.get("message", "")
+            if text:
+                texts.append(text)
+        if not texts:
+            continue
+        classname, name = case.get("classname", ""), case.get("name", "")
+        node_id = by_key.get((classname, name))
+        if node_id is None and repo is not None:
+            node_id = _resolve_node_id(Path(repo), classname, name)
+        if node_id is None:
+            continue
+        joined = "\n".join(texts) if node_id not in tails else tails[node_id] + "\n" + "\n".join(texts)
+        tails[node_id] = _cap(joined)
+    return tails
+
+
+def _failed_ids(output: str) -> list[str]:
+    """``FAILED`` ids from the short test summary (tracebacks may print the word)."""
+    headers = list(_SUMMARY_HEADER.finditer(output))
+    summary = output[headers[-1].end():] if headers else output
+    return list(dict.fromkeys(_FAILED_TEST.findall(summary)))
+
+
 def run_timing_check(
     repo: str | os.PathLike[str],
     tests: Iterable[str],
@@ -150,11 +241,15 @@ def run_timing_check(
     *,
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
+    tails: dict[str, str] | None = None,
 ) -> str:
     """Run every selected test under clock drift and summarize the outcome.
 
     *python* is the interpreter for the pytest child (default: this one), so
-    verification can use the same interpreter as its normal test run.
+    verification can use the same interpreter as its normal test run. When
+    *tails* is a dict, it receives ``{node_id: failure text}`` (at most
+    TAIL_MAX_LINES lines each) from pytest's junitxml report; the result
+    string stays the same either way.
     """
 
     test_list = list(tests)
@@ -168,9 +263,14 @@ def run_timing_check(
     env["PYTHONUNBUFFERED"] = "1"
     proc: subprocess.Popen[str] | None = None
     result = "error"
+    report_dir = tempfile.TemporaryDirectory(prefix="nexus-timing-check-")
+    report = Path(report_dir.name) / "junit.xml"
     try:
         proc = subprocess.Popen(
-            [python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--tb=no", *test_list],
+            [
+                python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+                "--tb=short", f"--junitxml={report}", *test_list,
+            ],
             cwd=Path(repo),
             env=env,
             stdout=subprocess.PIPE,
@@ -184,8 +284,13 @@ def run_timing_check(
         if proc.returncode == 0:
             result = "ok"
         elif proc.returncode == 1:
-            failed = list(dict.fromkeys(_FAILED_TEST.findall(output or "")))
+            failed = _failed_ids(output or "")
             result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
+        if tails is not None and proc.returncode != 0 and report.is_file():
+            try:
+                tails.update(failure_tails(report, _failed_ids(output or ""), repo))
+            except (ElementTree.ParseError, OSError):
+                pass  # tails are diagnostics; the verdict does not depend on them
     except Exception:  # spawning, observers, and malformed process results are check errors
         result = "error"
     finally:
@@ -196,4 +301,5 @@ def run_timing_check(
                 on_process(None)
             except Exception:
                 result = "error"
+        report_dir.cleanup()
     return result
