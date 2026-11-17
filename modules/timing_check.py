@@ -252,15 +252,29 @@ def run_timing_check(
     string stays the same either way.
     """
 
-    test_list = list(tests)
-    if not test_list:
-        return "ok"
     # The same isolated environment as the normal verification run (#736): no
     # production API key or provider credentials, AGENT_API_KEY = test key, and
     # no inherited drift - the drift below is the only one this child sees.
     env = build_verification_test_env()
     env[CLOCK_DRIFT_ENV] = str(drift_ms)
     env["PYTHONUNBUFFERED"] = "1"
+    return _run_timing_check_env(repo, tests, env, on_process=on_process, python=python, tails=tails)
+
+
+def _run_timing_check_env(
+    repo: str | os.PathLike[str],
+    tests: Iterable[str],
+    env: dict[str, str],
+    *,
+    on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
+    python: str | None = None,
+    tails: dict[str, str] | None = None,
+) -> str:
+    """Implementation shared with the old-vs-new environment probe (#738)."""
+
+    test_list = list(tests)
+    if not test_list:
+        return "ok"
     proc: subprocess.Popen[str] | None = None
     result = "error"
     report_dir = tempfile.TemporaryDirectory(prefix="nexus-timing-check-")
@@ -303,3 +317,68 @@ def run_timing_check(
                 result = "error"
         report_dir.cleanup()
     return result
+
+
+def _probe_status(result: str, node_id: str) -> str:
+    if result == "ok":
+        return "PASS"
+    failed = flagged_tests(result)
+    if failed:
+        return "FAIL" if node_id in failed else "PASS"
+    return "ERROR"
+
+
+def build_timing_check_env_probe_report(
+    ids: Iterable[str],
+    old_result: str,
+    new_result: str,
+    old_tails: dict[str, str] | None = None,
+    new_tails: dict[str, str] | None = None,
+) -> str:
+    """Build the Markdown evidence table and #737 failure tails for #738."""
+
+    node_ids = list(ids)
+    lines = [
+        "| test id | old env | verification env |",
+        "| --- | --- | --- |",
+    ]
+    for node_id in node_ids:
+        label = node_id.replace("|", r"\|")
+        lines.append(
+            f"| `{label}` | {_probe_status(old_result, node_id)} | "
+            f"{_probe_status(new_result, node_id)} |"
+        )
+    for heading, tails in (("Old env failure tails", old_tails or {}),
+                           ("Verification env failure tails", new_tails or {})):
+        lines.extend(["", f"### {heading}"])
+        if not tails:
+            lines.extend(["", "_None._"])
+            continue
+        for node_id in node_ids:
+            if node_id not in tails:
+                continue
+            # A tail can itself contain a fence; four backticks keep the report valid.
+            lines.extend(["", f"`{node_id}`", "", "````text", tails[node_id], "````"])
+    return "\n".join(lines)
+
+
+def timing_check_env_probe(ids: Iterable[str], drift_ms: int | float = 0) -> str:
+    """Run *ids* once with the inherited env and once with verification env.
+
+    This is a one-off diagnostic for #738. It runs from the current checkout
+    and returns Markdown suitable for posting on #714 and #729.
+    """
+
+    node_ids = list(ids)
+    old_env = os.environ.copy()
+    new_env = build_verification_test_env()
+    for env in (old_env, new_env):
+        env[CLOCK_DRIFT_ENV] = str(drift_ms)
+        env["PYTHONUNBUFFERED"] = "1"
+    old_tails: dict[str, str] = {}
+    new_tails: dict[str, str] = {}
+    old_result = _run_timing_check_env(Path.cwd(), node_ids, old_env, tails=old_tails)
+    new_result = _run_timing_check_env(Path.cwd(), node_ids, new_env, tails=new_tails)
+    return build_timing_check_env_probe_report(
+        node_ids, old_result, new_result, old_tails, new_tails,
+    )
