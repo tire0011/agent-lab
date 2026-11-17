@@ -11,6 +11,8 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+from modules.verification_env import CLOCK_DRIFT_ENV, build_verification_test_env
+
 
 _DIFF_PATH = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|\+\+\+ b/(\S+))$", re.MULTILINE)
 _FAILED_TEST = re.compile(r"^FAILED\s+(.+?)(?:\s+-\s+.*)?$", re.MULTILINE)
@@ -158,8 +160,12 @@ def run_timing_check(
     test_list = list(tests)
     if not test_list:
         return "ok"
-    env = os.environ.copy()
-    env["NEXUS_TEST_CLOCK_DRIFT_MS"] = str(drift_ms)
+    # The same isolated environment as the normal verification run (#736): no
+    # production API key or provider credentials, AGENT_API_KEY = test key, and
+    # no inherited drift - the drift below is the only one this child sees.
+    env = build_verification_test_env()
+    env[CLOCK_DRIFT_ENV] = str(drift_ms)
+    env["PYTHONUNBUFFERED"] = "1"
     proc: subprocess.Popen[str] | None = None
     result = "error"
     try:

@@ -36,6 +36,13 @@ _SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|autho
 # value, never whatever real key the parent ``agent-api`` process holds.
 VERIFICATION_TEST_API_KEY = "test-key"
 
+# The clock-drift fixture (#687) switch. Only the timing check sets it, for
+# its own pytest child; a verification run must never inherit it from its
+# parent - e.g. a verification nested in a test that itself runs under the
+# timing check (tests/test_issue_689_*) would otherwise run its "normal" test
+# run under drift as well (#736).
+CLOCK_DRIFT_ENV = "NEXUS_TEST_CLOCK_DRIFT_MS"
+
 
 def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the isolated environment for one verification test subprocess.
@@ -50,5 +57,6 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     """
     source: Mapping[str, str] = base_env if base_env is not None else os.environ
     env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
+    env.pop(CLOCK_DRIFT_ENV, None)
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
     return env
