@@ -98,7 +98,10 @@ def is_safe_log_id(value: object) -> bool:
 # enough that one bad loop cannot blow up the log file on its own (the
 # per-file ``max_bytes`` ceiling below is the actual hard backstop).
 MAX_MESSAGE_CHARS = 4000
-# A flat {str: str} extra field keeps at most this many entries (#737).
+# Extra fields written as a structured flat {str: str} map instead of a
+# string (#737); every other dict stays stringified as before.
+STRUCTURED_MAP_FIELDS = frozenset({"tails"})
+# A structured map extra field keeps at most this many entries (#737).
 MAX_EXTRA_MAP_ENTRIES = 50
 MAX_EXTRA_MAP_KEY_CHARS = 500
 MAX_COMMAND_CHARS = 1000
@@ -454,10 +457,10 @@ class ExperimentLogger:
                 truncated = truncated or extra_truncated
             elif isinstance(value, (int, float, bool)):
                 entry[key] = value
-            elif isinstance(value, dict) and all(
+            elif key in STRUCTURED_MAP_FIELDS and isinstance(value, dict) and all(
                 isinstance(k, str) and isinstance(v, str) for k, v in value.items()
             ):
-                # A flat {str: str} map (e.g. per-test failure tails, #737)
+                # A flat {str: str} map of an allowed field (per-test failure tails, #737)
                 # stays structured: every key and value is redacted and
                 # bounded, and only the first MAX_EXTRA_MAP_ENTRIES are kept.
                 bounded: dict[str, str] = {}

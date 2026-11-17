@@ -134,7 +134,12 @@ def test_unreadable_report_keeps_the_verdict(tmp_path: Path):
 def service(tmp_path: Path):
     repo = tmp_path / "repo"
     (repo / "tests").mkdir(parents=True)
-    (repo / "tests" / "test_new.py").write_text("def test_ok():\n    pass\n", encoding="utf-8")
+    # A unittest case: verification discovers with unittest, and Python 3.12+
+    # exits 5 when discovery finds no tests (a bare pytest function).
+    (repo / "tests" / "test_new.py").write_text(
+        "import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        pass\n",
+        encoding="utf-8",
+    )
 
     def git(*args: str) -> str:
         return subprocess.run(["git", *args], cwd=repo, check=True, text=True, capture_output=True).stdout
@@ -229,7 +234,10 @@ def test_logger_keeps_a_flat_text_map_structured_but_sanitized(tmp_path: Path):
     elog = ExperimentLogger("exp-tails", log_dir=str(tmp_path))
     tails = {f"t.py::test_{n}": f"tail {n}" for n in range(MAX_EXTRA_MAP_ENTRIES + 5)}
     tails["t.py::test_0"] = "api_key=sk-super-secret-value-123456"
-    elog.warning("verifying", "timing_check_failed_closed", "x", tails=tails, other=[1, 2])
+    elog.warning(
+        "verifying", "timing_check_failed_closed", "x", tails=tails, other=[1, 2],
+        classifications={"t.T.test": "pre_existing"},
+    )
     entry = json.loads(Path(elog.path).read_text(encoding="utf-8").splitlines()[0])
     assert isinstance(entry["tails"], dict)
     assert len(entry["tails"]) == MAX_EXTRA_MAP_ENTRIES
@@ -237,6 +245,8 @@ def test_logger_keeps_a_flat_text_map_structured_but_sanitized(tmp_path: Path):
     assert "sk-super-secret-value-123456" not in json.dumps(entry)
     assert entry["truncated"] is True
     assert entry["other"] == "[1, 2]"  # other structures are still stringified
+    # Only the allowed field is structured; other flat maps stay strings.
+    assert entry["classifications"] == str({"t.T.test": "pre_existing"})
 
 
 def test_parameter_ids_with_separators_match_exactly(tmp_path: Path):
