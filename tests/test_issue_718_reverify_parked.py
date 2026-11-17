@@ -6,10 +6,12 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
 from modules.experiment_service.reverify import list_reverifications, reverify_parked
+from modules.nexus_initiative import NexusInitiativeService
 from modules.run_store import init_db
 
 
@@ -114,6 +116,18 @@ class ReverifyParkedTests(unittest.TestCase):
         )
         self.assertEqual(list_reverifications(self.service), [])
 
+    def test_missing_issue_lookup_fails_closed(self) -> None:
+        self.service.add("missing")
+        self.assertIsNone(reverify_parked("exp", service=self.service))
+        self.assertEqual(list_reverifications(self.service), [])
+
+    def test_disabled_flag_does_not_touch_the_experiment_service(self) -> None:
+        initiative = object.__new__(NexusInitiativeService)
+        with patch.dict("os.environ", {"NEXUS_REVERIFY_PARKED": "off"}):
+            # No attributes are initialized: reaching beyond the flag guard
+            # would fail, which makes this a strict no-work assertion.
+            initiative._reverify_parked()
+
     def test_since_fixed_failure_passes_and_enters_adoption_path(self) -> None:
         git(self.repo, "checkout", "-b", "parked")
         (self.repo / "feature.txt").write_text("done\n", encoding="utf-8")
@@ -129,7 +143,11 @@ class ReverifyParkedTests(unittest.TestCase):
         result = reverify_parked("exp", service=self.service, issue_is_open=lambda _n: True)
 
         self.assertEqual(result["verdict"], "passes_now")
-        self.assertEqual(self.service.get_experiment("exp").status, "succeeded")
+        experiment = self.service.get_experiment("exp")
+        self.assertEqual(experiment.status, "succeeded")
+        # The normal adoption path requires the exact verified worktree; a pass
+        # must not hand it a path that reverify_parked already deleted.
+        self.assertTrue(Path(experiment.worktree_path).is_dir())
         self.assertEqual(self.service.verify_calls, 1)  # verifier only; no coding client exists
 
     def test_real_failure_stays_blocked_with_reason(self) -> None:
@@ -144,6 +162,7 @@ class ReverifyParkedTests(unittest.TestCase):
 
         self.assertTrue(result["verdict"].startswith("still_blocked:"))
         self.assertIn("test_real_failure", result["verdict"])
+        self.assertEqual(self.service.get_experiment("exp").status, "needs_review")
 
 
 if __name__ == "__main__":

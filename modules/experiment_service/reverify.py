@@ -93,7 +93,10 @@ def reverify_parked(
         ).fetchone():
             return None
     issue_number = _issue_number(service, experiment)
-    if issue_number is not None and issue_is_open is not None and not issue_is_open(issue_number):
+    # Re-verification must never resurrect work for a closed (or unresolvable)
+    # issue.  If the caller cannot prove openness, fail closed without recording
+    # an attempted run so a later maintenance tick with GitHub access can try.
+    if issue_number is None or issue_is_open is None or not issue_is_open(issue_number):
         return None
     branch = str(experiment.branch_name or "").strip()
     started = _now()
@@ -104,6 +107,7 @@ def reverify_parked(
     temp_root = Path(tempfile.mkdtemp(prefix="nexus-reverify-"))
     worktree = temp_root / "worktree"
     added = False
+    keep_worktree = False
     try:
         branch_ref = _run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo)
         if branch_ref.returncode:
@@ -163,6 +167,12 @@ def reverify_parked(
                         service._force_status(experiment_id, STATUS_NEEDS_REVIEW, error=reason, ended_at=_now())
                     else:
                         verdict = "passes_now"
+                        # Adoption validates and integrates the exact worktree
+                        # which verification passed.  Keep this registered
+                        # temporary worktree alive until the normal adoption
+                        # path consumes it; deleting it here would make the
+                        # freshly succeeded experiment impossible to adopt.
+                        keep_worktree = True
                         # Adoption and its mandatory review/CI checks must inspect
                         # the rebased commit, never the stale pre-rebase checkpoint.
                         try:
@@ -177,6 +187,13 @@ def reverify_parked(
                 elif result is not None:
                     reason = str(result.error or f"verification ended {result.status}")
                     verdict = f"still_blocked:{reason}"
+                    # A deterministic failure found by this maintenance pass
+                    # is still parked work, not a new failed coding attempt.
+                    # Keeping the terminal state as needs_review also makes the
+                    # verdict and experiment lifecycle agree.
+                    service._force_status(
+                        experiment_id, STATUS_NEEDS_REVIEW, error=reason, ended_at=_now(),
+                    )
     except Exception as exc:  # every attempted run gets a durable verdict
         reason = f"reverification error: {type(exc).__name__}: {str(exc)[:1000]}"
         verdict = f"still_blocked:{reason}"
@@ -186,9 +203,10 @@ def reverify_parked(
                 experiment_id, STATUS_NEEDS_REVIEW, error=reason, ended_at=_now(),
             )
     finally:
-        if added:
+        if added and not keep_worktree:
             _run_git(["worktree", "remove", "--force", str(worktree)], cwd=repo)
-        shutil.rmtree(temp_root, ignore_errors=True)
+        if not keep_worktree:
+            shutil.rmtree(temp_root, ignore_errors=True)
 
     finished = _now()
     with service._lock, service._conn:
