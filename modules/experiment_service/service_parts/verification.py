@@ -298,6 +298,9 @@ class VerificationMixin:
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
             )
             return None
+        # Per-test failure text by exact node id (#737), for the events below.
+        drift_tails: dict[str, str] = {}
+        control_tails: dict[str, str] = {}
         try:
             # The HEAD diff alone misses work a GitHub checkpoint already
             # committed, so the paths changed since the base count too.
@@ -321,6 +324,7 @@ class VerificationMixin:
 
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
+                tails=drift_tails,
             )
             control = None
             flagged = timing_check_module.flagged_tests(result)
@@ -329,7 +333,7 @@ class VerificationMixin:
                 # when the same test passes here without drift.
                 control = timing_check_module.control_check(
                     worktree_path, flagged, on_process=track,
-                    python=self.test_python_executable,
+                    python=self.test_python_executable, tails=control_tails,
                 )
                 if control is None:
                     result = "error: control run without drift gave no verdict"
@@ -351,14 +355,23 @@ class VerificationMixin:
                 elog.error(
                     "verifying", "timing_check_flagged", error,
                     fails_without_drift=fails_without_drift,
+                    tails={test: drift_tails[test] for test in drift_only if test in drift_tails},
                 )
                 return STATUS_FAILED, error
             result = (
                 "error: these tests fail on this host without drift too, so there is "
                 "no timing verdict: " + ", ".join(fails_without_drift)
             )
+            # Why they fail here: the control run's text, else the drift run's.
+            tails = {
+                test: control_tails.get(test) or drift_tails[test]
+                for test in fails_without_drift
+                if test in control_tails or test in drift_tails
+            }
+        else:
+            tails = dict(drift_tails)
         error = f"timing check failed closed: {result}"
-        elog.warning("verifying", "timing_check_failed_closed", error)
+        elog.warning("verifying", "timing_check_failed_closed", error, tails=tails)
         return STATUS_NEEDS_REVIEW, error
 
 
