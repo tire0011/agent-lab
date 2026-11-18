@@ -13,7 +13,6 @@ import logging
 import os
 import re
 import sqlite3
-import subprocess
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -1237,25 +1236,32 @@ class NexusInitiativeService:
         if (os.environ.get("NEXUS_REVERIFY_PARKED", "1").strip().lower()
                 in {"0", "false", "off", "no"}):
             return
-        from modules.experiment_service.reverify import parked_candidates, reverify_parked
+        from modules.experiment_service.reverify import (
+            SKIPPED_PREFIX, current_main, parked_candidates, reverify_parked,
+        )
 
         repo = str(getattr(self.experiment_service, "repo_root", ""))
-        if not repo:
+        if not repo or self._issue_lister is None:
+            # Without the open-issue list nothing could run anyway.
             return
         try:
-            main = subprocess.run(
-                ["git", "rev-parse", "main"], cwd=repo, capture_output=True,
-                text=True, timeout=10, check=True,
-            ).stdout.strip()
+            main = current_main(repo)
             open_numbers = {
-                int(item["number"]) for item in (self._issue_lister() if self._issue_lister else [])
+                int(item["number"]) for item in (self._issue_lister() or [])
                 if item.get("number") is not None
             }
-            is_open = (lambda number: number in open_numbers) if self._issue_lister else None
-            for experiment_id in parked_candidates(self.experiment_service, main, limit=3):
-                reverify_parked(
-                    experiment_id, service=self.experiment_service, issue_is_open=is_open,
+            runs = 0
+            # Skipped rows (closed issue) do not count, so up to three real runs
+            # happen even when newer parked experiments belong to closed issues.
+            for experiment_id in parked_candidates(self.experiment_service, main, limit=20):
+                outcome = reverify_parked(
+                    experiment_id, service=self.experiment_service,
+                    issue_is_open=lambda number: number in open_numbers, main_sha=main,
                 )
+                if outcome and not str(outcome.get("verdict", "")).startswith(SKIPPED_PREFIX):
+                    runs += 1
+                    if runs >= 3:
+                        break
         except Exception as exc:  # noqa: BLE001 - maintenance must not stop a tick
             logger.warning("initiative: parked re-verification failed: %s", exc)
 

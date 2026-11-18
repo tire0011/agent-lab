@@ -10,8 +10,13 @@ from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
-from modules.experiment_service.reverify import list_reverifications, reverify_parked
-from modules.nexus_initiative import NexusInitiativeService
+from unittest.mock import MagicMock
+
+from modules.experiment_service.reverify import (
+    list_reverifications, parked_candidates, reverify_parked,
+)
+from modules.nexus_initiative import KIND_INTEGRATION, NexusInitiativeService
+from modules.nexus_planner import _history_line
 from modules.run_store import init_db
 
 
@@ -28,6 +33,7 @@ class FakeService:
         self._lock = threading.Lock()
         self.verify_calls = 0
         self.verify_error = None
+        self.verify_kwargs: list[dict] = []
 
     def add(self, branch: str) -> None:
         self._conn.execute(
@@ -52,8 +58,14 @@ class FakeService:
         )
         self._conn.commit()
 
-    def _verify(self, experiment_id: str, worktree: str):
+    def _verify(self, experiment_id: str, worktree: str, **kwargs):
         self.verify_calls += 1
+        self.verify_kwargs.append(kwargs)
+        # Like the real verifier: the run's evidence is rewritten.
+        self._force_status(
+            experiment_id, "verifying", test_output="re-verification output",
+            diff_text="rebased diff", base_commit_sha="rebased-base",
+        )
         if self.verify_error:
             self._force_status(
                 experiment_id, "failed", ended_at="now", error=self.verify_error,
@@ -101,6 +113,7 @@ class ReverifyParkedTests(unittest.TestCase):
         git(self.repo, "checkout", "main")
         (self.repo / "value.txt").write_text("main\n", encoding="utf-8")
         git(self.repo, "commit", "-am", "main")
+        git(self.repo, "push", "origin", "main")
         self.service.add("parked")
 
         result = reverify_parked("exp", service=self.service, issue_is_open=lambda _n: True)
@@ -109,12 +122,14 @@ class ReverifyParkedTests(unittest.TestCase):
         self.assertEqual(git(self.repo, "rev-parse", "parked"), parked_sha)
         self.assertEqual(self.service.verify_calls, 0)
 
-    def test_closed_issue_is_not_run_or_recorded(self) -> None:
+    def test_closed_issue_is_not_run_but_recorded_as_skipped(self) -> None:
         self.service.add("missing")
-        self.assertIsNone(
-            reverify_parked("exp", service=self.service, issue_is_open=lambda _n: False)
-        )
-        self.assertEqual(list_reverifications(self.service), [])
+        result = reverify_parked("exp", service=self.service, issue_is_open=lambda _n: False)
+        self.assertEqual(result["verdict"], "skipped:issue_closed")
+        self.assertEqual(self.service.verify_calls, 0)
+        # It no longer occupies a candidate slot on this main commit.
+        main = git(self.repo, "rev-parse", "origin/main")
+        self.assertEqual(parked_candidates(self.service, main), [])
 
     def test_missing_issue_lookup_fails_closed(self) -> None:
         self.service.add("missing")
@@ -162,7 +177,107 @@ class ReverifyParkedTests(unittest.TestCase):
 
         self.assertTrue(result["verdict"].startswith("still_blocked:"))
         self.assertIn("test_real_failure", result["verdict"])
-        self.assertEqual(self.service.get_experiment("exp").status, "needs_review")
+        experiment = self.service.get_experiment("exp")
+        self.assertEqual(experiment.status, "needs_review")
+        # The parking evidence is restored, so the experiment stays eligible
+        # once main moves on.
+        self.assertEqual(experiment.error, "timing check failed closed: host failure")
+        self.assertIsNone(experiment.test_output)
+        self.assertIsNone(experiment.diff_text)
+        self.assertIsNone(experiment.worktree_path)
+        git(self.repo, "checkout", "main")
+        (self.repo / "other.txt").write_text("x\n", encoding="utf-8")
+        git(self.repo, "add", "other.txt")
+        git(self.repo, "commit", "-m", "main moves")
+        git(self.repo, "push", "origin", "main")
+        self.assertEqual(parked_candidates(self.service, git(self.repo, "rev-parse", "main")), ["exp"])
+
+    def test_verifier_routes_soft_findings_to_the_reviewer(self) -> None:
+        self._parked_feature_branch()
+        reverify_parked("exp", service=self.service, issue_is_open=lambda _n: True)
+        self.assertEqual(self.service.verify_kwargs, [{"soft_findings_to_reviewer": True}])
+
+    def test_rebases_onto_fetched_origin_main_not_stale_local_main(self) -> None:
+        self._parked_feature_branch()
+        # A merge lands on GitHub; the local main does not know it yet.
+        other = Path(self.tmp.name) / "other"
+        subprocess.run(["git", "clone", "-q", "-b", "main", str(self.remote), str(other)], check=True)
+        git(other, "config", "user.email", "o@example.invalid")
+        git(other, "config", "user.name", "Other")
+        (other / "merged.txt").write_text("merged\n", encoding="utf-8")
+        git(other, "add", "merged.txt")
+        git(other, "commit", "-m", "merged on GitHub")
+        git(other, "push", "origin", "main")
+        remote_main = git(other, "rev-parse", "HEAD")
+        self.assertNotEqual(git(self.repo, "rev-parse", "main"), remote_main)
+
+        result = reverify_parked("exp", service=self.service, issue_is_open=lambda _n: True)
+
+        self.assertEqual(result["verdict"], "passes_now")
+        self.assertEqual(result["main_commit_sha"], remote_main)
+        pushed = git(self.repo, "ls-remote", "origin", "refs/heads/parked").split()[0]
+        self.assertEqual(git(self.repo, "rev-parse", f"{pushed}~1"), remote_main)
+
+    def test_pass_reaches_the_adoption_queue_and_review_is_not_skipped(self) -> None:
+        self._parked_feature_branch()
+        reverify_parked("exp", service=self.service, issue_is_open=lambda _n: True)
+        paid_client = MagicMock()
+        initiative = NexusInitiativeService(
+            db_path=str(Path(self.tmp.name) / "runs.db"),
+            experiment_service=self.service,
+            controller=SimpleNamespace(handle_issue=paid_client),
+            daily_budget=5,
+            reflection_sweep=lambda **kwargs: None,
+        )
+        try:
+            candidates = initiative._integration_candidates()
+        finally:
+            initiative.close()
+        # The pass is a normal adoption candidate: adoption (with its paid
+        # review) has not started, and nothing was integrated or reviewed here.
+        self.assertEqual([(c.kind, c.ref) for c in candidates], [(KIND_INTEGRATION, "exp")])
+        self.assertEqual(candidates[0].payload["adoption_status"], "not_started")
+        paid_client.assert_not_called()
+
+    def test_planner_shows_ready_only_while_adoption_is_pending(self) -> None:
+        row = {"title": "T", "status": "succeeded", "error": "",
+               "reverification_verdict": "passes_now", "adoption_reason": ""}
+        for status in ("", "not_started", "queued", "adopting"):
+            self.assertIn("ready, no paid start needed", _history_line({**row, "adoption_status": status}))
+        failed = _history_line({**row, "adoption_status": "failed", "adoption_reason": "Review by codex blocked"})
+        self.assertNotIn("ready, no paid start needed", failed)
+        self.assertIn("blocked by review", failed)
+
+    def test_tick_with_flag_off_never_reverifies(self) -> None:
+        initiative = NexusInitiativeService(
+            db_path=str(Path(self.tmp.name) / "initiative.db"),
+            experiment_service=self.service,
+            controller=SimpleNamespace(handle_issue=MagicMock()),
+            daily_budget=5,
+            reflection_sweep=lambda **kwargs: None,
+        )
+        try:
+            with patch.dict("os.environ", {"NEXUS_REVERIFY_PARKED": "off"}), \
+                    patch("modules.experiment_service.reverify.reverify_parked") as run, \
+                    patch.object(initiative, "_paused", return_value=False), \
+                    patch.object(initiative, "_sweep_stalled_experiments"), \
+                    patch.object(initiative, "enforce_issue_approvals"), \
+                    patch.object(initiative, "busy_reason", return_value=None), \
+                    patch.object(initiative, "_stale_service_revisions", return_value=None), \
+                    patch.object(initiative, "candidates", return_value=[]):
+                self.assertEqual(initiative.tick().decision, "idle")
+            run.assert_not_called()
+        finally:
+            initiative.close()
+
+    def _parked_feature_branch(self) -> None:
+        git(self.repo, "checkout", "-b", "parked")
+        (self.repo / "feature.txt").write_text("done\n", encoding="utf-8")
+        git(self.repo, "add", "feature.txt")
+        git(self.repo, "commit", "-m", "feature")
+        git(self.repo, "push", "-u", "origin", "parked")
+        git(self.repo, "checkout", "main")
+        self.service.add("parked")
 
 
 if __name__ == "__main__":

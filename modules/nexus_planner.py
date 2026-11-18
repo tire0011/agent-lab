@@ -76,9 +76,16 @@ def _merge_label(status: str, reason: str) -> str:
     return status
 
 
+_ADOPTION_PENDING = ("", "not_started", "queued", "adopting")
+
+
 def _history_line(r: dict[str, Any]) -> str:
     """One recent experiment; with its merge outcome when that is known."""
-    if r.get("reverification_verdict") == "passes_now":
+    # A free re-verification passed (#718): ready only while its adoption has
+    # not finished; afterwards the real adoption outcome is shown below.
+    if r.get("reverification_verdict") == "passes_now" and str(
+        r.get("adoption_status") or ""
+    ) in _ADOPTION_PENDING:
         return f"- ready, no paid start needed: {r.get('title', '')}"
     if "adoption_status" not in r:
         detail = r.get("error") or ""

@@ -14,6 +14,18 @@ from .git_utils import _run_git
 from .models import STATUS_NEEDS_REVIEW, STATUS_SUCCEEDED, STATUS_VERIFYING
 
 _ALLOWED_ERROR_PREFIXES = ("timing check failed closed",)
+# The parked run's evidence. A re-verification that does not pass restores it,
+# so the experiment keeps its original error and stays eligible on the next
+# main commit; the new verdict lives only in ``reverifications`` (#718 review).
+_EVIDENCE_COLUMNS = (
+    "status", "error", "ended_at", "worktree_path", "base_commit_sha",
+    "test_command_json", "test_exit_code", "test_output", "git_status",
+    "diff_stat", "diff_text", "quality_evaluation_json", "failure_phase",
+    "failure_type", "baseline_test_classifications_json",
+)
+# Verdicts that did not really run the branch; they do not count toward the
+# per-tick limit, so closed issues can never starve open ones.
+SKIPPED_PREFIX = "skipped:"
 _ISSUE_RE = re.compile(r"\bGitHub\s+Issue\s+#(\d+)\b", re.IGNORECASE)
 
 
@@ -36,6 +48,79 @@ def _issue_number(service: Any, experiment: Any) -> int | None:
     return int(match.group(1)) if match else None
 
 
+def _snapshot(service: Any, experiment_id: str) -> dict[str, Any]:
+    with service._lock:
+        row = service._conn.execute(
+            f"SELECT {', '.join(_EVIDENCE_COLUMNS)} FROM experiments WHERE id=?",
+            (experiment_id,),
+        ).fetchone()
+    return dict(row) if row is not None else {}
+
+
+def _restore(service: Any, experiment_id: str, snapshot: dict[str, Any]) -> None:
+    if not snapshot:
+        return
+    columns = list(snapshot)
+    with service._lock, service._conn:
+        service._conn.execute(
+            f"UPDATE experiments SET {', '.join(f'{c}=?' for c in columns)} WHERE id=?",
+            (*(snapshot[c] for c in columns), experiment_id),
+        )
+
+
+def _has_origin(repo: str) -> bool:
+    return _run_git(["remote", "get-url", "origin"], cwd=repo).returncode == 0
+
+
+def current_main(repo: str) -> str:
+    """The commit to rebase onto: ``origin/main`` after a fetch.
+
+    On the VM merges land through GitHub, so local ``main`` can be stale. A
+    repository without an ``origin`` remote (local use) falls back to ``main``.
+    """
+    if _has_origin(repo):
+        fetch = _run_git(["fetch", "--quiet", "origin", "main"], cwd=repo, timeout=120)
+        if fetch.returncode:
+            raise RuntimeError(fetch.stderr.strip() or "git fetch origin main failed")
+        ref = "refs/remotes/origin/main"
+    else:
+        ref = "main"
+    main = _run_git(["rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=repo)
+    if main.returncode:
+        raise RuntimeError(main.stderr.strip() or f"cannot resolve {ref}")
+    return main.stdout.strip()
+
+
+def _branch_sha(repo: str, branch: str) -> str | None:
+    """The published branch head (fetched from origin when there is one)."""
+    if _has_origin(repo):
+        fetch = _run_git(
+            ["fetch", "--quiet", "origin", f"+refs/heads/{branch}:refs/remotes/origin/{branch}"],
+            cwd=repo, timeout=120,
+        )
+        if fetch.returncode == 0:
+            ref = _run_git(["rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo)
+            return ref.stdout.strip() if ref.returncode == 0 else None
+    ref = _run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo)
+    return ref.stdout.strip() if ref.returncode == 0 else None
+
+
+def _record(service: Any, experiment_id: str, issue_number: int | None, main_sha: str,
+            branch: str | None, old_sha: str | None, new_sha: str | None,
+            verdict: str, reason: str | None, started: str) -> dict[str, Any]:
+    with service._lock, service._conn:
+        service._conn.execute(
+            """INSERT OR IGNORE INTO reverifications
+               (experiment_id, issue_number, main_commit_sha, branch_name,
+                old_branch_sha, new_branch_sha, verdict, reason, created_at, finished_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (experiment_id, issue_number, main_sha, branch or None, old_sha, new_sha,
+             verdict, reason, started, _now()),
+        )
+    return {"experiment_id": experiment_id, "issue_number": issue_number,
+            "main_commit_sha": main_sha, "verdict": verdict, "reason": reason}
+
+
 def list_reverifications(service: Any, limit: int = 50) -> list[dict[str, Any]]:
     """Return recent durable re-verification verdicts, newest first."""
     if limit <= 0:
@@ -49,7 +134,11 @@ def list_reverifications(service: Any, limit: int = 50) -> list[dict[str, Any]]:
 
 
 def parked_candidates(service: Any, main_commit_sha: str, limit: int = 3) -> list[str]:
-    """Newest eligible experiments not yet checked for this exact main tree."""
+    """Newest eligible experiments not yet checked for this exact main tree.
+
+    Closed or unresolvable issues get a ``skipped:`` row for the main commit,
+    so they drop out here and older parked work with open issues is reached.
+    """
     with service._lock:
         rows = service._conn.execute(
             """SELECT e.id FROM experiments e
@@ -69,6 +158,7 @@ def reverify_parked(
     *,
     service: Any,
     issue_is_open: Callable[[int], bool] | None = None,
+    main_sha: str | None = None,
 ) -> dict[str, Any] | None:
     """Rebase and run the normal verifier without calling a coding model.
 
@@ -82,10 +172,8 @@ def reverify_parked(
     ):
         return None
     repo = str(service.repo_root)
-    main = _run_git(["rev-parse", "main"], cwd=repo)
-    if main.returncode:
-        raise RuntimeError(main.stderr.strip() or "cannot resolve main")
-    main_sha = main.stdout.strip()
+    if main_sha is None:
+        main_sha = current_main(repo)
     with service._lock:
         if service._conn.execute(
             "SELECT 1 FROM reverifications WHERE experiment_id=? AND main_commit_sha=?",
@@ -94,12 +182,18 @@ def reverify_parked(
             return None
     issue_number = _issue_number(service, experiment)
     # Re-verification must never resurrect work for a closed (or unresolvable)
-    # issue.  If the caller cannot prove openness, fail closed without recording
-    # an attempted run so a later maintenance tick with GitHub access can try.
-    if issue_number is None or issue_is_open is None or not issue_is_open(issue_number):
+    # issue.  Without an openness check (no GitHub access) nothing is recorded,
+    # so a later tick with access can try; a known closed or unresolvable issue
+    # is recorded as skipped for this main commit so it stops being picked.
+    if issue_is_open is None:
         return None
-    branch = str(experiment.branch_name or "").strip()
     started = _now()
+    if issue_number is None or not issue_is_open(issue_number):
+        verdict = f"{SKIPPED_PREFIX}{'no_issue' if issue_number is None else 'issue_closed'}"
+        return _record(service, experiment_id, issue_number, main_sha,
+                       experiment.branch_name, None, None, verdict, None, started)
+    branch = str(experiment.branch_name or "").strip()
+    snapshot = _snapshot(service, experiment_id)
     old_sha: str | None = None
     new_sha: str | None = None
     reason: str | None = None
@@ -109,13 +203,10 @@ def reverify_parked(
     added = False
     keep_worktree = False
     try:
-        branch_ref = _run_git(["rev-parse", "--verify", f"refs/heads/{branch}"], cwd=repo)
-        if branch_ref.returncode:
-            branch_ref = _run_git(["rev-parse", "--verify", f"refs/remotes/origin/{branch}"], cwd=repo)
-        if not branch or branch_ref.returncode:
+        old_sha = _branch_sha(repo, branch) if branch else None
+        if old_sha is None:
             reason = "branch does not exist locally or on origin"
         else:
-            old_sha = branch_ref.stdout.strip()
             add = _run_git(["worktree", "add", "--detach", str(worktree), old_sha], cwd=repo)
             if add.returncode:
                 raise RuntimeError(add.stderr.strip() or "could not create re-verification worktree")
@@ -138,7 +229,12 @@ def reverify_parked(
                     base_commit_sha=main_sha, error=None, ended_at=None,
                 )
                 try:
-                    result = service._verify(experiment_id, str(worktree))
+                    # Same gate as the original GitHub-tracked run: soft quality
+                    # findings go to the reviewer at adoption (#519), not to a
+                    # hard needs_review stop.
+                    result = service._verify(
+                        experiment_id, str(worktree), soft_findings_to_reviewer=True,
+                    )
                 except Exception as exc:  # a crashed verifier is not a pass
                     reason = f"verification error: {type(exc).__name__}: {str(exc)[:1000]}"
                     verdict = f"still_blocked:{reason}"
@@ -208,15 +304,9 @@ def reverify_parked(
         if not keep_worktree:
             shutil.rmtree(temp_root, ignore_errors=True)
 
-    finished = _now()
-    with service._lock, service._conn:
-        service._conn.execute(
-            """INSERT OR IGNORE INTO reverifications
-               (experiment_id, issue_number, main_commit_sha, branch_name,
-                old_branch_sha, new_branch_sha, verdict, reason, created_at, finished_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (experiment_id, issue_number, main_sha, branch or None, old_sha, new_sha,
-             verdict, reason, started, finished),
-        )
-    return {"experiment_id": experiment_id, "issue_number": issue_number,
-            "main_commit_sha": main_sha, "verdict": verdict, "reason": reason}
+    if verdict != "passes_now":
+        # Not a pass: the parked run's evidence and error stand unchanged, so
+        # the experiment stays eligible and nothing points at a deleted path.
+        _restore(service, experiment_id, snapshot)
+    return _record(service, experiment_id, issue_number, main_sha, branch,
+                   old_sha, new_sha, verdict, reason, started)
