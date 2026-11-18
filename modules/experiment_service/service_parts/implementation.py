@@ -19,7 +19,8 @@ from modules.coding_provider import (
 )
 from modules.coding_worker import agent_watchdog_limits
 from modules.experiment_handover import model_written_tests_block, with_model_written_tests
-from modules.local_coding_worker import local_not_called_reason
+from modules import handover_fact_check
+from modules.local_coding_worker import _goal_text, local_not_called_reason
 from modules.local_file_localizer import with_hint as with_likely_files_hint
 
 from ..git_utils import _run_git
@@ -69,6 +70,20 @@ def _take_model_written_tests(worker: Any, worktree_path: str) -> str:
     except OSError:
         pass
     return model_written_tests_block(str(rel), content, tests)
+
+
+def _with_repo_facts(prompt: str, worktree_path: str, elog: Any) -> str:
+    """*prompt* with the deterministic ``Repo facts:`` block of its goal (#735).
+
+    No local client here: an ambiguous name keeps all its candidates listed.
+    """
+    if handover_fact_check.has_facts(prompt):
+        return prompt
+    block = handover_fact_check.run_check(
+        _goal_text(prompt), worktree_path, client=None,
+        experiment_logger=elog, phase="implementation",
+    )
+    return handover_fact_check.with_facts(prompt, block or "")
 
 
 def _report_issue_progress(
@@ -298,6 +313,10 @@ class ImplementationMixin:
             f"Implementation runs on coding agent {implementation_provider or 'unknown'}",
             provider=implementation_provider or "",
         )
+        if implementation_provider != "local":
+            # #735: the paid coder gets the names its task gives checked against
+            # the repo (the local worker runs the same check with its own client).
+            implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
 
         stall_seconds, max_seconds = agent_watchdog_limits()
 
@@ -353,6 +372,13 @@ class ImplementationMixin:
             implementation_prompt = with_likely_files_hint(
                 implementation_prompt, getattr(worker, "likely_files_hint", "") or ""
             )
+            # #735: and the same ``Repo facts:`` block, checked once per run.
+            if getattr(worker, "repo_facts_checked", False) is True:
+                implementation_prompt = handover_fact_check.with_facts(
+                    implementation_prompt, getattr(worker, "repo_facts_block", "") or ""
+                )
+            else:
+                implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
             worker = self.worker_factory(worktree_path)
             implementation_provider = provider_of(worker)
             elog.warning(

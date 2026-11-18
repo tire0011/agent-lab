@@ -1672,6 +1672,9 @@ class LocalCodingWorker:
         # #720: the ``Likely files:`` line of this run, for the paid handover.
         self.likely_files: tuple[str, ...] = ()
         self.likely_files_hint = ""
+        # #735: this run's ``Repo facts:`` block, for the paid handover.
+        self.repo_facts_block = ""
+        self.repo_facts_checked = False
 
     def run(self, *, task: str, working_dir: str, sandbox: str,
             timeout_seconds: float = 300, experiment_logger: Any | None = None,
@@ -1688,6 +1691,8 @@ class LocalCodingWorker:
         self.sr_grammar = False
         self.likely_files = ()
         self.likely_files_hint = ""
+        self.repo_facts_block = ""
+        self.repo_facts_checked = False
         # #685: another process may use the slot between runs; start cold.
         self._last_sent = None
         self._last_prefix_reuse = self._reuse_tokens = self._reuse_prompt_tokens = 0
@@ -1750,8 +1755,11 @@ class LocalCodingWorker:
                     local_attempt_passed_generated_tests=None, paid_fallback_used=False,
                     tests=list(self.generated_tests),
                 )
+            # #735: the names the task gives, checked against the repo first.
+            prompt_task, facts_spent = self._fact_check(task, working_dir, experiment_logger, phase)
+            timeout_seconds = max(0.0, float(timeout_seconds) - facts_spent)
             # #720: optional localization, charged to this run's time budget.
-            prompt_task, spent = self._localize(task, working_dir, timeout_seconds,
+            prompt_task, spent = self._localize(prompt_task, working_dir, timeout_seconds,
                                                 experiment_logger, phase)
             timeout_seconds = max(0.0, float(timeout_seconds) - spent)
             try:
@@ -1826,6 +1834,33 @@ class LocalCodingWorker:
             # An httpx timeout stringifies to "" - never record an empty error (#642).
             error = str(exc).strip() or f"{type(exc).__name__} (no message)"
             return self._result(task, working_dir, "", error, started, success=False, exit_code=1)
+
+    # Handover fact check (#735)
+
+    def _fact_check(self, task: str, working_dir: str, experiment_logger: Any | None,
+                    phase: str) -> tuple[str, float]:
+        """``(task with the Repo facts block, seconds spent)`` behind ``NEXUS_HANDOVER_FACT_CHECK``.
+
+        A task that already carries the block (the launcher's) is reused
+        without a second check. Otherwise the goal is checked once; only an
+        ambiguous ``moved`` name costs one bounded call on this worker's client.
+        """
+        from modules import handover_fact_check as hfc
+
+        if not hfc.enabled():
+            return task, 0.0
+        self.repo_facts_checked = True
+        if hfc.has_facts(task):
+            return task, 0.0
+        started = time.monotonic()
+        try:
+            block = hfc.run_check(_goal_text(task), working_dir, client=self.client,
+                                  experiment_logger=experiment_logger, phase=phase) or ""
+        finally:
+            # A disambiguation call used the slot without going through _model_call.
+            self._last_sent = None
+        self.repo_facts_block = block
+        return hfc.with_facts(task, block), round(time.monotonic() - started, 3)
 
     # Localization (#720)
 
