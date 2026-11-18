@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from modules.claude_worker import ClaudeWorker
-from modules.coding_provider import PROVIDER_CLAUDE, PROVIDER_CODEX
+from modules.coding_provider import KNOWN_PROVIDERS, PROVIDER_CLAUDE, PROVIDER_CODEX
 from modules.coding_worker import WorkerResult
 from modules.codex_task_service import (
     STATUS_QUEUED,
@@ -111,7 +111,7 @@ class TaskProviderTests(unittest.TestCase):
                 service.create_task(prompt=f"task {i}", working_dir="/agent").provider
                 for i in range(40)
             }
-        self.assertEqual(providers, {PROVIDER_CODEX, PROVIDER_CLAUDE})
+        self.assertEqual(providers, set(KNOWN_PROVIDERS))
 
     def test_run_task_builds_the_worker_for_the_recorded_provider(self):
         service = self._service()
@@ -278,7 +278,7 @@ class ExperimentProviderTests(unittest.TestCase):
                 service.worker_factory(str(self.worktrees_root / f"exp-{i}")).provider
                 for i in range(40)
             }
-        self.assertEqual(providers, {PROVIDER_CODEX, PROVIDER_CLAUDE})
+        self.assertEqual(providers, set(KNOWN_PROVIDERS))
 
 
 if __name__ == "__main__":

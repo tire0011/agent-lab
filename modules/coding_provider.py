@@ -1,12 +1,15 @@
 """Which external coding agent runs the next task.
 
-Providers (Codex, Claude Code) are selected in a durable SQLite-backed
+Providers (Codex, Claude Code, Mistral) are selected in a durable SQLite-backed
 round-robin that survives restarts, so consecutive units of work use different
 agents. Before rotating, the selection is narrowed: ``AGENT_CODING_PROVIDER``
 pins one (unknown values ignored), ``AGENT_CODING_PROVIDERS`` is the allow list,
-and providers whose CLI is not installed are dropped. If nothing is installed,
-the first allowed provider is still returned - the run then fails with the
-ordinary "binary not found" error, an honest failure over a silent no-op.
+and providers that are not available are dropped - for Codex/Claude that means
+the CLI is not installed, for Mistral a coding-role model in
+``config/models.json`` with its API key set. If nothing is available, the first
+allowed provider is still returned - the run then fails with the ordinary
+"binary not found" / "no available model" error, an honest failure over a
+silent no-op.
 """
 
 from __future__ import annotations
@@ -27,11 +30,12 @@ from modules.local_coding_worker import (
     LocalCodingWorker, PROVIDER as PROVIDER_LOCAL, task_split_enabled, test_first_enabled,
     local_samples, sample_temperatures,
 )
+from modules.mistral_worker import PROVIDER as PROVIDER_MISTRAL, MistralWorker, coding_model
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
 
-KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE)
+KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE, PROVIDER_MISTRAL)
 EXTERNAL_PROVIDERS: tuple[str, ...] = KNOWN_PROVIDERS
 
 ENV_PROVIDER_PIN = "AGENT_CODING_PROVIDER"
@@ -60,7 +64,11 @@ def provider_binary(provider: str) -> str:
 
 
 def is_available(provider: str) -> bool:
-    """Whether this provider's CLI is installed and executable here."""
+    """Whether this provider can run here: its CLI is installed and executable
+    (Codex, Claude), or - Mistral has no CLI - a coding-role registry model with
+    its API key is configured."""
+    if _normalize(provider) == PROVIDER_MISTRAL:
+        return coding_model() is not None
     try:
         binary = provider_binary(provider)
     except UnknownProviderError:
@@ -215,6 +223,8 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
         return CodexWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_CLAUDE:
         return ClaudeWorker(db_path=db_path, **kwargs)
+    if provider == PROVIDER_MISTRAL:
+        return MistralWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_LOCAL:
         # #598: split into small subtasks first unless LOCAL_TASK_SPLIT turns it off.
         kwargs.setdefault("split_tasks", task_split_enabled())
