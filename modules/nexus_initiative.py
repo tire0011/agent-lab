@@ -25,6 +25,7 @@ from modules import issue_approvals
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
+from modules.gate_preflight import PreflightResult, preflight
 from modules.nexus_planner import PROPOSAL_LABEL
 from modules.nexus_sources import issue_source
 from modules.redaction import sanitized_reason
@@ -115,6 +116,7 @@ def _split_depth(body: str) -> int:
 # The owner paused Nexus: no new work, no adoption, no retries. Experiments
 # already running finish.
 DECISION_PAUSED = "paused"
+DECISION_PREFLIGHT_BLOCKED = "preflight_blocked"
 # Reasons only _check_goal_policy produces. A rejection with one of them is
 # known in advance from the goal text, so retrying the same text is pointless.
 _GOAL_POLICY_REASON_PREFIXES = tuple(
@@ -249,6 +251,8 @@ class NexusInitiativeService:
         proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
+        preflight_repo: str | os.PathLike[str] | None = None,
+        gate_preflight: Callable[[str, str | os.PathLike[str], float], PreflightResult] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -272,6 +276,8 @@ class NexusInitiativeService:
         self._restart_hook = restart_hook
         self._main_commit_date = main_commit_date
         self._drift_reader = drift_reader
+        self._preflight_repo = Path(preflight_repo or Path.cwd())
+        self._gate_preflight = gate_preflight or preflight
         if reflection_sweep is None:
             from modules.experiment_reflection import reflect_pending
 
@@ -587,6 +593,17 @@ class NexusInitiativeService:
         self._exhausted_issues = []
         self._exhausted_bodies: dict[int, str] = {}
         unapproved_skips = self._unapproved_issue_skips()
+        # A red-main issue should not monopolize every tick. Reconsider it
+        # after a bounded cooldown, when main or the verification host may
+        # have been repaired in the meantime.
+        preflight_cutoff = (_utcnow() - timedelta(hours=24)).isoformat()
+        preflight_blocked = {
+            str(row[0]) for row in self._conn.execute(
+                "SELECT DISTINCT source_ref FROM nexus_initiative_log "
+                "WHERE decision = ? AND created_at >= ?",
+                (DECISION_PREFLIGHT_BLOCKED, preflight_cutoff),
+            ).fetchall()
+        }
         for issue in issues:
             number = issue.get("number")
             labels = {
@@ -604,6 +621,8 @@ class NexusInitiativeService:
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
                     self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
+                continue
+            if str(number) in preflight_blocked:
                 continue
             raw_title = str(issue.get("title") or f"Issue #{number}")
             raw_body = str(issue.get("body") or "")
@@ -1534,6 +1553,42 @@ class NexusInitiativeService:
                         tick_id=tick_id,
                     )
                 )
+        if chosen.kind == KIND_ISSUE and os.environ.get("NEXUS_GATE_PREFLIGHT", "1").strip().lower() not in {
+            "0", "false", "no", "off",
+        }:
+            issue_text = f"{chosen.title}\n\n{chosen.payload.get('body') or ''}"
+            result = self._gate_preflight(issue_text, self._preflight_repo, 300)
+            logger.info("initiative: gate preflight for #%s status=%s wall_seconds=%.3f",
+                        chosen.ref, result.status, result.wall_seconds)
+            if result.blocked:
+                detail = json.dumps({
+                    "signature": result.signature,
+                    "failing_ids": list(result.failing_ids),
+                    "tails": result.tails,
+                    "wall_seconds": round(result.wall_seconds, 3),
+                }, sort_keys=True)[:12000]
+                decision = self._record(InitiativeDecision(
+                    DECISION_PREFLIGHT_BLOCKED, candidate=chosen, considered=found[:10],
+                    detail=detail, tick_id=tick_id,
+                ))
+                prior_blocks = self._conn.execute(
+                    "SELECT COUNT(*) FROM nexus_initiative_log "
+                    "WHERE decision = ? AND source_ref = ?",
+                    (DECISION_PREFLIGHT_BLOCKED, str(chosen.ref)),
+                ).fetchone()[0]
+                # The record above is the first one. Never spam the issue if a
+                # still-red host is reconsidered after its cooldown.
+                if self._issue_commenter is not None and prior_blocks == 1:
+                    try:
+                        tests = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
+                        self._issue_commenter(int(chosen.ref),
+                            "Nexus skipped the paid start because the same tests already fail on "
+                            f"clean `main` in the verification environment (drift 0):\n\n{tests}\n\n"
+                            f"Preflight wall time: {result.wall_seconds:.1f}s.")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("initiative: preflight comment failed for #%s: %s", chosen.ref, exc)
+                self._maybe_open_host_blocker(result)
+                return decision
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
@@ -1555,6 +1610,38 @@ class NexusInitiativeService:
                 _LOCAL_ONLY, detail=f"dispatch {tick_id} used only the local model", tick_id=f"local-{tick_id}",
             ))
         return decision
+
+    def _maybe_open_host_blocker(self, result: PreflightResult) -> None:
+        """After two distinct blocked issues, create one durable host blocker."""
+        if not result.signature or self._issue_creator is None:
+            return
+        marker = f'"signature": "{result.signature}"'
+        rows = self._conn.execute(
+            "SELECT DISTINCT source_ref FROM nexus_initiative_log "
+            "WHERE decision = ? AND detail LIKE ?",
+            (DECISION_PREFLIGHT_BLOCKED, f"%{marker}%"),
+        ).fetchall()
+        if len(rows) < 2:
+            return
+        created_marker = f"host_blocker_created:{result.signature}"
+        if self._conn.execute(
+            "SELECT 1 FROM nexus_initiative_log WHERE detail = ? LIMIT 1", (created_marker,)
+        ).fetchone():
+            return
+        ids = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
+        try:
+            self._issue_creator(
+                f"host_blocker: clean main fails preflight ({result.signature})",
+                "Two issues were blocked by the same clean-main failure signature. "
+                "Fix the verification host or main before spending another paid start.\n\n" + ids,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("initiative: host blocker creation failed: %s", exc)
+            return
+        self._record(InitiativeDecision(
+            "host_blocker_created", detail=created_marker,
+            tick_id=f"host-blocker-{result.signature}",
+        ))
 
     def _dispatch_was_paid(self, since: str) -> bool:
         """Whether this tick used a paid model (#541); unknown counts as paid.

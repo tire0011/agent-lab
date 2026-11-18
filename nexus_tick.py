@@ -349,6 +349,7 @@ def _build_service(args) -> NexusInitiativeService:
         checkout_revision=lambda: _checkout_revision(args.repo_root),
         main_commit_date=lambda: _main_commit_date(args.repo_root),
         restart_hook=_restart_stale_service,
+        preflight_repo=args.repo_root,
         daily_budget=args.daily_budget,
     )
 
