@@ -16,6 +16,7 @@ from modules.coding_provider import (
     KNOWN_PROVIDERS,
     PROVIDER_CLAUDE,
     PROVIDER_CODEX,
+    PROVIDER_MISTRAL,
     UnknownProviderError,
     allowed_providers,
     available_providers,
@@ -128,7 +129,9 @@ class ChooseProviderTests(PersistentDatabaseTestCase):
     def test_consecutive_selections_alternate(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
             selected = [choose_provider(db_path=self.db_path) for _ in range(4)]
-        self.assertEqual(selected, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
+        self.assertEqual(
+            selected, [KNOWN_PROVIDERS[i % len(KNOWN_PROVIDERS)] for i in range(4)]
+        )
 
     def test_rotation_persists_across_fresh_callers(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
@@ -167,8 +170,11 @@ class ChooseProviderTests(PersistentDatabaseTestCase):
 
 class BuildWorkerTests(PersistentDatabaseTestCase):
     def test_builds_the_matching_worker(self):
+        from modules.mistral_worker import MistralWorker
+
         self.assertIsInstance(build_worker(PROVIDER_CODEX), CodexWorker)
         self.assertIsInstance(build_worker(PROVIDER_CLAUDE), ClaudeWorker)
+        self.assertIsInstance(build_worker(PROVIDER_MISTRAL), MistralWorker)
 
     def test_provider_name_is_normalized(self):
         self.assertIsInstance(build_worker(" Claude "), ClaudeWorker)
@@ -200,19 +206,26 @@ class WorkerFactoryTests(PersistentDatabaseTestCase):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
             factory = random_worker_factory(db_path=self.db_path)
             drawn = [factory(f"/worktrees/exp-{i}").provider for i in range(4)]
-        self.assertEqual(drawn, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
+        self.assertEqual(
+            drawn, [KNOWN_PROVIDERS[i % len(KNOWN_PROVIDERS)] for i in range(4)]
+        )
 
     def test_non_sticky_factory_draws_every_call(self):
         with _clean_env(), _installed(*KNOWN_PROVIDERS):
             factory = random_worker_factory(db_path=self.db_path, sticky=False)
             drawn = [factory("/worktrees/exp-1").provider for _ in range(4)]
-        self.assertEqual(drawn, [PROVIDER_CODEX, PROVIDER_CLAUDE] * 2)
+        self.assertEqual(
+            drawn, [KNOWN_PROVIDERS[i % len(KNOWN_PROVIDERS)] for i in range(4)]
+        )
 
 
 class ProviderOfTests(unittest.TestCase):
     def test_reads_a_workers_provider(self):
+        from modules.mistral_worker import MistralWorker
+
         self.assertEqual(provider_of(CodexWorker()), PROVIDER_CODEX)
         self.assertEqual(provider_of(ClaudeWorker()), PROVIDER_CLAUDE)
+        self.assertEqual(provider_of(MistralWorker()), PROVIDER_MISTRAL)
 
     def test_anything_else_yields_the_default(self):
         from unittest.mock import MagicMock
