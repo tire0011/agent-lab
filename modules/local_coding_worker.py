@@ -1626,6 +1626,23 @@ class SampleStats:
         }
 
 
+class _CallTracker:
+    """Proxy for a llama client that records whether ``complete`` was called (#735)."""
+
+    def __init__(self, client: Any):
+        self._client = client
+        self.called = False
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._client, name)
+        if name == "complete" and callable(attr):
+            def complete(*args: Any, **kwargs: Any) -> Any:
+                self.called = True
+                return attr(*args, **kwargs)
+            return complete
+        return attr
+
+
 class LocalCodingWorker:
     provider = PROVIDER
 
@@ -1853,14 +1870,17 @@ class LocalCodingWorker:
         if hfc.has_facts(task):
             return task, 0.0
         started = time.monotonic()
+        client = _CallTracker(self.client) if self.client is not None else None
         try:
-            block = hfc.run_check(_goal_text(task), working_dir, client=self.client,
+            block = hfc.run_check(_goal_text(task), working_dir, client=client,
                                   experiment_logger=experiment_logger, phase=phase) or ""
         finally:
             # A disambiguation call used the slot without going through _model_call.
             self._last_sent = None
         self.repo_facts_block = block
-        return hfc.with_facts(task, block), round(time.monotonic() - started, 3)
+        # Only a disambiguation call is charged; the deterministic check is free.
+        spent = round(time.monotonic() - started, 3) if client is not None and client.called else 0.0
+        return hfc.with_facts(task, block), spent
 
     # Localization (#720)
 
