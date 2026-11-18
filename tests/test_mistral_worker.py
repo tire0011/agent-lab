@@ -186,6 +186,55 @@ class WorkerRunTests(_RepoMixin, unittest.TestCase):
         self.assertIn("Correction (round 1", calls[1]["messages"][0]["content"])
         self.assertEqual((self.repo / "value.txt").read_text(), "changed\n")
 
+    def test_usage_is_summed_across_correction_rounds(self):
+        bad = "value.txt\n<<<<<<< SEARCH\nnot there\n=======\nchanged\n>>>>>>> REPLACE\n"
+        answers = [
+            (bad, {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}),
+            (_SR_BLOCK, {"prompt_tokens": 20, "completion_tokens": 7, "total_tokens": 27}),
+        ]
+        live: list[dict] = []
+        calls = {"n": 0}
+
+        def transport(url, headers, body):
+            content, usage = answers[min(calls["n"], len(answers) - 1)]
+            calls["n"] += 1
+            return _chat_response(content, usage=usage)
+
+        worker = MistralWorker(transport=transport)
+        result = worker.run(
+            "change value.txt", str(self.repo), sandbox="workspace-write",
+            on_live_usage=live.append,
+        )
+        self.assertTrue(result.success, msg=result.stderr)
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(
+            result.usage,
+            {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42},
+        )
+        self.assertEqual(
+            live,
+            [
+                {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+                {"input_tokens": 30, "output_tokens": 12, "total_tokens": 42},
+            ],
+        )
+
+    def test_likely_files_hint_supplies_context_when_task_names_none(self):
+        seen: list[dict] = []
+
+        def capturing_transport(url, headers, body):
+            seen.append(body)
+            return _chat_response("just an answer")
+
+        worker = MistralWorker(transport=capturing_transport)
+        worker.run(
+            "rework the value handling\n\nLikely files: value.txt",
+            str(self.repo), sandbox="read-only",
+        )
+        prompt = seen[0]["messages"][0]["content"]
+        self.assertIn("--- value.txt ---", prompt)
+        self.assertIn("original", prompt)
+
     def test_search_replace_is_forced_even_in_diff_mode(self):
         with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "diff"}):
             worker = MistralWorker(transport=_transport(_SR_BLOCK))
