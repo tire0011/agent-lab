@@ -43,14 +43,15 @@ from modules.local_coding_worker import (
     _SR_CLOSING,
     _SYSTEM_PROMPT,
     _extract_diff,
+    _hinted_files,
     _is_search_replace_answer,
     _keywords,
-    _named_files,
     _render_feedback,
     _render_files,
     apply_and_check,
 )
 from modules.local_edit_format import edits_to_diff
+from modules.local_file_localizer import parse_likely_files
 
 #: This worker's provider name as recorded on every :class:`WorkerResult`.
 PROVIDER = "mistral"
@@ -101,7 +102,9 @@ def _build_prompt(task: str, working_dir: str, feedback: str = "") -> str:
     Without the file contents a SEARCH/REPLACE answer is guesswork, so the
     files are rendered exactly like the local worker renders them.
     """
-    files = _named_files(task, working_dir)
+    # Files named in the task first; when the task names none, the
+    # "Likely files:" hint (#720) supplies the target files instead.
+    files = _hinted_files(task, working_dir, parse_likely_files(task))
     files_text = _render_files(files, _keywords(task), (None, _MAX_FILE_BYTES))
     prompt = (
         f"{_SYSTEM_PROMPT}\n\n"
@@ -213,6 +216,21 @@ class MistralWorker:
         started = time.monotonic()
         timestamp = datetime.now(timezone.utc).isoformat()
         spec: model_registry.ModelSpec | None = None
+        # Usage is summed across all correction-round calls, so the audit row
+        # and any budget accounting see the whole run, not just the last call.
+        total_usage: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+        def note_usage(raw: dict[str, Any] | None) -> None:
+            mapped = _usage_dict(raw)
+            if mapped is None:
+                return
+            for key in total_usage:
+                total_usage[key] += mapped.get(key, 0)
+            if on_live_usage is not None:
+                try:
+                    on_live_usage(dict(total_usage))
+                except Exception:  # noqa: BLE001 - observers must not break the run
+                    pass
 
         def finish(
             success: bool,
@@ -225,6 +243,8 @@ class MistralWorker:
             usage: dict[str, int] | None = None,
             error: str | None = None,
         ) -> WorkerResult:
+            if usage is None:
+                usage = dict(total_usage) if any(total_usage.values()) else None
             out, out_truncated = truncate_output(stdout, self.max_output_bytes)
             err, err_truncated = truncate_output(stderr, self.max_output_bytes)
             result = WorkerResult(
@@ -283,23 +303,18 @@ class MistralWorker:
 
             prompt = _build_prompt(task, working_dir)
             result = call(prompt)
-            usage = _usage_dict(result.usage)
-            if on_live_usage is not None and usage is not None:
-                try:
-                    on_live_usage(usage)
-                except Exception:  # noqa: BLE001 - observers must not break the run
-                    pass
+            note_usage(result.usage)
 
             if not result.success:
                 error = "rate_limited" if result.rate_limited else (result.error or "mistral call failed")
                 timed_out = result.error in ("ReadTimeout", "ConnectTimeout")
                 if experiment_logger is not None:
                     experiment_logger.error(phase, "mistral_call_failed", f"Mistral API call failed: {error}")
-                return finish(False, 1, "", error, timed_out=timed_out, usage=usage, error=error)
+                return finish(False, 1, "", error, timed_out=timed_out, error=error)
 
             content = result.content
             if sandbox == "read-only":
-                return finish(True, 0, content, "", final_message=content, usage=usage)
+                return finish(True, 0, content, "", final_message=content)
 
             # Correction rounds: a rejected patch is fed back, like the local
             # worker does, up to MAX_PATCH_ROUNDS answers in total.
@@ -308,7 +323,7 @@ class MistralWorker:
                 try:
                     patch = _to_patch(content, working_dir)
                     apply_and_check(patch, working_dir, _PATCH_TIMEOUT_SECONDS)
-                    return finish(True, 0, content, "", final_message=content, usage=usage)
+                    return finish(True, 0, content, "", final_message=content)
                 except Exception as exc:  # noqa: BLE001 - a rejected patch is a result, not a crash
                     outcome = getattr(exc, "outcome", None) or type(exc).__name__
                     reason = f"patch rejected ({outcome}): {exc}"[:1000]
@@ -317,19 +332,19 @@ class MistralWorker:
                             experiment_logger.warning(phase, "mistral_patch_rejected", reason)
                         return finish(
                             False, 1, content, reason,
-                            final_message=content, usage=usage, error=reason,
+                            final_message=content, error=reason,
                         )
                     feedback = _render_feedback(round_no, reason, content)
                     result = call(_build_prompt(task, working_dir, feedback))
-                    usage = _usage_dict(result.usage) or usage
+                    note_usage(result.usage)
                     if not result.success:
                         error = "rate_limited" if result.rate_limited else (result.error or "mistral call failed")
                         return finish(
                             False, 1, content, error,
-                            final_message=content, usage=usage, error=error,
+                            final_message=content, error=error,
                         )
                     content = result.content
-            return finish(False, 1, content, "patch rounds exhausted", final_message=content, usage=usage, error="patch rounds exhausted")
+            return finish(False, 1, content, "patch rounds exhausted", final_message=content, error="patch rounds exhausted")
         finally:
             # No subprocess exists for an API call; the contract still gets its
             # "done" notification so a caller tracking processes can clear up.
