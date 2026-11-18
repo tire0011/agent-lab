@@ -247,6 +247,8 @@ class NexusInitiativeService:
         repository: str | None = None,
         drift_reader: Callable[[str, str | None], dict[str, Any]] | None = None,
         issue_creator: Callable[[str, str], int | None] | None = None,
+        issue_updater: Callable[[int, str, str], None] | None = None,
+        issue_comments_lister: Callable[[int], list[dict[str, Any]]] | None = None,
         issue_closer: Callable[[int, str], None] | None = None,
         proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
@@ -266,6 +268,8 @@ class NexusInitiativeService:
         self._proposal_creator = proposal_creator
         # Splitting a stuck or large issue into parts (#626).
         self._issue_creator = issue_creator
+        self._issue_updater = issue_updater
+        self._issue_comments_lister = issue_comments_lister
         self._issue_closer = issue_closer
         # Own proposals release themselves after a wait (#683).
         self._proposal_releaser = proposal_releaser
@@ -353,6 +357,17 @@ class NexusInitiativeService:
                 """
                 CREATE INDEX IF NOT EXISTS idx_initiative_created
                 ON nexus_initiative_log(created_at)
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS gate_preflight_actions (
+                    action_key TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    issue_number INTEGER,
+                    updated_at TEXT NOT NULL
+                )
                 """
             )
 
@@ -1557,7 +1572,12 @@ class NexusInitiativeService:
             "0", "false", "no", "off",
         }:
             issue_text = f"{chosen.title}\n\n{chosen.payload.get('body') or ''}"
-            result = self._gate_preflight(issue_text, self._preflight_repo, 300)
+            try:
+                result = self._gate_preflight(issue_text, self._preflight_repo, 300)
+            except Exception as exc:  # noqa: BLE001 - advisory gate fails open
+                result = PreflightResult(
+                    "skipped", reason=f"preflight unavailable: {type(exc).__name__}",
+                )
             logger.info("initiative: gate preflight for #%s status=%s wall_seconds=%.3f",
                         chosen.ref, result.status, result.wall_seconds)
             if result.blocked:
@@ -1571,22 +1591,7 @@ class NexusInitiativeService:
                     DECISION_PREFLIGHT_BLOCKED, candidate=chosen, considered=found[:10],
                     detail=detail, tick_id=tick_id,
                 ))
-                prior_blocks = self._conn.execute(
-                    "SELECT COUNT(*) FROM nexus_initiative_log "
-                    "WHERE decision = ? AND source_ref = ?",
-                    (DECISION_PREFLIGHT_BLOCKED, str(chosen.ref)),
-                ).fetchone()[0]
-                # The record above is the first one. Never spam the issue if a
-                # still-red host is reconsidered after its cooldown.
-                if self._issue_commenter is not None and prior_blocks == 1:
-                    try:
-                        tests = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
-                        self._issue_commenter(int(chosen.ref),
-                            "Nexus skipped the paid start because the same tests already fail on "
-                            f"clean `main` in the verification environment (drift 0):\n\n{tests}\n\n"
-                            f"Preflight wall time: {result.wall_seconds:.1f}s.")
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("initiative: preflight comment failed for #%s: %s", chosen.ref, exc)
+                self._comment_preflight_block(chosen, result)
                 self._maybe_open_host_blocker(result)
                 return decision
         decision = InitiativeDecision(
@@ -1611,37 +1616,105 @@ class NexusInitiativeService:
             ))
         return decision
 
+    def _action(self, key: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM gate_preflight_actions WHERE action_key = ?", (key,),
+        ).fetchone()
+
+    def _set_action(self, key: str, kind: str, status: str, number: int | None = None) -> None:
+        with self._conn:
+            self._conn.execute(
+                "INSERT INTO gate_preflight_actions "
+                "(action_key, kind, status, issue_number, updated_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(action_key) DO UPDATE SET status=excluded.status, "
+                "issue_number=COALESCE(excluded.issue_number, gate_preflight_actions.issue_number), "
+                "updated_at=excluded.updated_at",
+                (key, kind, status, number, _utcnow().isoformat()),
+            )
+
+    def _comment_preflight_block(self, chosen: Candidate, result: PreflightResult) -> None:
+        """Post once; only confirmed delivery receives a completed marker."""
+        if self._issue_commenter is None:
+            return
+        signature = result.signature or "unknown"
+        marker = f"<!-- nexus-preflight-block:{signature} -->"
+        key = f"preflight-comment:{chosen.ref}:{signature}"
+        row = self._action(key)
+        if row is not None and row["status"] == "done":
+            return
+        if self._issue_comments_lister is not None:
+            try:
+                if any(marker in str(c.get("body") or "")
+                       for c in self._issue_comments_lister(int(chosen.ref))):
+                    self._set_action(key, "comment", "done", int(chosen.ref))
+                    return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("initiative: preflight comment reconciliation failed: %s", exc)
+        self._set_action(key, "comment", "pending", int(chosen.ref))
+        tests = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
+        try:
+            self._issue_commenter(
+                int(chosen.ref),
+                "Nexus skipped the paid start because the same tests already fail on "
+                f"clean `main` in the verification environment (drift 0):\n\n{tests}\n\n"
+                f"Preflight wall time: {result.wall_seconds:.1f}s.\n\n{marker}",
+            )
+        except Exception as exc:  # noqa: BLE001 - pending is retried next tick
+            logger.warning("initiative: preflight comment failed for #%s: %s", chosen.ref, exc)
+            return
+        self._set_action(key, "comment", "done", int(chosen.ref))
+
+    def _find_host_blocker(self, marker: str) -> dict[str, Any] | None:
+        if self._issue_lister is None:
+            return None
+        try:
+            return next((issue for issue in (self._issue_lister() or [])
+                         if marker in str(issue.get("body") or "")), None)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("initiative: host blocker reconciliation failed: %s", exc)
+            return None
+
     def _maybe_open_host_blocker(self, result: PreflightResult) -> None:
-        """After two distinct blocked issues, create one durable host blocker."""
+        """After two blocked issues, reconcile and create/update one blocker."""
         if not result.signature or self._issue_creator is None:
             return
-        marker = f'"signature": "{result.signature}"'
+        signature_json = f'"signature": "{result.signature}"'
         rows = self._conn.execute(
             "SELECT DISTINCT source_ref FROM nexus_initiative_log "
             "WHERE decision = ? AND detail LIKE ?",
-            (DECISION_PREFLIGHT_BLOCKED, f"%{marker}%"),
+            (DECISION_PREFLIGHT_BLOCKED, f"%{signature_json}%"),
         ).fetchall()
         if len(rows) < 2:
             return
-        created_marker = f"host_blocker_created:{result.signature}"
-        if self._conn.execute(
-            "SELECT 1 FROM nexus_initiative_log WHERE detail = ? LIMIT 1", (created_marker,)
-        ).fetchone():
-            return
+        marker = f"<!-- nexus-host-blocker:{result.signature} -->"
+        key = f"host-blocker:{result.signature}"
+        action = self._action(key)
         ids = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
+        title = f"host_blocker: clean main fails preflight ({result.signature})"
+        body = ("Two issues were blocked by the same clean-main failure signature. "
+                "Fix the verification host or main before spending another paid start.\n\n"
+                f"{ids}\n\n{marker}")
+        existing = self._find_host_blocker(marker)
+        if existing is not None:
+            number = int(existing["number"])
+            if action is None or action["status"] != "done":
+                if self._issue_updater is not None:
+                    try:
+                        self._issue_updater(number, title, body)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("initiative: host blocker update failed: %s", exc)
+                        return
+                self._set_action(key, "host_blocker", "done", number)
+            return
+        if action is not None and action["status"] == "done":
+            return
+        self._set_action(key, "host_blocker", "pending")
         try:
-            self._issue_creator(
-                f"host_blocker: clean main fails preflight ({result.signature})",
-                "Two issues were blocked by the same clean-main failure signature. "
-                "Fix the verification host or main before spending another paid start.\n\n" + ids,
-            )
-        except Exception as exc:  # noqa: BLE001
+            number = self._issue_creator(title, body)
+        except Exception as exc:  # noqa: BLE001 - pending create is reconciled next time
             logger.warning("initiative: host blocker creation failed: %s", exc)
             return
-        self._record(InitiativeDecision(
-            "host_blocker_created", detail=created_marker,
-            tick_id=f"host-blocker-{result.signature}",
-        ))
+        self._set_action(key, "host_blocker", "done", int(number) if number else None)
 
     def _dispatch_was_paid(self, since: str) -> bool:
         """Whether this tick used a paid model (#541); unknown counts as paid.

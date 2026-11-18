@@ -73,8 +73,29 @@ def _signature(ids: list[str], tails: dict[str, str]) -> str:
 
 
 def preflight(issue_text: str, repo: str | os.PathLike[str], budget_s: float = 300) -> PreflightResult:
-    """Run likely tests on a clean detached ``main`` worktree at drift zero."""
+    """Run likely tests on clean ``main``; infrastructure faults never block work.
+
+    Keep the exception boundary outside selection as well as execution.  The
+    localizer walks caller-controlled repository contents and must not be able
+    to abort the initiative tick before a paid launch.
+    """
     started = time.monotonic()
+    try:
+        return _preflight(issue_text, repo, budget_s, started)
+    except Exception as exc:  # noqa: BLE001 - a free advisory gate fails open
+        return PreflightResult(
+            "skipped", wall_seconds=time.monotonic() - started,
+            reason=f"preflight unavailable: {type(exc).__name__}",
+        )
+
+
+def _preflight(
+    issue_text: str,
+    repo: str | os.PathLike[str],
+    budget_s: float,
+    started: float,
+) -> PreflightResult:
+    """Implementation under :func:`preflight`'s fail-open boundary."""
     root = Path(repo).resolve()
     ids = likely_tests(issue_text, root)
     if not ids:
