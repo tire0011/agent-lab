@@ -1203,7 +1203,9 @@ class NexusInitiativeService:
         try:
             rows = self._conn.execute(
                 "SELECT e.id, e.goal, e.status, e.error, "
-                "a.status AS adoption_status, a.reason AS adoption_reason "
+                "a.status AS adoption_status, a.reason AS adoption_reason, "
+                "(SELECT r.verdict FROM reverifications r WHERE r.experiment_id=e.id "
+                " ORDER BY r.id DESC LIMIT 1) AS reverification_verdict "
                 "FROM experiments e "
                 "LEFT JOIN experiment_adoptions a ON a.rowid = ("
                 "  SELECT a2.rowid FROM experiment_adoptions a2 "
@@ -1212,15 +1214,28 @@ class NexusInitiativeService:
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError:
-            with_adoption = False
             try:
                 rows = self._conn.execute(
-                    "SELECT id, goal, status, error FROM experiments "
-                    "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                    "SELECT e.id, e.goal, e.status, e.error, "
+                    "a.status AS adoption_status, a.reason AS adoption_reason, "
+                    "'' AS reverification_verdict "
+                    "FROM experiments e "
+                    "LEFT JOIN experiment_adoptions a ON a.rowid = ("
+                    "  SELECT a2.rowid FROM experiment_adoptions a2 "
+                    "  WHERE a2.experiment_id = e.id ORDER BY a2.rowid DESC LIMIT 1) "
+                    "WHERE e.ended_at IS NOT NULL ORDER BY e.ended_at DESC LIMIT ?",
                     (limit,),
                 ).fetchall()
             except sqlite3.OperationalError:
-                return []
+                with_adoption = False
+                try:
+                    rows = self._conn.execute(
+                        "SELECT id, goal, status, error FROM experiments "
+                        "WHERE ended_at IS NOT NULL ORDER BY ended_at DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    return []
         recent = []
         for row in rows:
             lines = str(row["goal"] or "").strip().splitlines()
@@ -1232,6 +1247,7 @@ class NexusInitiativeService:
             if with_adoption:
                 entry["adoption_status"] = str(row["adoption_status"] or "")
                 entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
+                entry["reverification_verdict"] = str(row["reverification_verdict"] or "")
             try:
                 worktree_path = None
                 get_experiment = getattr(self.experiment_service, "get", None)
@@ -1256,6 +1272,40 @@ class NexusInitiativeService:
             entry["overlap_files"] = drift.get("overlap_files", "unknown")
             recent.append(entry)
         return recent
+
+    def _reverify_parked(self) -> None:
+        """Best-effort free maintenance, once per experiment and main commit."""
+        if (os.environ.get("NEXUS_REVERIFY_PARKED", "1").strip().lower()
+                in {"0", "false", "off", "no"}):
+            return
+        from modules.experiment_service.reverify import (
+            SKIPPED_PREFIX, current_main, parked_candidates, reverify_parked,
+        )
+
+        repo = str(getattr(self.experiment_service, "repo_root", ""))
+        if not repo or self._issue_lister is None:
+            # Without the open-issue list nothing could run anyway.
+            return
+        try:
+            main = current_main(repo)
+            open_numbers = {
+                int(item["number"]) for item in (self._issue_lister() or [])
+                if item.get("number") is not None
+            }
+            runs = 0
+            # Skipped rows (closed issue) do not count, so up to three real runs
+            # happen even when newer parked experiments belong to closed issues.
+            for experiment_id in parked_candidates(self.experiment_service, main, limit=20):
+                outcome = reverify_parked(
+                    experiment_id, service=self.experiment_service,
+                    issue_is_open=lambda number: number in open_numbers, main_sha=main,
+                )
+                if outcome and not str(outcome.get("verdict", "")).startswith(SKIPPED_PREFIX):
+                    runs += 1
+                    if runs >= 3:
+                        break
+        except Exception as exc:  # noqa: BLE001 - maintenance must not stop a tick
+            logger.warning("initiative: parked re-verification failed: %s", exc)
 
     def _planned_issue(self, issues: list[Candidate], *, act: bool = True) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).
@@ -1514,7 +1564,6 @@ class NexusInitiativeService:
         busy = self.busy_reason()
         if busy is not None:
             return self._record(InitiativeDecision("busy", detail=busy, tick_id=tick_id))
-
         stale = self._stale_service_revisions()
         if stale is not None:
             startup, checkout = stale
@@ -1531,6 +1580,11 @@ class NexusInitiativeService:
                     decision.detail += f"; restart failed: {type(exc).__name__}: {exc}"[:500]
                     self._record(decision, update=True)
             return decision
+
+        # Re-verification can run tests for several minutes, so only do it after
+        # the busy and stale-service guards. A pass becomes an adoption candidate
+        # below in this same tick; the reviewer is therefore never bypassed.
+        self._reverify_parked()
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back

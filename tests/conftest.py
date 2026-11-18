@@ -38,7 +38,13 @@ def _clock_drift(request, monkeypatch):
     """Advance each wall-clock read by the configured amount per call."""
 
     configured_ms = os.environ.get("NEXUS_TEST_CLOCK_DRIFT_MS")
-    if configured_ms is None or "real_clock" in request.fixturenames:
+    usefixtures = request.node.get_closest_marker("usefixtures")
+    named_fixtures = set(usefixtures.args) if usefixtures is not None else set()
+    # pytest does not add ``usefixtures`` marker arguments to fixturenames for
+    # unittest.TestCase methods.  Honor the marker explicitly so those tests
+    # can use the same real-clock opt-out as fixture-native pytest tests.
+    if (configured_ms is None or "real_clock" in request.fixturenames
+            or "real_clock" in named_fixtures):
         yield
         return
 

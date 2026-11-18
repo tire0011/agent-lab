@@ -399,6 +399,13 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
 
         return {"experiments": gate_recheck(_api()._resolve_experiment_service())}
 
+    @mcp.tool(description="List parked-experiment re-verification verdicts.", structured_output=True)
+    def reverifications_list(limit: int | None = None) -> dict[str, Any]:
+        from modules.experiment_service.reverify import list_reverifications
+
+        value = 50 if limit is None else _validate_limit(limit, minimum=1, maximum=200)
+        return {"reverifications": list_reverifications(_api()._resolve_experiment_service(), value)}
+
     @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
     def experiment_get(experiment_id: str) -> dict[str, Any]:
         nexus_api = _api()

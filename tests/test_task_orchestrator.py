@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from modules.nexus_delegation import DelegationResult
 from modules.nexus_task_store import NexusTaskStore
 from modules.operations_registry import OperationArgSpec
@@ -344,6 +346,7 @@ class TaskOrchestratorTests(unittest.TestCase):
         # The model's own words for it, which is what makes the record useful.
         self.assertIn("fetch it again", metadata["controller_reason"])
 
+    @pytest.mark.usefixtures("real_clock")
     def test_the_budget_is_logged_once_not_every_turn(self):
         """A dozen numbers that do not move bury the two that do.
 
@@ -351,6 +354,11 @@ class TaskOrchestratorTests(unittest.TestCase):
         section split. None of it changes within a run, and repeating it on
         every turn pushed prompt_chars and omitted_observations - the values
         worth watching - into the noise.
+
+        This assertion is about log cardinality, not elapsed time.  Keep the
+        event loop on the process clock: synthetic per-read drift advances
+        asyncio's own scheduling clock and can stall this otherwise synchronous
+        fake-client scenario before it reaches the assertion.
         """
 
         self.registry = _MultiRegistry(self.db_path, self.tmp.name)
@@ -361,7 +369,11 @@ class TaskOrchestratorTests(unittest.TestCase):
             '"message":"done","reason":"enough"}',
         ])
         orchestrator = self._orchestrator(client)
-        with _patch_orchestrator("logger") as log:
+        orchestrator._schema_completion = AsyncMock(
+            side_effect=[(response, "local") for response in client.responses]
+        )
+        with patch.object(orchestrator, "_azure_drives_controller", return_value=False), \
+             _patch_orchestrator("logger") as log:
             try:
                 orchestrator.run("Search memory twice")
             finally:

@@ -272,6 +272,24 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_verification_runs_experiment
             ON verification_runs(experiment_id, iteration);
 
+        CREATE TABLE IF NOT EXISTS reverifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id TEXT NOT NULL,
+            issue_number INTEGER NULL,
+            main_commit_sha TEXT NOT NULL,
+            branch_name TEXT NULL,
+            old_branch_sha TEXT NULL,
+            new_branch_sha TEXT NULL,
+            verdict TEXT NOT NULL,
+            reason TEXT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT NOT NULL,
+            UNIQUE(experiment_id, main_commit_sha),
+            FOREIGN KEY (experiment_id) REFERENCES experiments(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_reverifications_created
+            ON reverifications(created_at DESC, id DESC);
+
         CREATE TABLE IF NOT EXISTS service_settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,

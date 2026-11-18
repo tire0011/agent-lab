@@ -407,6 +407,7 @@ class VerificationMixin:
         *,
         github_work_tracking: Any | None = None,
         repair_iteration: int = 0,
+        soft_findings_to_reviewer: bool | None = None,
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
@@ -738,10 +739,13 @@ class VerificationMixin:
                 )
                 quality_evaluation = eval_result.to_dict()
                 # Only artifact-evidence checks failed and tests are green: the reviewer decides at
-                # adoption (#519); every non-GitHub-tracked run keeps the hard stop.
-                review_findings = (
-                    eval_result.soft_findings() if github_work_tracking is not None else None
+                # adoption (#519); every non-GitHub-tracked run keeps the hard stop. A
+                # re-verification of a GitHub-tracked run (#718) asks for the same routing.
+                to_reviewer = (
+                    github_work_tracking is not None
+                    if soft_findings_to_reviewer is None else soft_findings_to_reviewer
                 )
+                review_findings = eval_result.soft_findings() if to_reviewer else None
                 if review_findings is not None:
                     quality_evaluation["outcome"] = "pass"
                     quality_evaluation["review_findings"] = review_findings

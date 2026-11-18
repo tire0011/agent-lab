@@ -43,6 +43,7 @@ annotations = __future__.annotations
 
 from .git_utils import _run_git
 from .gate_recheck import gate_recheck
+from .reverify import list_reverifications, parked_candidates, reverify_parked
 from .models import (
     STATUS_FAILED,
     STATUS_CANCELLED,
