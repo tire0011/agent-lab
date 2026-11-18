@@ -160,6 +160,14 @@ def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
     return status == "rejected" and str(error or "").startswith(_GOAL_POLICY_REASON_PREFIXES)
 
 
+def _gate_preflight_enabled() -> bool:
+    return os.environ.get("NEXUS_GATE_PREFLIGHT", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _preflight_issue_text(candidate: "Candidate") -> str:
+    return f"{candidate.title}\n\n{candidate.payload.get('body') or ''}"
+
+
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -493,6 +501,40 @@ class NexusInitiativeService:
             (KIND_INTEGRATION, f"%{_FRESH_ADOPTION}%"),
         ).fetchall()
         return {str(r["source_ref"]) for r in rows if r["n"] == 1 and str(r["first"]) >= since}
+
+    def _preflight_repo(self) -> Any:
+        return getattr(self.experiment_service, "repo_root", Path.cwd())
+
+    def _without_preflight_blocked(self, found: list[Candidate]) -> list[Candidate]:
+        """Drop issues the preflight already blocked on the current main.
+
+        Without this the same first candidate would be picked, preflighted and
+        logged again every tick and later candidates would never be reached
+        (#745). A block holds only while main and the issue text are unchanged.
+        """
+        from modules.gate_preflight import main_sha
+
+        sha = main_sha(self._preflight_repo())
+        if sha is None:
+            return found
+        kept: list[Candidate] = []
+        for candidate in found:
+            if candidate.kind == KIND_ISSUE:
+                row = self._conn.execute(
+                    "SELECT detail FROM nexus_initiative_log WHERE decision = 'preflight_blocked' "
+                    "AND source_kind = ? AND source_ref = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                    (KIND_ISSUE, candidate.ref),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        detail = json.loads(row["detail"] or "{}")
+                    except ValueError:
+                        detail = {}
+                    issue_hash = _sha256(_preflight_issue_text(candidate).encode())
+                    if detail.get("main_sha") == sha and detail.get("issue_hash") == issue_hash:
+                        continue
+            kept.append(candidate)
+        return kept
 
     def _adoption_dispatched_before(self, ref: str) -> bool:
         row = self._conn.execute(
@@ -1509,6 +1551,12 @@ class NexusInitiativeService:
                 )
         else:
             found = self.candidates()
+        if found and _gate_preflight_enabled():
+            found = self._without_preflight_blocked(found)
+            if not found:
+                return self._record(InitiativeDecision(
+                    "idle", detail="every candidate is preflight-blocked on this main", tick_id=tick_id,
+                ))
         if not found:
             return self._record(
                 InitiativeDecision("idle", detail="no actionable work found", tick_id=tick_id)
@@ -1534,6 +1582,37 @@ class NexusInitiativeService:
                         tick_id=tick_id,
                     )
                 )
+            if _gate_preflight_enabled():
+                from modules.gate_preflight import preflight
+
+                issue_text = _preflight_issue_text(chosen)
+                result = preflight(issue_text, self._preflight_repo())
+                if result.status == "blocked":
+                    failing_ids = sorted(result.failing_ids)
+                    signature = _sha256("\n".join(failing_ids).encode())
+                    short_tails = {
+                        test_id: "\n".join(str(tail).splitlines()[-40:])[-4000:]
+                        for test_id, tail in (result.tails or {}).items()
+                        if test_id in failing_ids
+                    }
+                    return self._record(
+                        InitiativeDecision(
+                            "preflight_blocked",
+                            candidate=chosen,
+                            considered=found[:10],
+                            detail=json.dumps(
+                                {
+                                    "ids": failing_ids,
+                                    "tails": short_tails,
+                                    "signature": signature,
+                                    "main_sha": result.main_sha,
+                                    "issue_hash": _sha256(issue_text.encode()),
+                                },
+                                sort_keys=True,
+                            ),
+                            tick_id=tick_id,
+                        )
+                    )
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
