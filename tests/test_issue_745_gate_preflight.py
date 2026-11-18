@@ -124,3 +124,75 @@ def test_passed_or_skipped_launches_and_flag_off_does_not_call_preflight(tmp_pat
             assert check.call_count == (0 if flag == "0" else 1)
         finally:
             service.close()
+
+
+def test_verdict_reached_after_the_budget_is_skipped(tmp_path: Path):
+    import time as _time
+
+    repo = _repo(tmp_path, {"tests/test_x.py": "def test_x(): assert True\n"})
+
+    def slow(*args, **kwargs):
+        _time.sleep(0.6)
+        return PreflightResult("passed")
+
+    with patch("modules.gate_preflight._run", side_effect=slow):
+        result = preflight("tests/test_x.py", repo, budget_s=0.5)
+    assert result.status == "skipped"
+    # cleanup ran: no worktree is left registered besides the main checkout
+    listed = subprocess.run(["git", "worktree", "list"], cwd=repo, capture_output=True, text=True).stdout
+    assert len(listed.strip().splitlines()) == 1
+
+
+def test_blocked_issue_is_skipped_until_main_moves(tmp_path: Path):
+    repo = _repo(tmp_path, {"README.md": "x\n"})
+    launcher = SimpleNamespace(handle_issue=MagicMock())
+    service = NexusInitiativeService(
+        db_path=str(tmp_path / "initiative.db"),
+        experiment_service=SimpleNamespace(repo_root=str(repo)),
+        controller=launcher,
+        daily_budget=5,
+        reflection_sweep=lambda **kwargs: None,
+    )
+    first = Candidate(KIND_ISSUE, "1", "First", "next", {"body": "tests/test_a.py"})
+    second = Candidate(KIND_ISSUE, "2", "Second", "next", {"body": "tests/test_b.py"})
+
+    def verdict(issue_text, repo_root, *args, **kwargs):
+        current = subprocess.run(["git", "rev-parse", "main"], cwd=repo, capture_output=True, text=True).stdout.strip()
+        if "test_a" in issue_text:
+            return PreflightResult("blocked", ["tests/test_a.py::test_a"], {}, 1, main_sha=current)
+        return PreflightResult("passed", main_sha=current)
+
+    common = (
+        patch.object(service, "_paused", return_value=False),
+        patch.object(service, "_sweep_stalled_experiments"),
+        patch.object(service, "enforce_issue_approvals"),
+        patch.object(service, "busy_reason", return_value=None),
+        patch.object(service, "_stale_service_revisions", return_value=None),
+        patch.object(service, "_spent_today", return_value=0),
+        patch.object(service, "_execution_allowed", return_value=SimpleNamespace(allowed=True)),
+        patch("modules.gate_preflight.preflight", side_effect=verdict),
+    )
+    try:
+        with common[0], common[1], common[2], common[3], common[4], common[5], common[6], common[7]:
+            with patch.object(service, "candidates", return_value=[first, second]):
+                assert service.tick().decision == "preflight_blocked"
+                launcher.handle_issue.assert_not_called()
+            # Same main: #1 is skipped and #2 is reached.
+            with patch.object(service, "candidates", return_value=[first, second]):
+                decision = service.tick()
+            assert decision.decision == "dispatched"
+            assert decision.candidate.ref == "2"
+            # Only #1 left and still blocked on this main: nothing is re-run.
+            with patch.object(service, "candidates", return_value=[first]):
+                assert service.tick().decision == "idle"
+            # main moves: #1 is preflighted again.
+            (repo / "README.md").write_text("y\n")
+            subprocess.run(["git", "commit", "-am", "move"], cwd=repo, check=True, capture_output=True)
+            with patch.object(service, "candidates", return_value=[first]):
+                assert service.tick().decision == "preflight_blocked"
+            # issue text changes on the same main: #1 is preflighted again.
+            edited = Candidate(KIND_ISSUE, "1", "First", "next", {"body": "tests/test_a.py edited"})
+            with patch.object(service, "candidates", return_value=[edited]):
+                assert service.tick().decision == "preflight_blocked"
+    finally:
+        service.close()
