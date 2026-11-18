@@ -160,6 +160,10 @@ def _is_goal_policy_rejection(status: Any, error: Any) -> bool:
     return status == "rejected" and str(error or "").startswith(_GOAL_POLICY_REASON_PREFIXES)
 
 
+_NEXUS_BRANCH_RE = re.compile(r"^nexus/(\d+)-")
+_MAX_STALE_PR_CLOSES = 10
+
+
 def _gate_preflight_enabled() -> bool:
     return os.environ.get("NEXUS_GATE_PREFLIGHT", "1").strip().lower() not in {"0", "false", "no", "off"}
 
@@ -255,6 +259,8 @@ class NexusInitiativeService:
         issue_creator: Callable[[str, str], int | None] | None = None,
         issue_closer: Callable[[int, str], None] | None = None,
         proposal_releaser: Callable[[int, str], None] | None = None,
+        pr_lister: Callable[[], list[dict[str, Any]]] | None = None,
+        stale_pr_closer: Callable[[int, int, str], bool] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
     ) -> None:
@@ -271,6 +277,10 @@ class NexusInitiativeService:
         # Splitting a stuck or large issue into parts (#626).
         self._issue_creator = issue_creator
         self._issue_closer = issue_closer
+        # Open Nexus PRs whose issue is closed (split parts done, owner closed
+        # it) are closed too, so finished work does not leave PRs behind.
+        self._pr_lister = pr_lister
+        self._stale_pr_closer = stale_pr_closer
         # Own proposals release themselves after a wait (#683).
         self._proposal_releaser = proposal_releaser
         self._proposal_counter = proposal_counter
@@ -617,7 +627,9 @@ class NexusInitiativeService:
             logger.warning("initiative: issue lookup failed: %s", exc)
             return []
         if record_skips:
-            self._close_finished_splits({int(i["number"]) for i in issues if i.get("number") is not None})
+            open_numbers = {int(i["number"]) for i in issues if i.get("number") is not None}
+            self._close_finished_splits(open_numbers)
+            self._close_stale_pull_requests(open_numbers)
         linked, exhausted = self._issue_attempts()
         reported = self._exhausted_reports()
         review_blocked = self._review_blocked_issues()
@@ -1470,6 +1482,43 @@ class NexusInitiativeService:
             detail["closed"] = True
             self._record(InitiativeDecision(DECISION_SPLIT, detail=json.dumps(detail), tick_id=tick_id),
                          update=True)
+
+    def _close_stale_pull_requests(self, open_numbers: set[int]) -> None:
+        """Close open Nexus PRs (branch ``nexus/<issue>-...``) whose issue is closed.
+
+        The open-issue list is capped, so a PR whose issue is missing from it
+        is only a suspect: the closer confirms the issue is really closed
+        before it touches the PR. The branch is kept.
+        """
+        if self._pr_lister is None or self._stale_pr_closer is None or not open_numbers:
+            return
+        try:
+            pulls = self._pr_lister() or []
+        except Exception as exc:  # noqa: BLE001 - housekeeping must not stop the tick
+            logger.warning("initiative: pull request lookup failed: %s", exc)
+            return
+        closed = 0
+        for pull in pulls:
+            match = _NEXUS_BRANCH_RE.match(str(pull.get("headRefName") or ""))
+            if match is None or pull.get("number") is None:
+                continue
+            issue = int(match.group(1))
+            if issue in open_numbers:
+                continue
+            try:
+                done = self._stale_pr_closer(
+                    int(pull["number"]), issue,
+                    f"Issue #{issue} is closed, so this pull request is no longer needed: its "
+                    "work was finished elsewhere (split parts, a later attempt) or the issue "
+                    "was dropped. Closed by Nexus; the branch is kept.",
+                )
+            except Exception as exc:  # noqa: BLE001 - tried again next tick
+                logger.warning("initiative: could not close PR #%s: %s", pull.get("number"), exc)
+                continue
+            if done:
+                closed += 1
+                if closed >= _MAX_STALE_PR_CLOSES:
+                    return
 
     def _owner_decisions(self) -> list[dict[str, str]]:
         """Proposals the owner closed, with why; none when they cannot be read."""

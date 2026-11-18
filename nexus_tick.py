@@ -170,6 +170,31 @@ def _close_issue(repo_root: str, number: int, text: str) -> None:
     _events.append(f"Closed split issue #{number}: {text}")
 
 
+def _list_open_pull_requests(repo_root: str) -> list[dict]:
+    proc = subprocess.run(
+        ["gh", "pr", "list", "--state", "open", "--limit", "200", "--json", "number,headRefName"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    return list(json.loads(proc.stdout or "[]"))
+
+
+def _close_stale_pull_request(repo_root: str, pr: int, issue: int, text: str) -> bool:
+    """Close *pr* only after confirming *issue* is closed; ``False`` otherwise."""
+    proc = subprocess.run(
+        ["gh", "issue", "view", str(issue), "--json", "state"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0 or str(json.loads(proc.stdout or "{}").get("state")).upper() != "CLOSED":
+        return False
+    # Like issues: comment first, then close; the branch is not deleted.
+    _gh(repo_root, ["pr", "comment", str(pr), "--body", text])
+    _gh(repo_root, ["pr", "close", str(pr)])
+    _events.append(f"Closed PR #{pr}: issue #{issue} is closed")
+    return True
+
+
 def _count_open_proposals(repo_root: str) -> int:
     """All open proposals; the issue list itself stops at ``_ISSUE_LIMIT``."""
     from modules.nexus_planner import PROPOSAL_LABEL
@@ -343,6 +368,8 @@ def _build_service(args) -> NexusInitiativeService:
         issue_creator=lambda title, body: _open_part_issue(args.repo_root, title, body),
         issue_closer=lambda number, text: _close_issue(args.repo_root, number, text),
         proposal_releaser=lambda number, text: _release_proposal(args.repo_root, number, text),
+        pr_lister=lambda: _list_open_pull_requests(args.repo_root),
+        stale_pr_closer=lambda pr, issue, text: _close_stale_pull_request(args.repo_root, pr, issue, text),
         proposal_counter=lambda: _count_open_proposals(args.repo_root),
         decision_lister=lambda: _owner_decisions(args.repo_root),
         diagnostics_client=_service_diagnostics,
