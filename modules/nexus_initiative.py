@@ -249,6 +249,7 @@ class NexusInitiativeService:
         issue_creator: Callable[[str, str], int | None] | None = None,
         issue_updater: Callable[[int, str, str], None] | None = None,
         issue_comments_lister: Callable[[int], list[dict[str, Any]]] | None = None,
+        host_blocker_finder: Callable[[str], dict[str, Any] | None] | None = None,
         issue_closer: Callable[[int, str], None] | None = None,
         proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
@@ -270,6 +271,10 @@ class NexusInitiativeService:
         self._issue_creator = issue_creator
         self._issue_updater = issue_updater
         self._issue_comments_lister = issue_comments_lister
+        # A targeted, all-state GitHub search.  The ordinary open-issue list is
+        # deliberately not used for write reconciliation: it is truncated and
+        # cannot prove that an ambiguously-created issue is absent.
+        self._host_blocker_finder = host_blocker_finder
         self._issue_closer = issue_closer
         # Own proposals release themselves after a wait (#683).
         self._proposal_releaser = proposal_releaser
@@ -1636,20 +1641,32 @@ class NexusInitiativeService:
         """Post once; only confirmed delivery receives a completed marker."""
         if self._issue_commenter is None:
             return
-        signature = result.signature or "unknown"
-        marker = f"<!-- nexus-preflight-block:{signature} -->"
-        key = f"preflight-comment:{chosen.ref}:{signature}"
+        # Identity is the issue, not the failure signature.  A changing main
+        # failure must not produce several successful comments on one issue.
+        marker = f"<!-- nexus-preflight-block:issue-{chosen.ref} -->"
+        key = f"preflight-comment:{chosen.ref}"
         row = self._action(key)
         if row is not None and row["status"] == "done":
             return
+        reconciled_absent = False
         if self._issue_comments_lister is not None:
             try:
                 if any(marker in str(c.get("body") or "")
                        for c in self._issue_comments_lister(int(chosen.ref))):
                     self._set_action(key, "comment", "done", int(chosen.ref))
                     return
+                reconciled_absent = True
             except Exception as exc:  # noqa: BLE001
                 logger.warning("initiative: preflight comment reconciliation failed: %s", exc)
+                # A pending row means a previous POST may have succeeded.  If
+                # that cannot be reconciled, defer instead of risking a second
+                # successful comment.
+                if row is not None and row["status"] == "pending":
+                    return
+        elif row is not None and row["status"] == "pending":
+            return
+        if row is not None and row["status"] == "pending" and not reconciled_absent:
+            return
         self._set_action(key, "comment", "pending", int(chosen.ref))
         tests = "\n".join(f"- `{test_id}`" for test_id in result.failing_ids)
         try:
@@ -1663,16 +1680,6 @@ class NexusInitiativeService:
             logger.warning("initiative: preflight comment failed for #%s: %s", chosen.ref, exc)
             return
         self._set_action(key, "comment", "done", int(chosen.ref))
-
-    def _find_host_blocker(self, marker: str) -> dict[str, Any] | None:
-        if self._issue_lister is None:
-            return None
-        try:
-            return next((issue for issue in (self._issue_lister() or [])
-                         if marker in str(issue.get("body") or "")), None)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("initiative: host blocker reconciliation failed: %s", exc)
-            return None
 
     def _maybe_open_host_blocker(self, result: PreflightResult) -> None:
         """After two blocked issues, reconcile and create/update one blocker."""
@@ -1694,7 +1701,17 @@ class NexusInitiativeService:
         body = ("Two issues were blocked by the same clean-main failure signature. "
                 "Fix the verification host or main before spending another paid start.\n\n"
                 f"{ids}\n\n{marker}")
-        existing = self._find_host_blocker(marker)
+        # The finder returns None only when a targeted all-state search has
+        # conclusively found no marker.  An exception is "unknown", never
+        # "absent", which closes the ambiguous-create duplicate window.
+        if self._host_blocker_finder is None:
+            logger.warning("initiative: no targeted host blocker finder; deferring write")
+            return
+        try:
+            existing = self._host_blocker_finder(marker)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("initiative: host blocker reconciliation failed: %s", exc)
+            return
         if existing is not None:
             number = int(existing["number"])
             if action is None or action["status"] != "done":

@@ -118,17 +118,19 @@ class GatePreflightInitiativeTests(unittest.TestCase):
             if len(attempts) == 1:
                 raise RuntimeError("before delivery")
 
-        service = fixture.service(issue_commenter=comment)
+        remote = []
+        service = fixture.service(issue_commenter=comment,
+                                  issue_comments_lister=lambda _number: list(remote))
         self.addCleanup(service.close)
         chosen = Candidate(KIND_ISSUE, "12", "x", "")
         result = PreflightResult("blocked", failing_ids=("tests/test_x.py::test_x",),
                                  signature="comment-same")
         service._comment_preflight_block(chosen, result)
-        self.assertEqual(service._action("preflight-comment:12:comment-same")["status"], "pending")
+        self.assertEqual(service._action("preflight-comment:12")["status"], "pending")
         service._comment_preflight_block(chosen, result)
         service._comment_preflight_block(chosen, result)
         self.assertEqual(len(attempts), 2)
-        self.assertEqual(service._action("preflight-comment:12:comment-same")["status"], "done")
+        self.assertEqual(service._action("preflight-comment:12")["status"], "done")
 
     def test_ambiguous_comment_is_reconciled_without_duplicate(self):
         fixture = InitiativeFixture()
@@ -150,13 +152,44 @@ class GatePreflightInitiativeTests(unittest.TestCase):
         self.addCleanup(service.close)
         service._comment_preflight_block(chosen, result)
         self.assertEqual(len(remote), 1)
-        self.assertEqual(service._action("preflight-comment:13:ambiguous")["status"], "done")
+        self.assertEqual(service._action("preflight-comment:13")["status"], "done")
+
+    def test_pending_comment_defers_when_reconciliation_fails(self):
+        fixture = InitiativeFixture()
+        self.addCleanup(shutil.rmtree, fixture.tmp, True)
+        posts = []
+        lookups = unittest.mock.Mock(side_effect=RuntimeError("GitHub unavailable"))
+        service = fixture.service(issue_commenter=lambda n, b: posts.append((n, b)),
+                                  issue_comments_lister=lookups)
+        self.addCleanup(service.close)
+        service._set_action("preflight-comment:14", "comment", "pending", 14)
+        service._comment_preflight_block(
+            Candidate(KIND_ISSUE, "14", "x", ""),
+            PreflightResult("blocked", signature="changed"),
+        )
+        self.assertEqual(posts, [])
+
+    def test_changed_signature_still_has_one_comment_identity(self):
+        fixture = InitiativeFixture()
+        self.addCleanup(shutil.rmtree, fixture.tmp, True)
+        remote = []
+        service = fixture.service(
+            issue_commenter=lambda _n, body: remote.append({"body": body}),
+            issue_comments_lister=lambda _n: list(remote),
+        )
+        self.addCleanup(service.close)
+        chosen = Candidate(KIND_ISSUE, "15", "x", "")
+        service._comment_preflight_block(chosen, PreflightResult("blocked", signature="one"))
+        service._comment_preflight_block(chosen, PreflightResult("blocked", signature="two"))
+        self.assertEqual(len(remote), 1)
+        self.assertEqual(service._action("preflight-comment:15")["status"], "done")
 
     def test_same_signature_opens_one_host_blocker(self):
         fixture = InitiativeFixture()
         self.addCleanup(shutil.rmtree, fixture.tmp, True)
         created = []
-        service = fixture.service(issue_creator=lambda title, body: created.append((title, body)) or 900)
+        service = fixture.service(issue_creator=lambda title, body: created.append((title, body)) or 900,
+                                  host_blocker_finder=lambda _marker: None)
         self.addCleanup(service.close)
         result = PreflightResult("blocked", failing_ids=("tests/test_x.py::test_x",), signature="same")
         for number in (1, 2):
@@ -180,7 +213,8 @@ class GatePreflightInitiativeTests(unittest.TestCase):
             remote.append({"number": 901, "title": title, "body": body})
             raise TimeoutError("accepted but response lost")
 
-        service = fixture.service(issue_lister=lambda: list(remote), issue_creator=create,
+        finder = lambda marker: next((row for row in remote if marker in row["body"]), None)
+        service = fixture.service(host_blocker_finder=finder, issue_creator=create,
                                   issue_updater=lambda *args: updates.append(args))
         result = PreflightResult("blocked", failing_ids=("tests/test_x.py::test_x",),
                                  signature="ambiguous-create")
@@ -193,7 +227,7 @@ class GatePreflightInitiativeTests(unittest.TestCase):
             ))
         service._maybe_open_host_blocker(result)
         service.close()  # Pending marker survives a crash before local confirmation.
-        service = fixture.service(issue_lister=lambda: list(remote), issue_creator=create,
+        service = fixture.service(host_blocker_finder=finder, issue_creator=create,
                                   issue_updater=lambda *args: updates.append(args))
         self.addCleanup(service.close)
         service._maybe_open_host_blocker(result)
@@ -202,6 +236,32 @@ class GatePreflightInitiativeTests(unittest.TestCase):
         self.assertEqual(len(updates), 1)
         self.assertEqual(updates[0][0], 901)
         self.assertEqual(service._action("host-blocker:ambiguous-create")["status"], "done")
+
+    def test_pending_host_blocker_defers_on_lookup_failure_then_reconciles(self):
+        fixture = InitiativeFixture()
+        self.addCleanup(shutil.rmtree, fixture.tmp, True)
+        creates = []
+        lookup = unittest.mock.Mock(side_effect=RuntimeError("search unavailable"))
+        service = fixture.service(
+            issue_creator=lambda title, body: creates.append((title, body)) or 902,
+            host_blocker_finder=lookup,
+        )
+        self.addCleanup(service.close)
+        result = PreflightResult("blocked", signature="lookup-failure")
+        for number in (1, 2):
+            service._record(InitiativeDecision(
+                DECISION_PREFLIGHT_BLOCKED,
+                detail='{"signature": "lookup-failure"}',
+                candidate=Candidate(KIND_ISSUE, str(number), "", ""),
+                tick_id=f"lookup-{number}",
+            ))
+        service._set_action("host-blocker:lookup-failure", "host_blocker", "pending")
+        service._maybe_open_host_blocker(result)
+        self.assertEqual(creates, [])
+        lookup.side_effect = None
+        lookup.return_value = None
+        service._maybe_open_host_blocker(result)
+        self.assertEqual(len(creates), 1)
 
 
 if __name__ == "__main__":

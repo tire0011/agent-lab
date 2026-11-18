@@ -148,6 +148,22 @@ def _update_issue(repo_root: str, number: int, title: str, body: str) -> None:
     _gh(repo_root, ["issue", "edit", str(number), "--title", title, "--body", body])
 
 
+def _find_host_blocker(repo_root: str, marker: str) -> dict | None:
+    """Targeted all-state lookup used to reconcile an ambiguous issue create."""
+    proc = subprocess.run(
+        ["gh", "issue", "list", "--state", "all", "--limit", "100",
+         "--search", f'\"{marker}\" in:body', "--json", "number,title,body,state"],
+        cwd=repo_root, capture_output=True, text=True, timeout=60, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip()[:400] or f"gh exited {proc.returncode}")
+    value = json.loads(proc.stdout or "[]")
+    if not isinstance(value, list):
+        raise RuntimeError("host blocker search returned a non-list response")
+    matches = [issue for issue in value if marker in str(issue.get("body") or "")]
+    return matches[0] if matches else None
+
+
 def _open_proposal(repo_root: str, title: str, body: str) -> None:
     from modules.nexus_planner import PROPOSAL_LABEL
 
@@ -355,6 +371,7 @@ def _build_service(args) -> NexusInitiativeService:
         planner=_planner(args.repo_root, args.db_path) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         issue_comments_lister=lambda number: _list_issue_comments(args.repo_root, number),
+        host_blocker_finder=lambda marker: _find_host_blocker(args.repo_root, marker),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
         issue_creator=lambda title, body: _open_part_issue(args.repo_root, title, body),
         issue_updater=lambda number, title, body: _update_issue(
