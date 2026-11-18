@@ -1534,6 +1534,40 @@ class NexusInitiativeService:
                         tick_id=tick_id,
                     )
                 )
+            if os.environ.get("NEXUS_GATE_PREFLIGHT", "1").strip().lower() not in {
+                "0", "false", "no", "off",
+            }:
+                from modules.gate_preflight import preflight
+
+                issue_text = f"{chosen.title}\n\n{chosen.payload.get('body') or ''}"
+                result = preflight(
+                    issue_text,
+                    getattr(self.experiment_service, "repo_root", Path.cwd()),
+                )
+                if result.status == "blocked":
+                    failing_ids = sorted(result.failing_ids)
+                    signature = _sha256("\n".join(failing_ids).encode())
+                    short_tails = {
+                        test_id: "\n".join(str(tail).splitlines()[-40:])[-4000:]
+                        for test_id, tail in (result.tails or {}).items()
+                        if test_id in failing_ids
+                    }
+                    return self._record(
+                        InitiativeDecision(
+                            "preflight_blocked",
+                            candidate=chosen,
+                            considered=found[:10],
+                            detail=json.dumps(
+                                {
+                                    "ids": failing_ids,
+                                    "tails": short_tails,
+                                    "signature": signature,
+                                },
+                                sort_keys=True,
+                            ),
+                            tick_id=tick_id,
+                        )
+                    )
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
