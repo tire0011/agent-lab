@@ -85,21 +85,31 @@ class RegistrationTests(unittest.TestCase):
 
 
 class CodingModelTests(unittest.TestCase):
+    def _spec(self, spec_id, base_url, roles):
+        return model_registry.ModelSpec(
+            id=spec_id, base_url=base_url, model="m",
+            cost="free", api_key_env="MISTRAL_API_KEY", roles=roles,
+        )
+
     def test_prefers_coding_role_and_available_key(self):
         specs = [
-            model_registry.ModelSpec(
-                id="general", base_url="https://example.invalid", model="m",
-                cost="free", api_key_env="MISTRAL_API_KEY", roles=("planning",),
-            ),
-            model_registry.ModelSpec(
-                id="coder", base_url="https://example.invalid", model="c",
-                cost="free", api_key_env="MISTRAL_API_KEY", roles=("coding",),
-            ),
+            self._spec("general", "https://api.mistral.ai/v1", ("planning",)),
+            self._spec("coder", "https://api.mistral.ai/v1", ("coding",)),
         ]
         with _clean_env(MISTRAL_API_KEY="test-key"):
             self.assertEqual(coding_model(specs).id, "coder")
         with _clean_env():
             self.assertIsNone(coding_model(specs))
+
+    def test_only_mistral_endpoints_are_drawn(self):
+        specs = [
+            self._spec("other-coder", "https://api.other-vendor.example/v1", ("coding",)),
+            self._spec("coder", "https://api.mistral.ai/v1", ("coding",)),
+        ]
+        with _clean_env(MISTRAL_API_KEY="test-key"):
+            self.assertEqual(coding_model(specs).id, "coder")
+        with _clean_env(MISTRAL_API_KEY="test-key"):
+            self.assertIsNone(coding_model(specs[:1]))
 
 
 class _RepoMixin:
@@ -138,13 +148,50 @@ class WorkerRunTests(_RepoMixin, unittest.TestCase):
     def test_workspace_write_applies_search_replace_block(self):
         usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
         worker = MistralWorker(transport=_transport(_SR_BLOCK, usage=usage))
-        result = worker.run("change the value", str(self.repo), sandbox="workspace-write")
+        result = worker.run("change value.txt", str(self.repo), sandbox="workspace-write")
         self.assertTrue(result.success, msg=result.stderr)
         self.assertEqual((self.repo / "value.txt").read_text(), "changed\n")
         self.assertEqual(
             result.usage,
             {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
         )
+
+    def test_prompt_contains_the_named_target_file(self):
+        seen: list[dict] = []
+
+        def capturing_transport(url, headers, body):
+            seen.append(body)
+            return _chat_response("just an answer")
+
+        worker = MistralWorker(transport=capturing_transport)
+        worker.run("please change value.txt now", str(self.repo), sandbox="read-only")
+        prompt = seen[0]["messages"][0]["content"]
+        self.assertIn("--- value.txt ---", prompt)
+        self.assertIn("original", prompt)
+        self.assertIn("<<<<<<< SEARCH", prompt)
+
+    def test_rejected_patch_gets_a_correction_round(self):
+        bad = "value.txt\n<<<<<<< SEARCH\nnot there\n=======\nchanged\n>>>>>>> REPLACE\n"
+        answers = [bad, _SR_BLOCK]
+        calls: list[dict] = []
+
+        def flaky_transport(url, headers, body):
+            calls.append(body)
+            return _chat_response(answers[min(len(calls) - 1, len(answers) - 1)])
+
+        worker = MistralWorker(transport=flaky_transport)
+        result = worker.run("change value.txt", str(self.repo), sandbox="workspace-write")
+        self.assertTrue(result.success, msg=result.stderr)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("Correction (round 1", calls[1]["messages"][0]["content"])
+        self.assertEqual((self.repo / "value.txt").read_text(), "changed\n")
+
+    def test_search_replace_is_forced_even_in_diff_mode(self):
+        with patch.dict(os.environ, {"LOCAL_EDIT_FORMAT": "diff"}):
+            worker = MistralWorker(transport=_transport(_SR_BLOCK))
+            result = worker.run("change value.txt", str(self.repo), sandbox="workspace-write")
+        self.assertTrue(result.success, msg=result.stderr)
+        self.assertEqual((self.repo / "value.txt").read_text(), "changed\n")
 
     def test_rejected_patch_leaves_tree_untouched(self):
         bad = "value.txt\n<<<<<<< SEARCH\nnot there\n=======\nchanged\n>>>>>>> REPLACE\n"
