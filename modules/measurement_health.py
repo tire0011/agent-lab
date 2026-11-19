@@ -79,21 +79,20 @@ def check_pipelines(
     )
     results = {}
     for name, enabled, scheduled, success, query in pipelines:
+        # Older and experiment-only stores may not support this pipeline.
+        enabled = enabled and name in tables
         result = {"status": "ok", "enabled": enabled, "latest_at": None}
         results[name] = result
         if not enabled:
             continue
-        if name in tables:
-            rows = db.execute(
-                f"SELECT * FROM ({query}) "
-                "WHERE measured_at IS NULL OR julianday(measured_at) <= julianday(?) "
-                "ORDER BY julianday(measured_at) DESC, id DESC",
-                (now.isoformat(),),
-            )
-            with closing(rows):
-                _check_rows(rows, result, success, cutoff, n, scheduled)
-        elif scheduled:
-            result["status"] = "stale"
+        rows = db.execute(
+            f"SELECT * FROM ({query}) "
+            "WHERE measured_at IS NULL OR julianday(measured_at) <= julianday(?) "
+            "ORDER BY julianday(measured_at) DESC, id DESC",
+            (now.isoformat(),),
+        )
+        with closing(rows):
+            _check_rows(rows, result, success, cutoff, n, scheduled)
     return results
 
 

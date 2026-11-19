@@ -1,5 +1,6 @@
 """Deterministic measurements and delivery checks for #716."""
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import fastapi.routing
@@ -75,6 +76,14 @@ def test_fewer_than_threshold_is_ok(db):
     assert check_pipelines(db, NOW)["local_replays"]["status"] == "ok"
 
 
+def test_missing_measurement_table_does_not_report_stale(db):
+    db.execute("DROP TABLE local_replays")
+    results = check_pipelines(db, NOW)
+    assert results["local_replays"]["status"] == "ok"
+    assert results["local_replays"]["enabled"] is False
+    assert results["planner_shadow"]["status"] == "stale"
+
+
 def test_other_measurement_pipelines(db):
     initial = check_pipelines(db, NOW)
     assert initial["planner_shadow"]["status"] == "stale"
@@ -124,8 +133,7 @@ def test_legacy_planner_shadow_uses_tick_timestamp(db):
     assert result["latest_at"] == NOW.isoformat()
 
 
-@pytest.mark.asyncio
-async def test_problems_lists_stuck_and_stale(db, monkeypatch):
+def test_problems_lists_stuck_and_stale(db, monkeypatch):
     add_replays(db, 5)
     monkeypatch.setattr(data_sources, "read_health", lambda path, now: check_pipelines(db, NOW))
     monkeypatch.setattr(data_sources, "RUNS_DIR", data_sources.REPO_ROOT / "missing-runs")
@@ -136,9 +144,12 @@ async def test_problems_lists_stuck_and_stale(db, monkeypatch):
         return func(*args, **kwargs)
 
     monkeypatch.setattr(fastapi.routing, "run_in_threadpool", run_inline)
-    transport = httpx.ASGITransport(app=api.app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/problems")
+    async def get_problems():
+        transport = httpx.ASGITransport(app=api.app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            return await client.get("/problems")
+
+    response = asyncio.run(get_problems())
     assert response.status_code == 200
     problems = {entry["source"]: entry for entry in response.json()["problems"]}
     assert problems["measurement_stuck"]["summary"] == (
