@@ -1,19 +1,69 @@
-# Home GPU batch lane
+# Home GPU batch lane (#743)
+
+Local-model work that can wait (bake-off, hunk replays, chat completions,
+review and code drafts) can run on the owner's PC instead of the VM's slow
+7B. Nexus writes a signed job into the mailbox repository, the PC answers it
+through its loopback llama-server, and Nexus checks the answer with the same
+checker the VM path uses. The PC never decides anything, and nothing in the
+paid path waits on it.
 
 The lane is opt-in with `NEXUS_HOME_GPU=1` on the Nexus processes that submit,
-poll, and score jobs. It shares the existing mailbox configuration and SQLite
-database. Nexus publishes through the regular mailbox poll and checks replay
-answers during the initiative tick’s local replay phase.
+poll and score jobs.
 
-## Submit and inspect jobs
+## Trust model
 
-Use a full commit SHA reachable from the canonical `origin/main` and a
-repository-relative path to a committed JSON request. For example, a committed
-`chat_completion` request can contain
-`{"messages":[{"role":"user","content":"Summarize this public example."}],"seed":42,"max_tokens":128}`.
-Optional constraints are `grammar` and `json_schema`. The other kinds take a
-`prompt` instead of messages. A `hunk_replay` can also include
-`expected_diff_refs`.
+| Boundary | Rule |
+| --- | --- |
+| What leaves the VM | Only text read from Git objects of the public `tire0011/agent-lab` repository at a commit that is reachable from the `main` tip GitHub reports (`git ls-remote https://github.com/tire0011/agent-lab`). The local `origin` URL and local refs are not trusted. Every string is refused if it holds a path outside the repository, a URL other than `https://github.com/tire0011/agent-lab/...` (including scheme-relative `//host` and bare `host/path` forms), or any credential shape of the shared scrubbers (`modules.redaction.contains_credential`, including bare GitHub tokens). At most 64 KiB per job. |
+| Jobs to the PC | HMAC-SHA256 over job id, kind, deadline and input SHA-256, with a key only Nexus and the PC hold. `created_by: nexus` alone is not trusted. |
+| Replies to Nexus | HMAC-SHA256 over every reply field and the answer, under a different domain label, so a job signature can never pass as a reply signature. Nexus reads replies only from the synced mailbox commit (`HEAD`), never from untracked or modified worktree files. |
+| Code from a reply | Applied by the VM's SEARCH/REPLACE applier. The merged tests that score it run under `bwrap` with no network, a private `/tmp`, a read-only system and Python, and only the throwaway worktree writable. The Nexus database, the mailbox, the key and home directories are not mounted. Without a working `bwrap` the job waits and is not scored. |
+| The PC handler | Sends one request to `http://127.0.0.1:<port>/v1/chat/completions`, with no proxy and no redirects. It runs no code from the payload and starts no process. The poll around it runs only `git`, with fixed arguments. |
+
+## Set up the shared key (once)
+
+The key is a random value of at least 32 bytes. It must not be readable by
+other users (`chmod 600`), and it must never be committed.
+
+1. On the VM, create the key file as the Nexus service user, for example with
+   `python3 -c "import secrets; print(secrets.token_hex(32))" > /var/lib/nexus/home-gpu.key`
+   and then `chmod 600 /var/lib/nexus/home-gpu.key`.
+2. Set `NEXUS_HOME_GPU_KEY_FILE=/var/lib/nexus/home-gpu.key` and
+   `NEXUS_HOME_GPU=1` for the Nexus mailbox poll, the tick and the API.
+3. Copy the same value to the PC over a private channel, not through the
+   mailbox, and store it in a file that only the owner can read.
+
+## Exact owner steps on the PC
+
+1. `git pull` the mailbox repository checkout on the PC. Also clone or pull
+   the public agent-lab repository; the worker runs from there.
+2. Start llama-server on loopback with the model you want to measure, for
+   example Ornith-1.5-9B Q4_K_M with 24k context, on port 8080.
+3. Run the worker from the agent-lab checkout:
+
+   ```sh
+   NEXUS_HOME_GPU_KEY_FILE=~/home-gpu.key \
+     python -m handlers.home_gpu_worker --mailbox PATH/TO/mailbox --port 8080 --loop
+   ```
+
+   On Windows PowerShell, set `$env:NEXUS_HOME_GPU_KEY_FILE` first. The worker
+   needs only the Python standard library and `git`. Each poll commits any
+   reply that an interrupted earlier poll left, pulls the mailbox, answers
+   every `inbox/*.md` with `to: home-gpu` and `type: batch_job`, then commits
+   and pushes `outbox/<job_id>.reply.md`. Running a poll twice never calls the
+   model twice for the same job.
+4. If the mailbox client already has its own poll, register the handler
+   there instead of running the loop:
+   `handlers.home_gpu_worker.register(dispatch)` adds `batch_job`, which is
+   called as `handle(meta, body, outbox_dir, key=key, port=port)`.
+5. Check the result on the VM with `GET /home-gpu/jobs` or the
+   `home_gpu_jobs_list` MCP tool. A job should go from `queued` to `answered`
+   and then get `check_status: passed`.
+
+## Submit jobs
+
+Generic jobs (`chat_completion`, `review_draft`, `code_draft`) come from a
+committed JSON request on public `main`:
 
 ```python
 from modules.home_gpu.jobs import submit_job
@@ -21,55 +71,58 @@ from modules.home_gpu.jobs import submit_job
 job_id = submit_job("chat_completion", {"commit": commit_sha, "path": "benchmarks/request.json"})
 ```
 
-The public remote-tracking ref is the trust anchor. Inputs are loaded from Git
-objects and checked for outside paths, foreign URLs, credential patterns, and
-the 64 KiB wire payload limit. Hunk requests are assembled from the merged
-commit subject and reconstructed source at the public base and merged commits.
+A `chat_completion` request holds `messages` and optionally `grammar`,
+`json_schema`, `seed` and `max_tokens`. The other kinds take a `prompt`. A
+`code_draft` can also list `files`, the repository paths it may edit.
+`submit_job` only stores the job. The next mailbox poll writes and publishes
+it, so a crash between the two leaves a queued row that the next poll
+publishes.
 
-Use the `home_gpu_jobs_list` MCP tool or the authenticated
-`GET /home-gpu/jobs` endpoint to see status and timing. A Nexus-side caller can
-retrieve the stored answer with `modules.home_gpu.collect.get_job` and apply
-its own checker. Job records include server inference time and total elapsed
-time. The default deadline is six hours. After a day without a valid reply
-since first publication or last contact, new jobs enter fallback or expire.
-A valid reply before its deadline restores contact, including a reply to a
-job already assigned to the VM. VM fallback runs from 00:00 to 06:00 UTC when
-the local server is idle. Review and code drafts expire with
-`home_gpu_expired`.
-
-## Run the existing benchmarks
+Hunk and bake-off jobs are created by the replay, which is also their checker:
 
 ```sh
 python -m modules.local_shadow_replay_hunks EXPERIMENT_ID --via home-gpu
 python scripts/local_model_bakeoff.py EXACT_LLAMA_MODEL_ID --via home-gpu
 ```
 
-The initial call can return while jobs are queued. The initiative tick
-consumes ready hunk results using the existing SEARCH/REPLACE applier,
-symbol splice, compiler, and merged tests. Re-run the same bake-off command to
-refresh its aggregate row after the unit scores arrive. The bake-off seed and
-fixture select a stable run ID. The home lane uses the PC’s already loaded
-model and checks that the reply reports that model ID. Hunk results and
-bake-off rows carry `host`. VM fallbacks are scored and aggregated under
-`host=vm`.
+The first call returns while jobs are queued. The tick scores the answers
+later. Re-run the bake-off command to refresh its aggregate row. Unit and
+bake-off rows carry `host`, so home GPU numbers stay apart from VM numbers.
 
-## Set up the mailbox client on the PC
+## Checkers
 
-1. Pull the PC’s mailbox checkout.
-2. Copy [the portable handler](../handlers/batch_job.py) into
-   `mailbox_client/handlers/batch_job.py` in the mailbox repository. Register
-   `batch_job` in that client’s dispatch table so a routed message calls
-   `handle(meta, body, outbox_path, port=llama_port)`. Pass the parsed front
-   matter, JSON body, and mailbox outbox directory. The client retains
-   responsibility for polling, routing, archiving, and syncing Git.
-3. Run llama-server on loopback and set the handler port to match it. The
-   default is `8080`. Start the mailbox client with recipient ID `home-gpu`.
-4. Submit a public smoke request and check that the job becomes `answered`.
-   The worker returns a reply for the same job ID and input SHA-256 and
-   records the llama-server model, token counts, elapsed seconds, and
-   generation rate. The worker’s only external call is the loopback
-   completion request.
+Inference and checking are recorded separately. `answered_at` and
+`answer_host` record who produced the text, and `checked_at` and
+`check_status` (`passed`, `failed`, `error`) record what the checker said.
 
-The mailbox checkout and the PC are separate from the agent-lab workspace.
-Verify dispatch registration and the smoke request there before enabling the
-lane for regular runs.
+| Kind | Checker |
+| --- | --- |
+| `hunk_replay`, `bakeoff_prompt` | Hunk replay: SEARCH/REPLACE applier, symbol splice, compile, merged tests (sandboxed for PC answers) |
+| `chat_completion` | JSON-schema validation when the job has `json_schema`, otherwise a non-empty answer |
+| `review_draft` | `nexus_reviewer.parse_review` |
+| `code_draft` | `local_edit_format.edits_to_diff` against the public files at the job's commit, in a temporary directory |
+
+## Deadlines, offline PC and fallback
+
+- Deadlines are enforced locally on every mailbox poll and tick, also while
+  the mailbox cannot be synced. A job within five minutes of its deadline is
+  not published any more.
+- The default deadline is six hours. If no valid reply has arrived in the
+  last 24 hours (or since the first publication), published jobs fall back
+  at once. New jobs are still published, so a PC that comes back is noticed.
+  A valid PC answer before the deadline still wins over a fallback that the
+  VM has not started yet.
+- Batch kinds (`chat_completion`, `hunk_replay`, `bakeoff_prompt`) go to the
+  VM between 00:00 and 06:00 UTC, only when the local server is idle.
+  Generic jobs go through the shared local job service, with the local time
+  budget as admission (`home_gpu_fallback_unaffordable` when the prompt does
+  not fit). Timeouts, connection, protocol and stuck errors are retried with
+  back-off up to three times. Other errors end the job with
+  `home_gpu_fallback_failed`.
+- Interactive kinds (`review_draft`, `code_draft`) are dropped with
+  `home_gpu_expired`.
+- One hunk job never blocks the others. A job whose replay already finished
+  is closed with that result. A job that cannot make progress (for example
+  because of a worktree failure, a busy server or a missing sandbox) gets a
+  growing back-off, and the next job is tried. After eight attempts the job
+  ends with `check_status: error`.

@@ -86,7 +86,17 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT,
             answer TEXT,
             checked_at REAL,
-            fallback_lease_until REAL
+            fallback_lease_until REAL,
+            answered_at REAL,
+            answer_host TEXT,
+            check_status TEXT,
+            check_detail TEXT,
+            check_attempts INTEGER NOT NULL DEFAULT 0,
+            next_check_at REAL,
+            fallback_attempts INTEGER NOT NULL DEFAULT 0,
+            next_fallback_at REAL,
+            fallback_job_id TEXT,
+            publish_error TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_status ON home_gpu_jobs(status, created_at);
 
@@ -402,8 +412,22 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_home_gpu_jobs(conn)
     conn.commit()
     return conn
+
+
+def _migrate_home_gpu_jobs(conn: sqlite3.Connection) -> None:
+    """#743: columns added after the first home GPU lane schema."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(home_gpu_jobs)")}
+    for column, ddl in (
+        ("answered_at", "REAL"), ("answer_host", "TEXT"), ("check_status", "TEXT"),
+        ("check_detail", "TEXT"), ("check_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_check_at", "REAL"), ("fallback_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_fallback_at", "REAL"), ("fallback_job_id", "TEXT"), ("publish_error", "TEXT"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE home_gpu_jobs ADD COLUMN {column} {ddl}")
 
 
 def _migrate_experiment_reflections_columns(conn: sqlite3.Connection) -> None:

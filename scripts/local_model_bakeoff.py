@@ -369,7 +369,7 @@ def run_home_bakeoff(candidates, fixture, *, repo_root, db_path, seed, replay_fn
         units = _units(summary)
         if units:
             outcomes.append(units[0])
-        elif summary is None or summary.get("pending_units"):
+        elif summary is None or summary.get("pending_units") or summary.get("transient_error"):
             pending += 1
         else:
             outcomes.append({"status": summary["status"], "error": summary.get("error")})

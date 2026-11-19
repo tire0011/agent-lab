@@ -85,6 +85,30 @@ def redact_known_secret_values(text: str) -> str:
     return text
 
 
+_PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----")
+_AWS_KEY_PATTERN = re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")
+
+
+def credential_patterns() -> tuple[re.Pattern[str], ...]:
+    """Every credential shape the scrubbers above recognize, plus the mailbox scanner's."""
+    from modules.mailbox.core import SECRET_PATTERNS
+
+    return (_SECRET_PATTERN, _BEARER_PATTERN, _SK_KEY_PATTERN, _GITHUB_TOKEN_PATTERN,
+            _URL_CRED_PATTERN, _URL_USERINFO_PATTERN, _PRIVATE_KEY_PATTERN, _AWS_KEY_PATTERN,
+            *SECRET_PATTERNS)
+
+
+def contains_credential(text: str) -> bool:
+    """Whether *text* holds a credential shape or a configured credential value (#743).
+
+    The gate for text that leaves the VM: anything one of the redactors would
+    scrub is refused instead of being sent.
+    """
+    if redact_known_secret_values(text) != text:
+        return True
+    return any(pattern.search(text) for pattern in credential_patterns())
+
+
 def redact_secrets(text: str) -> str:
     """Scrub secret-shaped substrings but keep filesystem paths.
 

@@ -550,47 +550,177 @@ class ReadSideTests(unittest.TestCase):
 
 
 class HomeGpuScoringTests(unittest.TestCase):
-    def test_mailbox_answer_is_scored_using_the_vm_hunk_checker(self):
-        from modules.home_gpu.collect import collect, get_job
-        from modules.home_gpu.fallback import advance_one
-        from modules.home_gpu.jobs import list_jobs
+    """#743: a home GPU answer is scored by the VM hunk checker, in the sandbox."""
+
+    KEY = b"h" * 40
+
+    def lane(self):
+        from modules.home_gpu import jobs
         from modules.mailbox.config import MailboxConfig
 
         fx = HunkFixture(self)
         config = MailboxConfig.from_paths(Path(fx.repo), fx.root / "mailbox")
-        _git(fx.repo, "remote", "add", "origin", "https://github.com/tire0011/agent-lab.git")
-        _git(fx.repo, "update-ref", "refs/remotes/origin/main", fx.merged)
-        with patch.dict(os.environ, {
-            "NEXUS_HOME_GPU": "1",
+        config.mailbox_repo_path.mkdir()
+        _git(config.mailbox_repo_path, "init", "-q", "-b", "main")
+        key_file = fx.root / "key"
+        key_file.write_bytes(self.KEY)
+        key_file.chmod(0o600)
+        env = patch.dict(os.environ, {
+            "NEXUS_HOME_GPU": "1", "NEXUS_HOME_GPU_KEY_FILE": str(key_file),
             "AGENT_MAILBOX_REPO_PATH": str(config.mailbox_repo_path),
-            "AGENT_MAILBOX_LOCK_PATH": str(fx.root / "mailbox.lock"),
-        }):
-            queued = lsh.replay_hunks(
-                "exp-1", repo_root=fx.repo, db_path=fx.db_path, via="home-gpu",
-                max_units=1, client=FakeClient(),
-            )
-            self.assertEqual(queued["pending_units"], 1)
-            self.assertEqual(queued["units"], [])
-            [job] = list_jobs(db_path=fx.db_path)
-            payload = get_job(job["job_id"], db_path=fx.db_path)["payload"]
-            self.assertNotIn("A long issue body", payload)
-            self.assertNotIn("assert shapes.area", payload)
-            self.assertNotIn("return math.pi * r * r", payload)
-            _write(config.mailbox_repo_path, f"outbox/{job['job_id']}.reply.md",
-                   f"---\nin_reply_to: {job['job_id']}\ninput_sha256: {get_job(job['job_id'], db_path=fx.db_path)['input_sha256']}\n"
-                   "model: ornith\nprompt_tokens: 88\ncompletion_tokens: 30\nseconds: 2\n---\n"
-                   f"{SHAPES}\n<<<<<<< SEARCH\ndef area(r):\n    return 0\n=======\n"
-                   "def area(r):\n    return math.pi * r * r\n>>>>>>> REPLACE\n")
-            collect(config, fx.db_path)
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        jobs._reset_canonical_cache()
+        canonical = patch.object(jobs, "_ls_remote_main", lambda repo: fx.merged)
+        canonical.start()
+        self.addCleanup(canonical.stop)
+        return fx, config
+
+    def queue(self, fx):
+        from modules.home_gpu.jobs import list_jobs
+
+        queued = lsh.replay_hunks("exp-1", repo_root=fx.repo, db_path=fx.db_path, via="home-gpu",
+                                  max_units=1, client=FakeClient())
+        self.assertEqual(queued["pending_units"], 1)
+        self.assertEqual(queued["units"], [])
+        [job] = list_jobs(db_path=fx.db_path)
+        return queued, job["job_id"]
+
+    def answer(self, fx, config, job_id):
+        from handlers.batch_job import reply_message
+        from modules.home_gpu.collect import collect, get_job
+
+        job = get_job(job_id, db_path=fx.db_path)
+        _write(config.mailbox_repo_path, f"outbox/{job_id}.reply.md", reply_message(
+            self.KEY, job_id=job_id, digest=job["input_sha256"], model="ornith", prompt_tokens=88,
+            completion_tokens=30, seconds=2.0, rate=15.0,
+            answer=(f"{SHAPES}\n<<<<<<< SEARCH\ndef area(r):\n    return 0\n=======\n"
+                    "def area(r):\n    return math.pi * r * r\n>>>>>>> REPLACE")))
+        _git(config.mailbox_repo_path, "add", ".")
+        _git(config.mailbox_repo_path, "commit", "-q", "-m", "reply")
+        collect(config, fx.db_path, published={job_id})
+        self.assertEqual(get_job(job_id, db_path=fx.db_path)["status"], "answered")
+
+    def test_mailbox_answer_is_scored_using_the_vm_hunk_checker(self):
+        from modules.home_gpu import sandbox
+        from modules.home_gpu.collect import get_job
+        from modules.home_gpu.fallback import advance_one
+
+        if sandbox.unavailable_reason():
+            self.skipTest("bwrap not usable here")
+        fx, config = self.lane()
+        queued, job_id = self.queue(fx)
+        payload = get_job(job_id, db_path=fx.db_path)["payload"]
+        self.assertNotIn("A long issue body", payload)
+        self.assertNotIn("assert shapes.area", payload)
+        self.assertNotIn("return math.pi * r * r", payload)
+        self.answer(fx, config, job_id)
+        boxed = []
+        real = sandbox.command
+        with patch.object(sandbox, "command", lambda *a: boxed.append(a) or real(*a)):
             self.assertTrue(advance_one(fx.repo, fx.db_path))
+        self.assertTrue(boxed, "the merged tests must run in the sandbox")
+        self.assertFalse(advance_one(fx.repo, fx.db_path))
+        with lsr._connect(fx.db_path) as conn:
+            [unit] = lsh.stored_units(conn, "exp-1", queued["prompt_variant"])
+        self.assertEqual(unit["host"], "home-gpu")
+        self.assertEqual(unit["model"], "ornith")
+        self.assertEqual(unit["generation_tokens_per_second"], 15)
+        self.assertTrue(unit["compiled"])
+        self.assertTrue(unit["tests_passed"])
+        job = get_job(job_id, db_path=fx.db_path)
+        self.assertEqual(job["check_status"], "passed")
+        self.assertGreaterEqual(job["checked_at"], job["answered_at"])
+
+    def test_worktree_failure_keeps_the_run_open_and_the_job_retryable(self):
+        from modules.home_gpu import sandbox
+        from modules.home_gpu.collect import get_job
+        from modules.home_gpu.fallback import advance_one
+
+        if sandbox.unavailable_reason():
+            self.skipTest("bwrap not usable here")
+        fx, config = self.lane()
+        queued, job_id = self.queue(fx)
+        self.answer(fx, config, job_id)
+        with patch.object(lsr, "_create_worktree", side_effect=OSError("no space left")):
             self.assertFalse(advance_one(fx.repo, fx.db_path))
-            with lsr._connect(fx.db_path) as conn:
-                [unit] = lsh.stored_units(conn, "exp-1", queued["prompt_variant"])
-            self.assertEqual(unit["host"], "home-gpu")
-            self.assertEqual(unit["model"], "ornith")
-            self.assertEqual(unit["generation_tokens_per_second"], 15)
-            self.assertTrue(unit["compiled"])
-            self.assertTrue(unit["tests_passed"])
+        job = get_job(job_id, db_path=fx.db_path)
+        self.assertIsNone(job["checked_at"])
+        self.assertEqual(job["check_attempts"], 1)
+        self.assertIn("no space left", job["check_detail"])
+        with lsr._connect(fx.db_path) as conn:
+            run = lsh._run_row(conn, "exp-1", queued["prompt_variant"])
+            self.assertEqual(run["status"], lsh.RUN_RUNNING)
+            # Nothing was claimed, so no unit attempt was used up.
+            self.assertEqual(lsh.stored_units(conn, "exp-1", queued["prompt_variant"]), [])
+        self.assertTrue(advance_one(fx.repo, fx.db_path, now=job["next_check_at"] + 1))
+        self.assertEqual(get_job(job_id, db_path=fx.db_path)["check_status"], "passed")
+
+    def test_overdue_job_is_produced_and_scored_by_the_vm_at_night_only(self):
+        from modules.home_gpu import collect as home_collect
+        from modules.home_gpu.collect import advance_deadlines, get_job
+        from modules.home_gpu.fallback import advance_one
+
+        fx, _ = self.lane()
+        queued, job_id = self.queue(fx)
+        advance_deadlines(fx.db_path, now=get_job(job_id, db_path=fx.db_path)["deadline"])
+        self.assertEqual(get_job(job_id, db_path=fx.db_path)["status"], "fallback")
+        worker = FakeWorker({SHAPES: MERGED_SHAPES})
+        with patch.object(lsh, "default_hunk_replay_client", FakeClient), \
+                patch.object(lsh, "hunk_worker_factory", lambda _client: worker), \
+                patch.object(lsr, "server_state", lambda *a: (True, "idle")):
+            with patch.object(home_collect, "night_window", lambda now=None: False):
+                self.assertFalse(advance_one(fx.repo, fx.db_path))
+            self.assertFalse(worker.calls)
+            with patch.object(home_collect, "night_window", lambda now=None: True):
+                self.assertTrue(advance_one(fx.repo, fx.db_path))
+                self.assertFalse(advance_one(fx.repo, fx.db_path))
+        self.assertEqual(len(worker.calls), 1)
+        with lsr._connect(fx.db_path) as conn:
+            [unit] = lsh.stored_units(conn, "exp-1", queued["prompt_variant"])
+        self.assertEqual(unit["host"], "vm")
+        self.assertTrue(unit["tests_passed"])
+        job = get_job(job_id, db_path=fx.db_path)
+        self.assertEqual((job["answer_host"], job["check_status"]), ("vm", "passed"))
+        self.assertEqual(job["fallback_job_id"], "replay")
+
+    def test_unreachable_github_or_missing_key_never_fails_a_unit(self):
+        from modules.home_gpu import jobs
+        from modules.home_gpu.jobs import list_jobs
+
+        fx, _ = self.lane()
+
+        def down(repo):
+            raise jobs.ProvenanceUnavailable("canonical repository unreachable")
+
+        with patch.object(jobs, "_ls_remote_main", down):
+            result = lsh.replay_hunks("exp-1", repo_root=fx.repo, db_path=fx.db_path, via="home-gpu",
+                                      max_units=1, client=FakeClient())
+        self.assertIn("unreachable", result["transient_error"])
+        with patch.dict(os.environ, {"NEXUS_HOME_GPU_KEY_FILE": str(fx.root / "missing")}):
+            result = lsh.replay_hunks("exp-1", repo_root=fx.repo, db_path=fx.db_path, via="home-gpu",
+                                      max_units=1, client=FakeClient())
+        self.assertIn("transient_error", result)
+        self.assertEqual((result["status"], result["units"]), (lsh.RUN_RUNNING, []))
+        self.assertEqual(list_jobs(db_path=fx.db_path), [])
+        # Once both are back the unit is queued normally.
+        self.queue(fx)
+
+    def test_a_missing_sandbox_defers_scoring_instead_of_running_unisolated(self):
+        from modules.home_gpu import sandbox
+        from modules.home_gpu.collect import get_job
+        from modules.home_gpu.fallback import advance_one
+
+        fx, config = self.lane()
+        _, job_id = self.queue(fx)
+        self.answer(fx, config, job_id)
+        with patch.object(sandbox, "unavailable_reason", return_value="bwrap is not installed"):
+            self.assertFalse(advance_one(fx.repo, fx.db_path))
+        job = get_job(job_id, db_path=fx.db_path)
+        self.assertIsNone(job["checked_at"])
+        self.assertIn("home_gpu_checker_unavailable", job["check_detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

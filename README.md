@@ -63,7 +63,7 @@ at once and outside the budget.
 
 ## Mailbox
 
-The [home GPU batch lane](docs/home-gpu.md) uses this mailbox for public-repository replay and bake-off jobs.
+The [home GPU batch lane](docs/home-gpu.md) uses this mailbox for signed public-repository jobs (replays, bake-off, drafts) answered by the owner's PC.
 
 Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed mailbox communication. GitHub push events affecting `inbox/` trigger immediate processing through `POST /mailbox/webhook/github`; the systemd timer remains as a one-minute fallback.
 

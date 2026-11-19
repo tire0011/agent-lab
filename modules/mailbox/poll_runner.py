@@ -158,6 +158,42 @@ def _worktree_safe_for_mailbox_sync(
     return True
 
 
+def _home_gpu_before_sync(mailbox_config: Any, db_path: str, mailbox_module: Any,
+                          run_name: str) -> set[str]:
+    """#743: local spool upkeep and deadlines, then publication of live jobs.
+
+    Runs before the sync and whatever its outcome, so a mailbox outage never
+    keeps a home GPU job queued past its deadline. Never fails the poll.
+    """
+    from modules.home_gpu import collect as home_gpu_collect, jobs as home_gpu_jobs
+
+    try:
+        # Always, also with the lane switched off: a stray temporary file of
+        # ours must never block the regular mailbox.
+        home_gpu_collect.cleanup_spool_artifacts(mailbox_config)
+        if not home_gpu_jobs.enabled():
+            return set()
+        home_gpu_collect.advance_deadlines(db_path)
+        return home_gpu_collect.publish_pending(mailbox_config, db_path, mailbox_module)
+    except Exception as exc:  # noqa: BLE001 - never block the poll
+        logger.warning("Home GPU publication failed run=%s type=%s", run_name, type(exc).__name__)
+        return set()
+
+
+def _home_gpu_after_sync(mailbox_config: Any, db_path: str, published: set[str],
+                         run_name: str) -> None:
+    """#743: collect signed replies from the synced commit and run the checkers."""
+    from modules.home_gpu import collect as home_gpu_collect, jobs as home_gpu_jobs
+
+    if not home_gpu_jobs.enabled():
+        return
+    try:
+        home_gpu_collect.collect(mailbox_config, db_path, published=published)
+        home_gpu_collect.run_checks(mailbox_config.code_repo_path, db_path)
+    except Exception as exc:  # noqa: BLE001 - never block the poll
+        logger.warning("Home GPU collection failed run=%s type=%s", run_name, type(exc).__name__)
+
+
 def _sync_mailbox_repo(
     mailbox_module: Any,
     repo_path: Path,
@@ -433,12 +469,7 @@ def run_mailbox_poll_once(
             except ValueError:
                 outbox_prefix = ""
             ignored_untracked = (outbox_prefix,) if outbox_prefix else ()
-            from modules.home_gpu import collect as home_gpu_collect, jobs as home_gpu_jobs
-
-            published = (
-                home_gpu_collect.publish_pending(mailbox_config, db_path, mailbox_module)
-                if home_gpu_jobs.enabled() else set()
-            )
+            published = _home_gpu_before_sync(mailbox_config, db_path, mailbox_module, run_name)
             if not _worktree_safe_for_mailbox_sync(
                 mailbox_module,
                 mailbox_config.mailbox_repo_path,
@@ -452,8 +483,7 @@ def run_mailbox_poll_once(
             ):
                 result = MailboxPollRunResult(status="sync_failed")
             else:
-                if home_gpu_jobs.enabled():
-                    home_gpu_collect.collect(mailbox_config, db_path, published=published)
+                _home_gpu_after_sync(mailbox_config, db_path, published, run_name)
                 outcome = _drain_inbox(
                     processor=processor,
                     mailbox_module=mailbox_module,
