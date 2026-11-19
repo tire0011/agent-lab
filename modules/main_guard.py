@@ -4,6 +4,10 @@ and let the tick report it - a merge that broke main must not stay while later
 experiments build on it (#410). Only Nexus's own merge at the tip is reverted; a
 human commit, or a Nexus merge something else already built on, is reported, not
 undone.
+
+The revert goes through a pull request (branch ``nexus/revert-<sha>``, PR,
+squash merge), never a direct push, so main can be protected by a ruleset that
+requires pull requests.
 """
 
 from __future__ import annotations
@@ -54,7 +58,7 @@ def guard_main(repo_root: str, runner: Runner = subprocess.run) -> str | None:
         return None
 
     title = message.splitlines()[0][:120]
-    if not _revert(runner, repo_root, sha):
+    if not _revert(runner, repo_root, sha, title):
         return f"main is red after Nexus merge {sha[:8]} ({title}); the automatic revert failed"
     issue = re.search(r"\bCloses #(\d+)", message)
     if issue:
@@ -66,15 +70,25 @@ def guard_main(repo_root: str, runner: Runner = subprocess.run) -> str | None:
     return f"Reverted Nexus merge {sha[:8]} ({title}): CI on main failed after it"
 
 
-def _revert(runner: Runner, repo_root: str, sha: str) -> bool:
-    """Revert *sha* on top of origin/main in a scratch worktree and push it."""
+def _revert(runner: Runner, repo_root: str, sha: str, title: str = "") -> bool:
+    """Revert *sha* on top of origin/main and land it through a pull request."""
+    branch = f"nexus/revert-{sha[:8]}"
+    pr_title = f"Revert Nexus merge {sha[:8]}: {title}"[:200]
+    pr_body = (
+        f"Automatic revert by the main guard: CI on main failed after Nexus merge {sha}. "
+        "Opened as a pull request because main only accepts pull requests."
+    )
     with tempfile.TemporaryDirectory(prefix="nexus-revert-") as scratch:
         worktree = f"{scratch}/main"
         steps = [
             (["git", "fetch", "origin", "main"], repo_root),
             (["git", "worktree", "add", "--detach", worktree, "origin/main"], repo_root),
             (["git", "revert", "--no-edit", sha], worktree),
-            (["git", "push", "origin", "HEAD:main"], worktree),
+            # Our own branch: a leftover from an earlier failed attempt is replaced.
+            (["git", "push", "--force", "origin", f"HEAD:refs/heads/{branch}"], worktree),
+            (["gh", "pr", "create", "--base", "main", "--head", branch,
+              "--title", pr_title, "--body", pr_body], repo_root),
+            (["gh", "pr", "merge", branch, "--squash", "--delete-branch"], repo_root),
         ]
         ok = True
         for argv, cwd in steps:

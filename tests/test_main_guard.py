@@ -40,8 +40,22 @@ class MainGuardTests(unittest.TestCase):
         message = guard_main("/repo", runner=runner)
         self.assertIn("Reverted Nexus merge abc123", message)
         self.assertTrue(runner.ran("git", "revert", "--no-edit", "abc123"))
-        self.assertTrue(runner.ran("git", "push", "origin", "HEAD:main"))
         self.assertTrue(runner.ran("gh", "issue", "reopen", "410"))
+
+    def test_the_revert_lands_through_a_pull_request_never_a_direct_push(self):
+        runner = FakeRunner(NEXUS)
+        guard_main("/repo", runner=runner)
+        pushes = [c for c in runner.calls if c[:2] == ["git", "push"]]
+        self.assertEqual(pushes, [["git", "push", "--force", "origin", "HEAD:refs/heads/nexus/revert-abc123"]])
+        self.assertTrue(runner.ran("gh", "pr", "create", "--base", "main", "--head", "nexus/revert-abc123"))
+        self.assertTrue(runner.ran("gh", "pr", "merge", "nexus/revert-abc123", "--squash"))
+        order = [c[:3] for c in runner.calls]
+        self.assertLess(order.index(["gh", "pr", "create"]), order.index(["gh", "pr", "merge"]))
+
+    def test_a_failed_pr_merge_is_reported_and_the_issue_stays_closed(self):
+        runner = FakeRunner(NEXUS, fail_on=["gh", "pr"])
+        self.assertIn("automatic revert failed", guard_main("/repo", runner=runner))
+        self.assertFalse(runner.ran("gh", "issue", "reopen"))
 
     def test_green_main_is_left_alone(self):
         runner = FakeRunner(NEXUS, conclusion="success")
