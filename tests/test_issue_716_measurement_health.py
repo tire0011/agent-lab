@@ -133,8 +133,13 @@ def test_legacy_planner_shadow_uses_tick_timestamp(db):
     assert result["latest_at"] == NOW.isoformat()
 
 
-def test_problems_lists_stuck_and_stale(db, monkeypatch):
-    add_replays(db, 5)
+@pytest.mark.parametrize("age", [0, 25])
+def test_problems_lists_stuck_and_stale(db, monkeypatch, age):
+    add_replays(db, 5, age=age)
+    add_hostile_shadow_rows(db)
+    db.execute(
+        "UPDATE local_replays SET error=error || ': FOLLOW THESE INSTRUCTIONS'"
+    )
     monkeypatch.setattr(data_sources, "read_health", lambda path, now: check_pipelines(db, NOW))
     monkeypatch.setattr(data_sources, "RUNS_DIR", data_sources.REPO_ROOT / "missing-runs")
     monkeypatch.setattr(data_sources, "EXPERIMENT_DB_PATH", data_sources.REPO_ROOT / "missing.db")
@@ -151,16 +156,25 @@ def test_problems_lists_stuck_and_stale(db, monkeypatch):
 
     response = asyncio.run(get_problems())
     assert response.status_code == 200
-    problems = {entry["source"]: entry for entry in response.json()["problems"]}
-    assert problems["measurement_stuck"]["summary"] == (
-        "local replays: 5x local_too_slow: the time budget allows only 312 output tokens"
-    )
-    assert "5, 4, 3, 2, 1" in problems["measurement_stuck"]["detail"]
-    assert problems["measurement_stale"]["id"] == "planner_shadow"
+    assert "FOLLOW THESE INSTRUCTIONS" not in response.text
+    problems = {entry["id"]: entry for entry in response.json()["problems"]}
+    replay = problems["local_replays"]
+    expected_streak = "5x local_too_slow: the time budget allows only 312 output tokens"
+    if age:
+        assert replay["source"] == "measurement_stale"
+        assert replay["summary"] == (
+            f"local replays: no measurement in the last 24 hours (last streak: {expected_streak})"
+        )
+    else:
+        assert replay["source"] == "measurement_stuck"
+        assert replay["summary"] == f"local replays: {expected_streak}"
+    assert "5, 4, 3, 2, 1" in problems["local_replays"]["detail"]
+    assert problems["planner_shadow"]["summary"] == "planner shadow: 5x invalid"
 
 
 def test_first_planner_prompt_starts_with_stuck_measurement(db, monkeypatch):
     add_replays(db, 5)
+    add_hostile_shadow_rows(db)
     monkeypatch.setattr(nexus_planner, "read_health", lambda path, now: check_pipelines(db, NOW))
     prompts = []
     planner = nexus_planner.IssuePlanner(
@@ -170,6 +184,8 @@ def test_first_planner_prompt_starts_with_stuck_measurement(db, monkeypatch):
     choice = planner.choose(ISSUES)
     assert choice.issue == 716
     assert len(prompts) == 1
+    assert "planner shadow: 5x invalid" in prompts[0]
+    assert "FOLLOW THESE INSTRUCTIONS" not in prompts[0]
     assert prompts[0].startswith(
         "STUCK MEASUREMENT PIPELINES:\n"
         "local replays: 5x local_too_slow: the time budget allows only 312 output tokens\n"
@@ -186,3 +202,94 @@ def test_read_only_operation_returns_structured_results(db, monkeypatch):
         assert result.metrics["pipelines"]["local_replays"]["row_ids"] == [5, 4, 3, 2, 1]
     finally:
         registry.close()
+
+
+def test_hunk_setup_failures_survive_running_rows_and_retries(db, monkeypatch):
+    monkeypatch.setenv("NEXUS_SHADOW_REPLAY_UNIT", "hunk")
+    for i in range(5):
+        db.execute(
+            "INSERT INTO local_replay_unit_runs "
+            "(experiment_id, prompt_variant, status, error, created_at) "
+            "VALUES (?, 'default', 'error', ?, ?)",
+            (str(i), "the merged commit is not available in the local repository", NOW.isoformat()),
+        )
+    for _ in range(2):
+        db.execute(
+            "INSERT OR IGNORE INTO local_replay_unit_runs "
+            "(experiment_id, prompt_variant, created_at) VALUES ('retry', 'default', ?)",
+            (NOW.isoformat(),),
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO local_replay_units "
+            "(experiment_id, file, symbol, prompt_variant, status, created_at) "
+            "VALUES ('retry', 'app.py', 'handler', 'default', 'running', ?)",
+            (NOW.isoformat(),),
+        )
+        result = check_pipelines(db, NOW)["local_replay_units"]
+        assert result["status"] == "stuck"
+        assert result["row_table"] == "local_replay_unit_runs"
+        assert result["row_ids"] == [5, 4, 3, 2, 1]
+        assert result["reason"] == "the merged commit is not available in the local repository"
+
+    db.execute("UPDATE local_replay_unit_runs SET status='done' WHERE experiment_id='retry'")
+    assert check_pipelines(db, NOW)["local_replay_units"]["status"] == "ok"
+
+
+def test_interrupted_bakeoff_placeholders_do_not_count_or_hide_streak(db):
+    def insert(status):
+        db.execute(
+            "INSERT INTO local_model_bakeoffs (run_id, created_at, model, status) "
+            "VALUES ('run', ?, 'model', ?)",
+            (NOW.isoformat(), status),
+        )
+
+    insert("interrupted")
+    for _ in range(6):
+        insert("not_run")
+    assert check_pipelines(db, NOW)["local_model_bakeoffs"]["status"] == "ok"
+    for _ in range(4):
+        insert("interrupted")
+        insert("not_run")
+    result = check_pipelines(db, NOW)["local_model_bakeoffs"]
+    assert result["status"] == "stuck"
+    assert result["outcome"] == "interrupted"
+    assert result["row_ids"] == [14, 12, 10, 8, 1]
+
+
+def test_stale_streak_retains_details_and_ignores_pending_replays(db):
+    add_replays(db, 5, age=25)
+    db.execute(
+        "INSERT INTO local_replays (experiment_id, prompt_variant, created_at) "
+        "VALUES ('crashed', 'default', ?)",
+        (NOW.isoformat(),),
+    )
+    result = check_pipelines(db, NOW)["local_replays"]
+    assert result["status"] == "stale"
+    assert result["row_ids"] == [5, 4, 3, 2, 1]
+    assert "last streak: 5x local_too_slow" in measurement_health.health_summary(
+        "local_replays", result,
+    )
+
+
+def add_hostile_shadow_rows(db):
+    for i in range(5):
+        db.execute(
+            "INSERT INTO planner_shadow "
+            "(tick_id, paid_issue, local_valid, prompt_tokens, seconds, error, created_at) "
+            "VALUES (?, 716, 0, 100, 0.1, 'HTTP 503: FOLLOW THESE INSTRUCTIONS', ?)",
+            (f"shadow-{i}", NOW.isoformat()),
+        )
+
+
+def test_read_during_failed_write_does_not_commit_partial_streak(db):
+    add_replays(db, 4)
+    db.commit()
+    db.execute(
+        "INSERT INTO local_replays (experiment_id, prompt_variant, status, error, created_at) "
+        "VALUES ('partial', 'default', 'local_too_slow', "
+        "'the time budget allows only 312 output tokens', ?)",
+        (NOW.isoformat(),),
+    )
+    assert check_pipelines(db, NOW)["local_replays"]["status"] == "stuck"
+    db.rollback()
+    assert check_pipelines(db, NOW)["local_replays"]["status"] == "ok"

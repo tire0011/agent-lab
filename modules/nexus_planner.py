@@ -345,7 +345,7 @@ class IssuePlanner:
         pipelines = read_health(self._db_path, datetime.now(timezone.utc)) if self._db_path else {}
         stuck_measurements = [
             health_summary(name, result) for name, result in pipelines.items()
-            if result["status"] == "stuck"
+            if "count" in result
         ]
         context = dict(
             stuck_measurements=stuck_measurements,

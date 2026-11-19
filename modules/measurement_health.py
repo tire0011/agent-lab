@@ -11,9 +11,19 @@ from pathlib import Path
 from typing import Any
 
 from modules.local_shadow_replay import ENV_UNIT, enabled_for_settings
-from modules.redaction import sanitized_reason
 
 _NUMBERS = re.compile(r"[+-]?\d+(?:[.,]\d+)*")
+_TOKEN_BUDGET = re.compile(
+    r"(?:local_too_slow: )?the time budget allows only ([0-9]{1,9}) output tokens\b"
+)
+_SETUP_REASONS = (
+    "the merged commit is not available in the local repository",
+    "the merged diff changes no non-test Python code",
+)
+_OUTCOMES = {
+    "local_too_slow", "no_tests", "no_units", "error", "timeout",
+    "invalid", "interrupted", "switch_failed", "lease_busy",
+}
 _LABELS = {
     "local_replays": "local replays",
     "local_replay_units": "local hunk replays",
@@ -25,7 +35,7 @@ _LABELS = {
 def check_pipelines(
     db: sqlite3.Connection, now: datetime, n: int = 5, max_age_hours: float = 24,
 ) -> dict[str, dict[str, Any]]:
-    """Report the latest consecutive failure streak, or freshness if none qualifies."""
+    """Report terminal failure streaks and check freshness independently."""
     if n < 1 or max_age_hours <= 0:
         raise ValueError("n and max_age_hours must be positive")
     if now.tzinfo is None:
@@ -56,13 +66,21 @@ def check_pipelines(
     replay_unit = os.environ.get(ENV_UNIT, "whole").strip().lower()
     unit_columns = {row[1] for row in db.execute("PRAGMA table_info(local_replay_units)")}
     if "status" in unit_columns:
+        unit_error = "error" if "error" in unit_columns else "NULL"
+        unit_time = "COALESCE(finished_at, created_at)" if "finished_at" in unit_columns else "created_at"
         hunk_query = (
-            "SELECT id, status, error, COALESCE(finished_at, created_at) AS measured_at "
+            f"SELECT id, status, {unit_error}, {unit_time} AS measured_at "
             "FROM local_replay_units WHERE status != 'running'"
         )
     else:
         hunk_query = "SELECT id, 'scored', NULL, created_at AS measured_at FROM local_replay_units"
 
+    # Run completions and unit completions have independent streaks. A done
+    # run can contain failed units, so it must not reset their streak.
+    hunk_run_query = (
+        "SELECT id, status, error, COALESCE(finished_at, created_at) AS measured_at "
+        "FROM local_replay_unit_runs WHERE status IN ('done', 'no_units', 'error')"
+    )
     paused = setting("nexus.paused") == "1"
     pipelines = (
         ("local_replays", replay_enabled, replay_unit == "whole", "scored",
@@ -75,29 +93,46 @@ def check_pipelines(
          f"p.error, {planner_time} AS measured_at FROM planner_shadow AS p {planner_join}"),
         # Bake-offs are run manually and have no expected cadence.
         ("local_model_bakeoffs", True, False, "completed",
-         "SELECT id, status, error, created_at AS measured_at FROM local_model_bakeoffs"),
+         "SELECT id, status, error, created_at AS measured_at FROM local_model_bakeoffs WHERE status != 'not_run'"),
     )
     results = {}
     for name, enabled, scheduled, success, query in pipelines:
         # Older and experiment-only stores may not support this pipeline.
-        enabled = enabled and name in tables
+        sources = [(name, success, query)] if name in tables else []
+        if name == "local_replay_units" and "local_replay_unit_runs" in tables:
+            sources.append(("local_replay_unit_runs", "done", hunk_run_query))
+        enabled = enabled and bool(sources)
         result = {"status": "ok", "enabled": enabled, "latest_at": None}
         results[name] = result
         if not enabled:
             continue
-        rows = db.execute(
-            f"SELECT * FROM ({query}) "
-            "WHERE measured_at IS NULL OR julianday(measured_at) <= julianday(?) "
-            "ORDER BY julianday(measured_at) DESC, id DESC",
-            (now.isoformat(),),
-        )
-        with closing(rows):
-            _check_rows(rows, result, success, cutoff, n, scheduled)
+        observations = []
+        for table, success, query in sources:
+            with closing(db.execute(
+                f"SELECT * FROM ({query}) "
+                "WHERE measured_at IS NULL OR julianday(measured_at) <= julianday(?) "
+                "ORDER BY julianday(measured_at) DESC, id DESC",
+                (now.isoformat(),),
+            )) as rows:
+                observations.append(_check_rows(rows, success, n, table))
+        latest = max((timestamp for timestamp, _ in observations), key=_timestamp)
+        result["latest_at"] = latest
+        streaks = [streak for _, streak in observations if streak]
+        if streaks:
+            result.update(max(streaks, key=lambda streak: _timestamp(streak["stuck_at"])))
+            result["status"] = "stuck"
+        if scheduled and _timestamp(latest) < cutoff:
+            result.update(status="stale", max_age_hours=max_age_hours)
     return results
 
 
-def _reason_text(error: str | None) -> str:
-    return " ".join((sanitized_reason(error) or "").split())
+def _diagnostic(outcome: str, error: str) -> str:
+    """Render only fixed diagnostic text and bounded numeric measurements."""
+    if outcome == "local_too_slow" and (match := _TOKEN_BUDGET.match(error)):
+        return f"the time budget allows only {int(match[1])} output tokens"
+    if error in _SETUP_REASONS:
+        return error
+    return ""
 
 
 def _normalize(reason: str) -> str:
@@ -105,35 +140,40 @@ def _normalize(reason: str) -> str:
 
 
 def _check_rows(
-    rows: sqlite3.Cursor, result: dict[str, Any], success: str,
-    cutoff: datetime, n: int, scheduled: bool,
-) -> None:
+    rows: sqlite3.Cursor, success: str, n: int, table: str,
+) -> tuple[str | None, dict[str, Any]]:
     first = rows.fetchone()
-    if first is not None:
-        row_id, outcome, error, timestamp = first
-        result["latest_at"] = timestamp
-        if outcome != success:
-            reason = _reason_text(error)
-            normalized = _normalize(reason)
-            ids = [row_id]
-            for row_id, next_outcome, next_error, _ in rows:
-                if next_outcome != outcome:
-                    break
-                if _normalize(_reason_text(next_error)) != normalized:
-                    break
-                ids.append(row_id)
-            if len(ids) >= n:
-                result.update(status="stuck", outcome=outcome, reason=reason,
-                              normalized_reason=normalized, count=len(ids), row_ids=ids)
-                return
-    timestamp = result["latest_at"]
-    if scheduled and (timestamp is None or _older_than(timestamp, cutoff)):
-        result["status"] = "stale"
+    if first is None:
+        return None, {}
+    row_id, outcome, error, timestamp = first
+    if outcome == success:
+        return timestamp, {}
+    # Compare stored text locally. Only the controlled diagnostic leaves this module.
+    normalized = _normalize(error or "")
+    ids = [row_id]
+    for row_id, next_outcome, next_error, _ in rows:
+        if next_outcome != outcome or _normalize(next_error or "") != normalized:
+            break
+        ids.append(row_id)
+    if len(ids) < n:
+        return timestamp, {}
+    reason = _diagnostic(outcome, error or "")
+    return timestamp, {
+        "outcome": outcome if outcome in _OUTCOMES else "unknown_failure",
+        "reason": reason,
+        "normalized_reason": _normalize(reason),
+        "count": len(ids),
+        "row_ids": ids,
+        "row_table": table,
+        "stuck_at": timestamp,
+    }
 
 
-def _older_than(timestamp: str, cutoff: datetime) -> bool:
-    measured = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
-    return measured.replace(tzinfo=measured.tzinfo or timezone.utc) < cutoff
+def _timestamp(value: str | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    measured = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return measured.replace(tzinfo=measured.tzinfo or timezone.utc)
 
 
 def read_health(db_path: str | Path, now: datetime) -> dict[str, dict[str, Any]]:
@@ -141,6 +181,7 @@ def read_health(db_path: str | Path, now: datetime) -> dict[str, dict[str, Any]]
     try:
         uri = Path(db_path).resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as db:
+            db.execute("BEGIN")
             return check_pipelines(db, now)
     except (OSError, sqlite3.Error):
         return {}
@@ -148,10 +189,14 @@ def read_health(db_path: str | Path, now: datetime) -> dict[str, dict[str, Any]]
 
 def health_summary(name: str, result: dict[str, Any]) -> str:
     label = _LABELS[name]
-    if result["status"] == "stuck":
-        summary = f"{label}: {result['count']}x {result['outcome']}"
-        reason = result["reason"].removeprefix(f"{result['outcome']}: ").strip()
-        return f"{summary}: {reason}" if reason else summary
+    streak = ""
+    if "count" in result:
+        streak = f"{result['count']}x {result['outcome']}"
+        if result["reason"]:
+            streak += f": {result['reason']}"
     if result["status"] == "stale":
-        return f"{label}: no measurement in the last 24 hours"
+        summary = f"{label}: no measurement in the last {result['max_age_hours']:g} hours"
+        return f"{summary} (last streak: {streak})" if streak else summary
+    if streak:
+        return f"{label}: {streak}"
     return f"{label}: {'ok' if result['enabled'] else 'disabled'}"
