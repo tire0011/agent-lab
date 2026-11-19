@@ -65,6 +65,41 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     conn = _connect(db_path)
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS home_gpu_jobs (
+            job_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued', 'answered', 'expired', 'fallback')),
+            created_at REAL NOT NULL,
+            deadline REAL NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            published_at REAL,
+            finished_at REAL,
+            reply_seen_at REAL,
+            expected_model TEXT,
+            replay_key TEXT,
+            model TEXT,
+            prompt_tokens INTEGER,
+            completion_tokens INTEGER,
+            seconds REAL,
+            tokens_per_second REAL,
+            error TEXT,
+            answer TEXT,
+            checked_at REAL,
+            fallback_lease_until REAL,
+            answered_at REAL,
+            answer_host TEXT,
+            check_status TEXT,
+            check_detail TEXT,
+            check_attempts INTEGER NOT NULL DEFAULT 0,
+            next_check_at REAL,
+            fallback_attempts INTEGER NOT NULL DEFAULT 0,
+            next_fallback_at REAL,
+            fallback_job_id TEXT,
+            publish_error TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_status ON home_gpu_jobs(status, created_at);
+
         CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT NOT NULL,
@@ -377,8 +412,22 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_home_gpu_jobs(conn)
     conn.commit()
     return conn
+
+
+def _migrate_home_gpu_jobs(conn: sqlite3.Connection) -> None:
+    """#743: columns added after the first home GPU lane schema."""
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(home_gpu_jobs)")}
+    for column, ddl in (
+        ("answered_at", "REAL"), ("answer_host", "TEXT"), ("check_status", "TEXT"),
+        ("check_detail", "TEXT"), ("check_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_check_at", "REAL"), ("fallback_attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_fallback_at", "REAL"), ("fallback_job_id", "TEXT"), ("publish_error", "TEXT"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE home_gpu_jobs ADD COLUMN {column} {ddl}")
 
 
 def _migrate_experiment_reflections_columns(conn: sqlite3.Connection) -> None:
@@ -1129,9 +1178,13 @@ def _migrate_local_replays(conn: sqlite3.Connection) -> None:
         ("sr_grammar", "INTEGER NULL"),
         ("format_rounds", "INTEGER NOT NULL DEFAULT 0"),
         ("generation_tokens_per_second", "REAL NULL"),
+        ("host", "TEXT NOT NULL DEFAULT 'vm'"),
     ):
         if column not in unit_columns:
             conn.execute(f"ALTER TABLE local_replay_units ADD COLUMN {column} {ddl}")
+    bakeoff_columns = {row[1] for row in conn.execute("PRAGMA table_info(local_model_bakeoffs)")}
+    if "host" not in bakeoff_columns:
+        conn.execute("ALTER TABLE local_model_bakeoffs ADD COLUMN host TEXT NOT NULL DEFAULT 'vm'")
     # #639: what the local run cost and how best-of-N sampled, so variants
     # (e.g. samples1 vs samples4) can be weighed on evidence.
     existing = {row[1] for row in conn.execute("PRAGMA table_info(local_replays)")}

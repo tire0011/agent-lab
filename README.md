@@ -63,6 +63,8 @@ at once and outside the budget.
 
 ## Mailbox
 
+The [home GPU batch lane](docs/home-gpu.md) uses this mailbox for signed public-repository jobs (replays, bake-off, drafts) answered by the owner's PC.
+
 Nexus uses the separate `tire0011/agent-lab-mailbox` repository for Git-backed mailbox communication. GitHub push events affecting `inbox/` trigger immediate processing through `POST /mailbox/webhook/github`; the systemd timer remains as a one-minute fallback.
 
 **Inbox** (`<AGENT_MAILBOX_REPO_PATH>/inbox/`): Drop a Markdown file with YAML front matter here to send a message to Nexus. This root-level directory is the only supported inbox; the code repository's former `communication/inbox/` path is not scanned.

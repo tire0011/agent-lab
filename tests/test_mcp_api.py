@@ -336,6 +336,7 @@ class McpApiTests(unittest.TestCase):
                 "chat",
                 "codex_tasks_list",
                 "mailbox_messages_list",
+                "home_gpu_jobs_list",
                 "experiments_list",
                 "experiment_logs",
                 "activity_list",

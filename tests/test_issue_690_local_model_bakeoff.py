@@ -187,6 +187,30 @@ class BakeoffTests(unittest.TestCase):
         self.assertNotEqual(first["run_id"], second["run_id"])
         self.assertEqual(len(list_bakeoffs(10, db_path=self.db)), 2)
 
+    def test_remote_bakeoff_resumes_and_separates_fallback_rows(self):
+        from unittest.mock import patch
+
+        def queued(experiment, **kwargs):
+            self.assertEqual(kwargs["via"], "home-gpu")
+            return {"units": [], "pending_units": 1}
+
+        def scored(experiment, **kwargs):
+            self.assertEqual(kwargs["home_kind"], "bakeoff_prompt")
+            host = "vm" if experiment == "e9" else "home-gpu"
+            return {"units": [{"status": "scored", "host": host, "tests_passed": True,
+                                "model": "vm-local" if host == "vm" else "ornith",
+                                "seconds": 2, "generation_tokens_per_second": 15}]}
+
+        with patch.dict(os.environ, {"NEXUS_HOME_GPU": "1"}):
+            first = self.execute(candidates=["ornith"], via="home-gpu", replay_fn=queued)
+            second = self.execute(candidates=["ornith"], via="home-gpu", replay_fn=scored)
+        self.assertEqual(first["run_id"], second["run_id"])
+        self.assertEqual(first["rows"][0]["status"], "queued")
+        self.assertFalse(self.calls)
+        rows = {row["host"]: row for row in list_bakeoffs(db_path=self.db)}
+        self.assertEqual(rows["home-gpu"]["passing_hunks"], 9)
+        self.assertEqual(rows["vm"]["passing_hunks"], 1)
+        self.assertEqual(rows["vm"]["model"], "vm-local")
 
 if __name__ == "__main__":
     unittest.main()

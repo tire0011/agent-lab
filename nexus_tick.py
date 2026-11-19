@@ -455,6 +455,13 @@ def _shadow_replay(repo_root: str, db_path: str) -> None:
     from modules import local_shadow_replay
 
     try:
+        from modules.home_gpu.fallback import advance_one
+
+        if advance_one(repo_root, db_path):
+            return
+    except Exception as exc:  # noqa: BLE001 - the home GPU lane never blocks the VM replay
+        logger.warning("home GPU lane step failed: %s", type(exc).__name__)
+    try:
         outcome = local_shadow_replay.replay_next(repo_root=repo_root, db_path=db_path)
     except Exception as exc:  # noqa: BLE001 - the replay never owns the tick
         logger.warning("local shadow replay failed: %s", exc)
