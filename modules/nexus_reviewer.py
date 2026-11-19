@@ -181,15 +181,27 @@ class NexusReviewer:
             return None
         return (str(row[0]), str(row[1])) if row and row[0] in REVIEWERS else None
 
+    def latest_blocking_review(self, experiment_id: str) -> tuple[str, str] | None:
+        """Return the persisted findings before the adoption reason's clipping."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT reviewer, summary FROM nexus_pr_reviews "
+                "WHERE experiment_id = ? AND verdict = ? ORDER BY id DESC LIMIT 1",
+                (experiment_id, VERDICT_BLOCK),
+            ).fetchone()
+        return (str(row[0]), str(row[1])) if row else None
+
     def review(
         self, *, experiment_id: str, goal: str, worktree_path: str, base_sha: str,
         gate_findings: str = "", model_written_tests: str = "",
+        earlier_review: tuple[str, str] | None = None,
     ) -> ReviewResult:
-        diff = _diff(worktree_path, base_sha)
+        diff = (_diff(worktree_path, base_sha, exact_base=True) if earlier_review
+                else _diff(worktree_path, base_sha))
         result = None
-        order = self._order()
-        earlier = self._earlier_block(experiment_id)
-        if earlier is not None:
+        earlier = earlier_review or self._earlier_block(experiment_id)
+        order = [earlier_review[0]] if earlier_review else self._order()
+        if earlier is not None and earlier_review is None:
             # A retry goes back to the reviewer that blocked it: a new reviewer
             # each time found new edge cases until the attempts ran out.
             order = [earlier[0], *[name for name in order if name != earlier[0]]]
@@ -215,7 +227,11 @@ class NexusReviewer:
             result = ReviewResult(name, *parsed)
             break
         if result is None:
-            result = ReviewResult("none", "unreviewed", "No reviewer could run; merged on tests and the quality gate.")
+            summary = (
+                "The blocking reviewer did not provide a follow-up verdict."
+                if earlier_review else "No reviewer could run; merged on tests and the quality gate."
+            )
+            result = ReviewResult("none", "unreviewed", summary)
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO nexus_pr_reviews (experiment_id, reviewer, verdict, summary, created_at) "
@@ -233,11 +249,14 @@ def default_reviewer(db_path: str = DEFAULT_DB_PATH) -> NexusReviewer | None:
     return NexusReviewer(db_path=db_path)
 
 
-def _diff(worktree_path: str, base_sha: str) -> str:
+def _diff(worktree_path: str, base_sha: str, *, exact_base: bool = False) -> str:
+    if exact_base:
+        args = ["diff", "--no-ext-diff", "--no-textconv", base_sha, "HEAD"]
+    else:
+        args = ["diff", f"{base_sha}...HEAD"] if base_sha else ["show", "HEAD"]
     proc = subprocess.run(
-        ["git", "-C", worktree_path, "diff", f"{base_sha}...HEAD"] if base_sha
-        else ["git", "-C", worktree_path, "show", "HEAD"],
-        capture_output=True, text=True, timeout=60, check=False,
+        ["git", "-C", worktree_path, *args],
+        capture_output=True, text=True, timeout=60, check=exact_base,
     )
     return proc.stdout
 

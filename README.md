@@ -39,6 +39,22 @@ failed attempts per issue. A provider overload or a crash of Nexus's own
 pipeline does not use up an attempt, and a retry after a blocking review runs
 at once and outside the budget.
 
+On a review-block retry, Nexus first tries up to three local patch rounds on
+the blocked branch. It runs the experiment tests and timing check, and each
+numbered finding must name a file with a changed hunk. Passing candidates go
+back to the same reviewer and still need exact-commit CI before merge.
+Failed candidates go to the existing paid retry with the local diff and
+failure output. Set `NEXUS_LOCAL_REVIEW_FIX=off` to disable the local attempt
+or `NEXUS_LOCAL_REVIEW_FIX_ROUNDS` to change the round limit within the local
+time budget.
+
+For the first 10 review-block retries after rollout, count
+`paid_coder_avoided` in the `local_review_fix` experiment log events. The target
+is at least 3 of 10. Among events with `review_requested`, report the share
+with `reviewer_accepted`. Use `experiments_list` to compare the share of
+retries that ultimately merge with the 10 review-block retries before
+rollout.
+
 ## Working with Nexus
 
 - **Give work:** open a GitHub issue with a concrete Problem / Change / Test.

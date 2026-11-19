@@ -1650,7 +1650,8 @@ class LocalCodingWorker:
                  split_tasks: bool = False, planner: Callable[[str], Any] | None = None,
                  test_first: bool = False, rates_path: str | Path | None = None,
                  samples: int = 1, sample_temperatures: tuple[float, ...] | None = None,
-                 sample_tmp_root: str | None = None,
+                 sample_tmp_root: str | None = None, patch_rounds: int = MAX_PATCH_ROUNDS,
+                 likely_files: tuple[str, ...] = (),
                  **_: Any) -> None:
         self.client = client or LlamaCppClient()
         self.max_tokens = max_tokens
@@ -1675,6 +1676,8 @@ class LocalCodingWorker:
         self.sample_temperatures = tuple(sample_temperatures or DEFAULT_SAMPLE_TEMPERATURES)
         # Where candidates' throwaway copies go (default: the system temp dir).
         self.sample_tmp_root = sample_tmp_root
+        self.patch_rounds = max(1, patch_rounds)
+        self._provided_likely_files = likely_files
         # #685: the last prompt sent on the client's slot and this run's reuse totals.
         self._last_sent: SentPrompt | None = None
         self._last_prefix_reuse = 0
@@ -1688,6 +1691,7 @@ class LocalCodingWorker:
         self.sr_grammar = False
         # #720: the ``Likely files:`` line of this run, for the paid handover.
         self.likely_files: tuple[str, ...] = ()
+        self.last_attempted_patch = ""
         self.likely_files_hint = ""
         # #735: this run's ``Repo facts:`` block, for the paid handover.
         self.repo_facts_block = ""
@@ -1706,8 +1710,9 @@ class LocalCodingWorker:
         self.last_run_metrics = None
         self.lenient_creates = 0
         self.sr_grammar = False
-        self.likely_files = ()
+        self.likely_files = self._provided_likely_files
         self.likely_files_hint = ""
+        self.last_attempted_patch = ""
         self.repo_facts_block = ""
         self.repo_facts_checked = False
         # #685: another process may use the slot between runs; start cold.
@@ -1896,7 +1901,7 @@ class LocalCodingWorker:
         """
         from modules import local_file_localizer as lfl
 
-        if not lfl.enabled():
+        if self._provided_likely_files or not lfl.enabled():
             return task, 0.0
         event = "local_localization"
         existing = lfl.parse_likely_files(task)
@@ -2160,7 +2165,7 @@ class LocalCodingWorker:
                       experiment_logger: Any | None, phase: str, *,
                       allowed_paths: set[str] | None = None, tests: tuple[str, ...] = (),
                       subtask: int | None = None) -> tuple[bool, str, str]:
-        """``(applied, model output, failure reason)`` after at most ``MAX_PATCH_ROUNDS``."""
+        """``(applied, model output, failure reason)`` within the configured round limit."""
         stats = SampleStats(samples_setting=self.samples)
         self.last_sample_stats.append(stats)
         try:
@@ -2187,7 +2192,7 @@ class LocalCodingWorker:
             grammar = None
         if grammar is not None:
             self.sr_grammar = True
-        for round_no in range(1, MAX_PATCH_ROUNDS + 1):
+        for round_no in range(1, self.patch_rounds + 1):
             stats.rounds = round_no
             prompt, extra = plan.prompt, {"prompt_tokens": plan.prompt_tokens, **tag}
             if round_no > 1:
@@ -2232,6 +2237,8 @@ class LocalCodingWorker:
                 except EditFormatError as exc:
                     patch = ""
                     format_error = f"local model SEARCH/REPLACE edits were rejected: {exc}"
+                if patch:
+                    self.last_attempted_patch = patch
                 checked = time.monotonic()
                 if format_error:
                     outcome = "no_diff" if "did not return any SEARCH/REPLACE" in format_error else "edit_format"
@@ -2292,7 +2299,7 @@ class LocalCodingWorker:
             self.local_attempt_passed_generated_tests = None
             generated_test_failure = run_named_tests(working_dir, self.generated_tests, timeout)
             self.local_attempt_passed_generated_tests = generated_test_failure is None
-        return False, "", f"local model patch failed after {MAX_PATCH_ROUNDS} rounds; last reason: {reason}"
+        return False, "", f"local model patch failed after {self.patch_rounds} rounds; last reason: {reason}"
 
     async def _feedback_prompt(self, plan: PromptPlan, round_no: int, error: str,
                                previous_diff: str) -> tuple[FeedbackPrompt, int]:
@@ -2581,7 +2588,7 @@ class LocalCodingWorker:
                    reason: str, **fields: Any) -> None:
         self._log(
             experiment_logger, phase, "local_patch_round",
-            f"Local patch round {round_no}/{MAX_PATCH_ROUNDS}: {outcome}" + (f" ({reason[:300]})" if reason else ""),
+            f"Local patch round {round_no}/{self.patch_rounds}: {outcome}" + (f" ({reason[:300]})" if reason else ""),
             warning=outcome != "applied", round=round_no, outcome=outcome, reason=reason, **fields,
         )
 

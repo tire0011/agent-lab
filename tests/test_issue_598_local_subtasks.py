@@ -595,14 +595,14 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertEqual([tuple(generated), tuple(generated)], seen)
 
     def test_exhaustion_runner_crash_does_not_reuse_stale_pass_state(self):
-        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True)
+        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True,
+                                   patch_rounds=1)
         worker.generated_tests = ("tests.test_generated.T.test_value",)
         worker.local_attempt_passed_generated_tests = True
         plan = mock.Mock(prompt="prompt", prompt_tokens=1)
 
-        with mock.patch.object(local_coding_worker, "MAX_PATCH_ROUNDS", 1), \
-                mock.patch.object(local_coding_worker, "run_named_tests",
-                                  side_effect=RuntimeError("runner crashed")):
+        with mock.patch.object(local_coding_worker, "run_named_tests",
+                               side_effect=RuntimeError("runner crashed")):
             with self.assertRaisesRegex(RuntimeError, "runner crashed"):
                 worker._patch_rounds(plan, str(self.repo), 10, None, "implementation",
                                      tests=worker.generated_tests)
@@ -610,14 +610,14 @@ class Issue598SubtaskTests(unittest.TestCase):
         self.assertIsNone(worker.local_attempt_passed_generated_tests)
 
     def test_exhaustion_runner_interrupt_propagates_without_stale_pass_state(self):
-        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True)
+        worker = LocalCodingWorker(client=_Server(_TWO_STEPS, ["no diff"]), test_first=True,
+                                   patch_rounds=1)
         worker.generated_tests = ("tests.test_generated.T.test_value",)
         worker.local_attempt_passed_generated_tests = True
         plan = mock.Mock(prompt="prompt", prompt_tokens=1)
 
-        with mock.patch.object(local_coding_worker, "MAX_PATCH_ROUNDS", 1), \
-                mock.patch.object(local_coding_worker, "run_named_tests",
-                                  side_effect=KeyboardInterrupt):
+        with mock.patch.object(local_coding_worker, "run_named_tests",
+                               side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
                 worker._patch_rounds(plan, str(self.repo), 10, None, "implementation",
                                      tests=worker.generated_tests)

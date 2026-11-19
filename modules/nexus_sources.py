@@ -46,6 +46,7 @@ def issue_source(
     body: str,
     state: str | None = None,
     url: str | None = None,
+    retry_handover: str = "",
 ) -> NexusSource:
     """Wrap issue data supplied by a GitHub/MCP adapter for Nexus.
 
@@ -56,7 +57,7 @@ def issue_source(
     if issue_number <= 0:
         raise NexusSourceError("issue number must be positive")
     clean_title = (title or f"Issue #{issue_number}").strip()[:500]
-    clean_body = (body or "").strip()[:16000]
+    clean_body = (body or "").strip()[:16000] + retry_handover
     return NexusSource(
         source_type="issue",
         source_id=str(issue_number),
