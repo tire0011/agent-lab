@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -242,6 +243,7 @@ def run_bakeoff(
     lease_wait_seconds: float = 60.0,
     sleep_fn: Callable[[float], None] = time.sleep,
     monotonic_fn: Callable[[], float] = time.monotonic,
+    via: str = "vm",
 ) -> dict[str, Any]:
     if not candidates:
         raise ValueError("at least one candidate is required")
@@ -250,6 +252,11 @@ def run_bakeoff(
             or any(not isinstance(item, dict) or not isinstance(item.get("experiment_id"), str)
                    or not item["experiment_id"].strip() for item in fixture)):
         raise ValueError("bakeoff fixture must contain exactly 10 fixed experiment_id entries")
+    if via == "home-gpu":
+        return run_home_bakeoff(candidates, fixture, repo_root=repo_root, db_path=db_path,
+                                seed=seed, replay_fn=replay_fn)
+    if via != "vm":
+        raise ValueError("unknown bake-off host")
     original = current_model(run_command)
     run_id = uuid.uuid4().hex
     ephemeral_rates = rates_path is None
@@ -337,6 +344,70 @@ def run_bakeoff(
                         pass
 
 
+def run_home_bakeoff(candidates, fixture, *, repo_root, db_path, seed, replay_fn):
+    from modules.home_gpu.jobs import enabled
+
+    if not enabled():
+        raise ValueError("home-gpu bake-off requires NEXUS_HOME_GPU=1")
+    if len(candidates) != 1:
+        raise ValueError("home-gpu uses the single model already loaded on the PC")
+    model = candidates[0]
+    key = json.dumps([model, fixture, seed], sort_keys=True)
+    run_id = "home-gpu-" + hashlib.sha256(key.encode()).hexdigest()[:24]
+    outcomes = []
+    pending = 0
+    for index, item in enumerate(fixture):
+        try:
+            summary = replay_fn(
+                fixture_experiment_id(item, db_path), repo_root=repo_root, db_path=db_path,
+                variant=f"{run_id}-{index:02d}", max_units=1, via="home-gpu", seed=seed,
+                home_model=model, home_kind="bakeoff_prompt",
+            )
+        except (ValueError, sqlite3.Error) as exc:
+            outcomes.append({"status": "fixture_error", "error": str(exc)})
+            continue
+        units = _units(summary)
+        if units:
+            outcomes.append(units[0])
+        elif summary is None or summary.get("pending_units"):
+            pending += 1
+        else:
+            outcomes.append({"status": summary["status"], "error": summary.get("error")})
+    home = [unit for unit in outcomes if unit.get("host") == "home-gpu"]
+    fallback = [unit for unit in outcomes if unit.get("host") == "vm"]
+    results = []
+    for host, measured in (("home-gpu", home), ("vm", fallback)):
+        if host == "vm" and not measured:
+            continue
+        seconds = sum(unit.get("seconds") or 0 for unit in measured)
+        generated = sum((unit.get("generation_tokens_per_second") or 0)
+                        * (unit.get("seconds") or 0) for unit in measured)
+        actual_model = model if host == "home-gpu" else (measured[0].get("model") or "vm")
+        row = {
+            "run_id": run_id, "created_at": datetime.now(timezone.utc).isoformat(),
+            "host": host, "model": actual_model, "status": "queued" if pending else (
+                "completed" if measured else "error"
+            ),
+            "is_current": 0, "winner": 0, "recommend_switch": 0,
+            "hunks_total": len(measured),
+            "hunks_applied": sum(bool(unit.get("applied")) for unit in measured),
+            "hunks_compiled": sum(bool(unit.get("compiled")) for unit in measured),
+            "passing_hunks": sum(bool(unit.get("tests_passed")) for unit in measured),
+            "local_too_slow": sum(unit.get("status") == "local_too_slow" for unit in measured),
+            "seconds": seconds, "output_tokens_per_second": generated / seconds if seconds else None,
+            "details_json": json.dumps({"hunks": measured, "seed": seed, "pending": pending,
+                                        "fixture_errors": [u for u in outcomes if "host" not in u]}),
+            "error": None if measured or pending else "no home GPU fixture was scored",
+        }
+        row["passing_hunks_per_hour"] = passing_hunks_per_hour(row)
+        results.append(row)
+    with contextlib.closing(init_db(db_path)) as conn:
+        for row in results:
+            insert_bakeoff_row(conn, row, resume=True)
+    return {"run_id": run_id, "original_model": model, "rows": results,
+            "winner": None, "recommend_switch": False}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("candidates", nargs="+", help="downloaded GGUF filenames, in scoring order")
@@ -344,12 +415,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repo-root", default=str(ROOT))
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--url", default="http://127.0.0.1:8080")
+    parser.add_argument("--via", choices=("vm", "home-gpu"), default="vm")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--timeout", type=float, default=600.0)
     args = parser.parse_args(argv)
     report = run_bakeoff(args.candidates, repo_root=args.repo_root, db_path=args.db_path,
                          fixture_path=args.fixture, url=args.url, seed=args.seed,
-                         timeout=args.timeout)
+                         timeout=args.timeout, via=args.via)
     print(json.dumps(report, indent=2))
     return 0
 

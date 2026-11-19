@@ -549,5 +549,48 @@ class ReadSideTests(unittest.TestCase):
         self.assertIn("tests passed 1/2 (50%)", text)
 
 
+class HomeGpuScoringTests(unittest.TestCase):
+    def test_mailbox_answer_is_scored_using_the_vm_hunk_checker(self):
+        from modules.home_gpu.collect import collect, get_job
+        from modules.home_gpu.fallback import advance_one
+        from modules.home_gpu.jobs import list_jobs
+        from modules.mailbox.config import MailboxConfig
+
+        fx = HunkFixture(self)
+        config = MailboxConfig.from_paths(Path(fx.repo), fx.root / "mailbox")
+        _git(fx.repo, "remote", "add", "origin", "https://github.com/tire0011/agent-lab.git")
+        _git(fx.repo, "update-ref", "refs/remotes/origin/main", fx.merged)
+        with patch.dict(os.environ, {
+            "NEXUS_HOME_GPU": "1",
+            "AGENT_MAILBOX_REPO_PATH": str(config.mailbox_repo_path),
+            "AGENT_MAILBOX_LOCK_PATH": str(fx.root / "mailbox.lock"),
+        }):
+            queued = lsh.replay_hunks(
+                "exp-1", repo_root=fx.repo, db_path=fx.db_path, via="home-gpu",
+                max_units=1, client=FakeClient(),
+            )
+            self.assertEqual(queued["pending_units"], 1)
+            self.assertEqual(queued["units"], [])
+            [job] = list_jobs(db_path=fx.db_path)
+            payload = get_job(job["job_id"], db_path=fx.db_path)["payload"]
+            self.assertNotIn("A long issue body", payload)
+            self.assertNotIn("assert shapes.area", payload)
+            self.assertNotIn("return math.pi * r * r", payload)
+            _write(config.mailbox_repo_path, f"outbox/{job['job_id']}.reply.md",
+                   f"---\nin_reply_to: {job['job_id']}\ninput_sha256: {get_job(job['job_id'], db_path=fx.db_path)['input_sha256']}\n"
+                   "model: ornith\nprompt_tokens: 88\ncompletion_tokens: 30\nseconds: 2\n---\n"
+                   f"{SHAPES}\n<<<<<<< SEARCH\ndef area(r):\n    return 0\n=======\n"
+                   "def area(r):\n    return math.pi * r * r\n>>>>>>> REPLACE\n")
+            collect(config, fx.db_path)
+            self.assertTrue(advance_one(fx.repo, fx.db_path))
+            self.assertFalse(advance_one(fx.repo, fx.db_path))
+            with lsr._connect(fx.db_path) as conn:
+                [unit] = lsh.stored_units(conn, "exp-1", queued["prompt_variant"])
+            self.assertEqual(unit["host"], "home-gpu")
+            self.assertEqual(unit["model"], "ornith")
+            self.assertEqual(unit["generation_tokens_per_second"], 15)
+            self.assertTrue(unit["compiled"])
+            self.assertTrue(unit["tests_passed"])
+
 if __name__ == "__main__":
     unittest.main()

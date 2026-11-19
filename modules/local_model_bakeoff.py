@@ -38,15 +38,28 @@ def choose_winner(rows: list[dict[str, Any]], current_model: str) -> dict[str, A
     return {"winner": winner, "recommend_switch": recommend, "current": current}
 
 
-def insert_bakeoff_row(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
+def insert_bakeoff_row(conn: sqlite3.Connection, row: dict[str, Any], *, resume: bool = False) -> int:
     columns = (
         "run_id", "created_at", "model", "is_current", "status",
         "prompt_tokens_per_second", "output_tokens_per_second", "hunks_total",
         "hunks_applied", "hunks_compiled", "passing_hunks", "local_too_slow",
         "seconds", "passing_hunks_per_hour", "winner", "recommend_switch",
-        "details_json", "error",
+        "details_json", "error", "host",
     )
-    values = [row.get(c) for c in columns]
+    values = [row.get(c, "vm" if c == "host" else None) for c in columns]
+    if resume:
+        conn.execute("BEGIN IMMEDIATE")
+        old = conn.execute(
+            "SELECT id FROM local_model_bakeoffs WHERE run_id=? AND model=? AND host=?",
+            (row["run_id"], row["model"], row["host"]),
+        ).fetchone()
+        if old is not None:
+            conn.execute(
+                f"UPDATE local_model_bakeoffs SET {','.join(f'{c}=?' for c in columns)} WHERE id=?",
+                (*values, old[0]),
+            )
+            conn.commit()
+            return int(old[0])
     cur = conn.execute(
         f"INSERT INTO local_model_bakeoffs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
         values,

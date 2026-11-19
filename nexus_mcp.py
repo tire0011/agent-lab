@@ -464,6 +464,14 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="Home GPU batch job status and timing (#743)", structured_output=True)
+    def home_gpu_jobs_list(limit: int = 50) -> dict[str, Any]:
+        from modules.home_gpu.jobs import list_jobs
+
+        limit = _validate_limit(limit, minimum=1, maximum=500)
+        rows = list_jobs(limit, db_path=_api()._resolve_experiment_service().db_path)
+        return {"count": len(rows), "jobs": rows}
+
     @mcp.tool(description="Stored local GGUF model bake-off rows (#690)", structured_output=True)
     def local_model_bakeoffs_list(limit: int = 50) -> dict[str, Any]:
         from modules.local_model_bakeoff import list_bakeoffs

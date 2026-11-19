@@ -433,6 +433,12 @@ def run_mailbox_poll_once(
             except ValueError:
                 outbox_prefix = ""
             ignored_untracked = (outbox_prefix,) if outbox_prefix else ()
+            from modules.home_gpu import collect as home_gpu_collect, jobs as home_gpu_jobs
+
+            published = (
+                home_gpu_collect.publish_pending(mailbox_config, db_path, mailbox_module)
+                if home_gpu_jobs.enabled() else set()
+            )
             if not _worktree_safe_for_mailbox_sync(
                 mailbox_module,
                 mailbox_config.mailbox_repo_path,
@@ -446,6 +452,8 @@ def run_mailbox_poll_once(
             ):
                 result = MailboxPollRunResult(status="sync_failed")
             else:
+                if home_gpu_jobs.enabled():
+                    home_gpu_collect.collect(mailbox_config, db_path, published=published)
                 outcome = _drain_inbox(
                     processor=processor,
                     mailbox_module=mailbox_module,

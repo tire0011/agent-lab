@@ -208,3 +208,16 @@ def list_mailbox_messages(
         inbox=inbox,
         outbox=outbox,
     )
+
+
+@router.get("/home-gpu/jobs")
+def home_gpu_jobs_list(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=50, ge=1, le=500),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> dict:
+    from modules.home_gpu.jobs import list_jobs
+
+    api.authorize(x_api_key)
+    rows = list_jobs(limit, db_path=service.db_path)
+    return {"count": len(rows), "jobs": rows}

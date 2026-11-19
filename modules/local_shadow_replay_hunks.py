@@ -824,6 +824,11 @@ def replay_hunks(
     test_runner: Callable[[str, list[str], float], lsr.MergedTestRun] | None = None,
     max_units: int | None = None,
     _global_lease: lsr.GlobalLease | None = None,
+    via: str = "vm",
+    seed: int = 42,
+    home_model: str | None = None,
+    home_kind: str = "hunk_replay",
+    resume_only: bool = False,
 ) -> dict[str, Any] | None:
     """Score the merged units of one experiment; at most *max_units* new ones.
 
@@ -832,7 +837,14 @@ def replay_hunks(
     for an experiment that is unknown, not merged or not paid. Every later
     failure is stored (as the run's or the unit's error).
     """
+    from modules.home_gpu.jobs import enabled as home_gpu_enabled
+    from modules.home_gpu.replay import ReplyWorker, ready, replay_job
+
+    if via not in {"vm", "home-gpu"} or (via == "home-gpu" and not home_gpu_enabled()):
+        raise ValueError("home-gpu replay requires NEXUS_HOME_GPU=1")
     variant = variant or lsr.prompt_variant()
+    if via == "home-gpu" and not variant.startswith("home-gpu-"):
+        variant = "home-gpu-" + variant
     conn = lsr._connect(db_path)
     owned_lease = _global_lease is None
     lease = _global_lease or lsr._acquire_global_lease(conn, lsr.lease_seconds())
@@ -840,6 +852,7 @@ def replay_hunks(
         conn.close()
         return None
     ran = 0
+    pending = 0
     try:
         lsr.cleanup_orphaned_worktree(repo_root, lease.orphaned_worktree)
         row, adoption = lsr._load(conn, experiment_id)
@@ -865,11 +878,56 @@ def replay_hunks(
             factory = worker_factory or hunk_worker_factory
             baseline: dict[str, lsr.MergedTestRun] = {}
             worktree: str | None = None
+            selected = 0
             try:
                 for unit in units:
-                    if max_units is not None and ran >= max_units:
+                    if max_units is not None and (selected if via == "home-gpu" and not resume_only else ran) >= max_units:
                         break
-                    if not _claim_unit(conn, experiment_id, variant, unit, model):
+                    key = (experiment_id, unit.file, unit.symbol, variant)
+                    prior = conn.execute(
+                        f"SELECT status FROM local_replay_units WHERE {_UNIT_KEY}", key,
+                    ).fetchone()
+                    if prior is not None and prior["status"] != UNIT_RUNNING:
+                        continue
+                    selected += 1
+                    job = None
+                    unit_factory = factory
+                    unit_model = model
+                    host = "vm"
+                    submission_error = None
+                    if via == "home-gpu":
+                        try:
+                            job = replay_job(repo_root, db_path, experiment_id, variant, unit,
+                                             old, new, seed=seed, model=home_model, kind=home_kind,
+                                             resume_only=resume_only)
+                        except (ValueError, UnicodeError) as exc:
+                            submission_error = str(exc)
+                        if not submission_error and (not job or not ready(job)):
+                            pending += 1
+                            continue
+                        if job and job["status"] == "answered":
+                            unit_model = job["model"]
+                            host = "home-gpu"
+                            unit_factory = lambda _, reply=job, path=unit.file: ReplyWorker(reply, path)
+                        elif job and job["status"] == "fallback":
+                            idle, _ = lsr.server_state(client, db_path)
+                            if not idle:
+                                pending += 1
+                                continue
+                        else:
+                            unit_model = home_model or ""
+                            host = "home-gpu"
+                    if not _claim_unit(conn, experiment_id, variant, unit, unit_model):
+                        if job:
+                            conn.execute("UPDATE home_gpu_jobs SET checked_at=? WHERE job_id=?",
+                                         (time.time(), job["job_id"]))
+                        continue
+                    conn.execute(f"UPDATE local_replay_units SET host=? WHERE {_UNIT_KEY}", (host, *key))
+                    if submission_error or (job and job["status"] == "expired"):
+                        _store_unit(conn, experiment_id, variant, unit, UnitOutcome(
+                            error=submission_error or job["error"],
+                        ))
+                        ran += 1
                         continue
                     if worktree is None:
                         worktree = lsr._create_worktree(repo_root, new, db_path=db_path,
@@ -882,26 +940,42 @@ def replay_hunks(
                     try:
                         outcome = _score_unit(
                             repo_root, worktree, unit, old=old, new=new, title=title, summary=summary,
-                            client=client, worker_factory=factory, tests=tests, test_runner=runner,
+                            client=client, worker_factory=unit_factory, tests=tests, test_runner=runner,
                             baseline=baseline,
                         )
                     except Exception as exc:  # one bad unit must not stop the others
                         logger.warning("hunk replay %s %s:%s failed: %s",
                                        experiment_id, unit.file, unit.symbol, exc)
                         outcome = UnitOutcome(status=UNIT_ERROR, error=f"{type(exc).__name__}: {exc}")
-                    _store_unit(conn, experiment_id, variant, unit, outcome)
+                    if job and job["status"] == "answered":
+                        outcome.seconds = job["seconds"]
+                        outcome.prompt_tokens = job["prompt_tokens"]
+                        outcome.generation_tokens_per_second = job["tokens_per_second"]
+                        outcome.rounds = 1
+                    conn.execute("BEGIN IMMEDIATE")
+                    try:
+                        _store_unit(conn, experiment_id, variant, unit, outcome)
+                        if job:
+                            conn.execute("UPDATE home_gpu_jobs SET checked_at=? WHERE job_id=?",
+                                         (time.time(), job["job_id"]))
+                        conn.execute("COMMIT")
+                    except BaseException:
+                        conn.execute("ROLLBACK")
+                        raise
             finally:
                 if worktree is not None:
                     lsr.remove_worktree(repo_root, worktree)
                     lsr._set_lease_worktree(db_path, lease.token, None)
             stored = {(u["file"], u["symbol"]): u["status"] for u in stored_units(conn, experiment_id, variant)}
-            if all(stored.get((u.file, u.symbol)) not in (None, UNIT_RUNNING) for u in units):
+            if ((home_kind == "bakeoff_prompt" and any(status != UNIT_RUNNING for status in stored.values()))
+                    or all(stored.get((u.file, u.symbol)) not in (None, UNIT_RUNNING) for u in units)):
                 _finish_run(conn, experiment_id, variant, RUN_DONE, units=len(units), merged_commit=new)
         except Exception as exc:  # stored, so a broken case is not retried every tick
             message = str(exc) if isinstance(exc, lsr.ReplayError) else f"{type(exc).__name__}: {exc}"
             logger.warning("hunk replay of %s failed: %s", experiment_id, message)
             _finish_run(conn, experiment_id, variant, RUN_ERROR, error=message, merged_commit=new)
-        return _summary(conn, experiment_id, variant, ran)
+        return {**_summary(conn, experiment_id, variant, ran),
+                **({"pending_units": pending} if via == "home-gpu" and pending else {})}
     finally:
         if owned_lease:
             lsr._release_global_lease(conn, lease.token)
@@ -1004,3 +1078,26 @@ def unit_variant_summary(*, db_path: str = DEFAULT_DB_PATH) -> list[dict[str, An
             "experiment_errors": runs.get((row["prompt_variant"], RUN_ERROR), 0),
         })
     return out
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="Score one merged experiment by hunk")
+    parser.add_argument("experiment_id")
+    parser.add_argument("--repo-root", default=str(Path.cwd()))
+    parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    parser.add_argument("--variant")
+    parser.add_argument("--via", choices=("vm", "home-gpu"), default="vm")
+    parser.add_argument("--max-units", type=int)
+    args = parser.parse_args(argv)
+    print(json.dumps(replay_hunks(
+        args.experiment_id, repo_root=args.repo_root, db_path=args.db_path,
+        via=args.via, variant=args.variant, max_units=args.max_units,
+    ), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
