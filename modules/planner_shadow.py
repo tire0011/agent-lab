@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import statistics
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -18,7 +19,8 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             local_valid INTEGER NOT NULL CHECK (local_valid IN (0, 1)),
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
-            error TEXT
+            error TEXT,
+            created_at TEXT
         )
         """
     )
@@ -26,12 +28,16 @@ def ensure_table(conn: sqlite3.Connection) -> None:
 
 def record(db_path: str, **values: Any) -> None:
     with sqlite3.connect(db_path, timeout=30) as conn:
+        conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
+        if "created_at" not in {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}:
+            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
+        values.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         conn.execute(
             """INSERT INTO planner_shadow
-               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error)
+               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, created_at)
                VALUES (:tick_id, :paid_issue, :local_issue, :local_valid,
-                       :prompt_tokens, :seconds, :error)""",
+                       :prompt_tokens, :seconds, :error, :created_at)""",
             values,
         )
 

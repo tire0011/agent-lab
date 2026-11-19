@@ -182,11 +182,13 @@ def _setting(db_path: str, key: str) -> str | None:
 def enabled(db_path: str = DEFAULT_DB_PATH) -> bool:
     """On unless ``NEXUS_SHADOW_REPLAY=0``, the mailbox setting
     ``shadow_replay_enabled`` = 0, or Nexus is paused."""
+    return enabled_for_settings(lambda key: _setting(db_path, key))
+
+
+def enabled_for_settings(setting: Callable[[str], str | None]) -> bool:
     if os.environ.get(ENV_ENABLED, "1").strip().lower() in {"0", "false", "no", "off"}:
         return False
-    if _setting(db_path, SETTING_ENABLED) == "0":
-        return False
-    return _setting(db_path, "nexus.paused") != "1"
+    return setting(SETTING_ENABLED) != "0" and setting("nexus.paused") != "1"
 
 
 # ---- time and claims ---------------------------------------------------------

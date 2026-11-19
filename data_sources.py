@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from models import Idea, Problem
+from modules.measurement_health import health_summary, read_health
 from modules.run_store import DEFAULT_DB_PATH
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -142,6 +143,21 @@ def list_problems(
         else EXPERIMENT_DB_PATH
     )
     problems: list[Problem] = _experiment_problems(db_path)
+    now = datetime.now(timezone.utc)
+    for name, result in read_health(db_path, now).items():
+        status = result["status"]
+        if status == "ok":
+            continue
+        summary = health_summary(name, result)
+        row_ids = result.get("row_ids", [])
+        detail = f"{summary} (row IDs: {', '.join(map(str, row_ids))})" if row_ids else summary
+        problems.append(Problem(
+            id=name,
+            source=f"measurement_{status}",
+            summary=summary,
+            detail=detail,
+            timestamp=(result["latest_at"] if status == "stuck" else None) or now.isoformat(),
+        ))
 
     if not RUNS_DIR.exists() or not RUNS_DIR.is_dir():
         run_files: list[Path] = []
