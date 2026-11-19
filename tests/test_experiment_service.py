@@ -833,6 +833,35 @@ class ExperimentServiceTestCase(unittest.TestCase):
         self.assertEqual(result.status, STATUS_FAILED)
         self.assertIn("real failure", result.error)
 
+    def test_claude_weekly_limit_hands_the_attempt_to_codex_and_cools_claude_down(self):
+        """#753: the 2026-11-18 message moves the same attempt to Codex and
+        keeps Claude out of the rotation until the stated reset."""
+        from modules.coding_provider import choose_provider, provider_cooldowns
+
+        self.implementation_worker.provider = "claude"
+        self.implementation_worker.run.side_effect = None
+        self.implementation_worker.run.return_value = _make_result(
+            success=False, sandbox="workspace-write",
+            error="You've hit your weekly limit · resets 12pm (UTC)",
+        )
+        fallback = MagicMock()
+        fallback.run.return_value = _make_result(
+            success=False, sandbox="workspace-write", error="real failure",
+        )
+        with patch.dict(os.environ, {"AGENT_CODING_PROVIDERS": "codex,claude"}), patch(
+            "modules.coding_provider.is_available", return_value=True
+        ), _patch_service("build_worker", return_value=fallback) as build:
+            experiment = self.service.create_experiment(goal="g")
+            result = self.service.run_experiment(experiment.id)
+            cooled = provider_cooldowns(db_path=self.service.db_path)
+            picks = {choose_provider(db_path=self.service.db_path) for _ in range(3)}
+        self.assertEqual(build.call_args.args[0], "codex")
+        fallback.run.assert_called_once()
+        self.assertIn("real failure", result.error)
+        self.assertEqual(set(cooled), {"claude"})
+        self.assertEqual((cooled["claude"].hour, cooled["claude"].minute), (12, 0))
+        self.assertEqual(picks, {"codex"})
+
     def test_other_errors_do_not_fall_back(self):
         self.implementation_worker.provider = "claude"
         self.implementation_worker.run.side_effect = None

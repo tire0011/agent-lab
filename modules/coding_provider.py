@@ -18,7 +18,8 @@ import logging
 import os
 import re
 import shutil
-from datetime import datetime, timezone
+import sqlite3
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from modules.claude_worker import ClaudeWorker
@@ -76,10 +77,20 @@ def is_available(provider: str) -> bool:
     return shutil.which(binary) is not None
 
 
-def allowed_providers() -> list[str]:
+def allowed_providers(*, db_path: str | None = None) -> list[str]:
     """Providers permitted by configuration, in a stable order; an empty or
     entirely unknown allow list falls back to all known providers, so a typo
-    cannot make the system unable to run any task."""
+    cannot make the system unable to run any task. With *db_path*, providers
+    cooling down after a usage limit (#753) are left out - the result may then
+    be empty."""
+    configured = _configured_providers()
+    if db_path is None:
+        return configured
+    cooled = provider_cooldowns(db_path=db_path)
+    return [provider for provider in configured if provider not in cooled]
+
+
+def _configured_providers() -> list[str]:
     raw = os.environ.get(ENV_PROVIDER_ALLOW_LIST, "")
     if not raw.strip():
         return list(EXTERNAL_PROVIDERS)
@@ -106,9 +117,10 @@ def allowed_providers() -> list[str]:
     return allowed
 
 
-def available_providers() -> list[str]:
-    """Allowed providers whose CLI is actually installed here."""
-    return [provider for provider in allowed_providers() if is_available(provider)]
+def available_providers(*, db_path: str | None = None) -> list[str]:
+    """Allowed providers whose CLI is actually installed here (and, with
+    *db_path*, that are not cooling down after a usage limit)."""
+    return [provider for provider in allowed_providers(db_path=db_path) if is_available(provider)]
 
 
 def pinned_provider() -> str | None:
@@ -131,12 +143,17 @@ def choose_provider(
 ) -> str:
     """Select the next provider in a persistent, concurrency-safe rotation. ``rng``
     is an unused compatibility argument; pins bypass the rotation; the allow list
-    and installed-CLI filter apply first."""
+    and installed-CLI filter apply first, then providers cooling down after a
+    usage limit are skipped (#753). If every installed provider is cooling
+    down, the rotation runs over them anyway - the initiative tick does not
+    start paid work then (``providers_cooling_down``)."""
     pinned = pinned_provider()
     if pinned is not None:
         return pinned
 
-    candidates = available_providers()
+    installed = available_providers()
+    cooled = provider_cooldowns(db_path=db_path)
+    candidates = [provider for provider in installed if provider not in cooled] or installed
     if not candidates:
         fallback = allowed_providers()[0]
         logger.warning(
@@ -193,14 +210,203 @@ _OVERLOAD_RE = re.compile(
 
 def is_provider_overload(error: Any) -> bool:
     """The provider was busy or could not log in, not the work wrong
-    ("API Error: 529 Overloaded", "Failed to authenticate")."""
-    return bool(_OVERLOAD_RE.search(str(error or "")))
+    ("API Error: 529 Overloaded", "Failed to authenticate"); a usage limit
+    (:func:`is_provider_limit`) is an overload too."""
+    text = str(error or "")
+    return bool(_OVERLOAD_RE.search(text)) or is_provider_limit(text)
 
 
-def other_provider(provider: str | None) -> str | None:
-    """Another allowed provider with an installed CLI, for when *provider* is overloaded."""
+# A usage limit with a reset time (#753). 2026-11-18: "You've hit your weekly
+# limit · resets 12pm (UTC)" matched nothing above, so 15 runs started on Claude.
+# Codex/OpenAI say "usage limit", "quota exceeded" or "insufficient_quota".
+_LIMIT_RE = re.compile(
+    r"hit your (?:(?:weekly|daily|session|5[ -]?hour|monthly|usage) )?limit"
+    r"|\blimit\b.{0,20}\bresets?\b"
+    r"|usage[ _-]?limit|quota[ _-]?exceeded|exceeded (?:your|the) (?:current )?quota"
+    r"|insufficient[ _-]quota",
+    re.IGNORECASE,
+)
+
+DEFAULT_LIMIT_COOLDOWN = timedelta(hours=1)
+COOLDOWN_SETTING_PREFIX = "provider_cooldown_until."
+
+_RESET_IN_RE = re.compile(
+    r"(?:resets?|try again|retry)\s+in\s+((?:\d+(?:\.\d+)?\s*(?:days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])[\s,]*(?:and\s+)?)+)",
+    re.IGNORECASE,
+)
+_DURATION_PART_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m|seconds?|secs?|s)(?![a-z])", re.IGNORECASE
+)
+_RESET_AT_RE = re.compile(
+    r"(?:resets?|try again|retry)(?:\s+(?:at|after|on))?\s+"
+    r"(?P<hour>\d{1,2})(?::(?P<minute>\d{2}))?\s*(?P<ampm>am|pm)?"
+    r"(?:\s*\(?(?P<tz>utc|gmt|z)\)?)?",
+    re.IGNORECASE,
+)
+_RESET_ISO_RE = re.compile(
+    r"(?:resets?|try again|retry)(?:\s+(?:at|after|on))?\s+"
+    r"(?P<iso>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.IGNORECASE,
+)
+# Claude's older "Claude AI usage limit reached|1762300800": the reset as epoch seconds.
+_RESET_EPOCH_RE = re.compile(r"limit reached\|(\d{10})\b", re.IGNORECASE)
+
+
+def is_provider_limit(error: Any) -> bool:
+    """The provider refused because a usage limit or quota is used up (#753)."""
+    return bool(_LIMIT_RE.search(str(error or "")))
+
+
+def _duration(text: str) -> timedelta:
+    total = timedelta()
+    for amount, unit in _DURATION_PART_RE.findall(text):
+        value = float(amount)
+        unit = unit.lower()
+        if unit.startswith("d"):
+            total += timedelta(days=value)
+        elif unit.startswith("h"):
+            total += timedelta(hours=value)
+        elif unit.startswith("m"):
+            total += timedelta(minutes=value)
+        else:
+            total += timedelta(seconds=value)
+    return total
+
+
+def parse_limit_reset(error: Any, now: datetime | None = None) -> datetime | None:
+    """When a limit message says the limit resets, in UTC; ``None`` if it does not.
+
+    Understands ``resets 12pm (UTC)``, ``resets 9:30am``, ``resets in 3h``,
+    ``try again in 2 hours 5 minutes``, ``try again at 2026-11-18T12:00:00Z``
+    and Claude's ``limit reached|<epoch>``. A clock time without a date is the
+    next such time after *now*; times without a zone are taken as UTC.
+    """
+    text = str(error or "")
+    now = now or datetime.now(timezone.utc)
+    match = _RESET_IN_RE.search(text)
+    if match:
+        delta = _duration(match.group(1))
+        if delta > timedelta():
+            return now + delta
+    match = _RESET_ISO_RE.search(text)
+    if match:
+        try:
+            when = datetime.fromisoformat(match.group("iso").replace("Z", "+00:00").replace(" ", "T"))
+        except ValueError:
+            when = None
+        if when is not None:
+            return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+    match = _RESET_EPOCH_RE.search(text)
+    if match:
+        return datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
+    match = _RESET_AT_RE.search(text)
+    if match and (match.group("ampm") or match.group("minute")):
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute") or 0)
+        ampm = (match.group("ampm") or "").lower()
+        if ampm:
+            if not 1 <= hour <= 12:
+                return None
+            hour = hour % 12 + (12 if ampm == "pm" else 0)
+        if hour > 23 or minute > 59:
+            return None
+        when = now.astimezone(timezone.utc).replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if when <= now:
+            when += timedelta(days=1)
+        return when
+    return None
+
+
+def _settings_conn(db_path: str) -> Any:
+    return init_db(db_path)
+
+
+def note_provider_limit(
+    provider: str | None, error: Any, *, db_path: str = DEFAULT_DB_PATH,
+    now: datetime | None = None,
+) -> datetime | None:
+    """Cool *provider* down until its limit resets (default: one hour).
+
+    Persists ``provider_cooldown_until.<provider>`` in ``service_settings`` and
+    returns the time; ``None`` when *error* is no limit or *provider* is not an
+    external provider. An existing later cooldown is kept.
+    """
+    if not provider or provider not in EXTERNAL_PROVIDERS or not is_provider_limit(error):
+        return None
+    now = now or datetime.now(timezone.utc)
+    until = parse_limit_reset(error, now)
+    if until is None or until <= now:
+        until = now + DEFAULT_LIMIT_COOLDOWN
+    key = COOLDOWN_SETTING_PREFIX + provider
+    conn = _settings_conn(db_path)
+    try:
+        row = conn.execute("SELECT value FROM service_settings WHERE key = ?", (key,)).fetchone()
+        current = _parse_utc(row[0]) if row is not None else None
+        if current is not None and current > until:
+            until = current
+        conn.execute(
+            """
+            INSERT INTO service_settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE
+            SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, until.isoformat(), now.isoformat()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    logger.warning("coding provider %s hit its usage limit; cooling down until %s", provider, until.isoformat())
+    return until
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def provider_cooldowns(
+    *, db_path: str = DEFAULT_DB_PATH, now: datetime | None = None
+) -> dict[str, datetime]:
+    """External providers still cooling down after a limit, with their reset time."""
+    now = now or datetime.now(timezone.utc)
+    if not os.path.exists(db_path):
+        return {}
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(
+                "SELECT key, value FROM service_settings WHERE key LIKE ?",
+                (COOLDOWN_SETTING_PREFIX + "%",),
+            ).fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:  # an unreadable store must not stop provider selection
+        if "no such table" not in str(exc):
+            logger.warning("cannot read provider cooldowns: %s", exc)
+        return {}
+    found: dict[str, datetime] = {}
+    for key, value in rows:
+        provider = str(key)[len(COOLDOWN_SETTING_PREFIX):]
+        until = _parse_utc(value)
+        if provider in EXTERNAL_PROVIDERS and until is not None and until > now:
+            found[provider] = until
+    return found
+
+
+def cooling_down(provider: str, *, db_path: str = DEFAULT_DB_PATH, now: datetime | None = None) -> bool:
+    return provider in provider_cooldowns(db_path=db_path, now=now)
+
+
+def other_provider(provider: str | None, *, db_path: str | None = None) -> str | None:
+    """Another allowed provider with an installed CLI, for when *provider* is
+    overloaded; with *db_path*, providers cooling down after a limit are skipped."""
+    cooled = provider_cooldowns(db_path=db_path) if db_path else {}
     for candidate in allowed_providers():
-        if candidate != provider and is_available(candidate):
+        if candidate != provider and candidate not in cooled and is_available(candidate):
             return candidate
     return None
 
