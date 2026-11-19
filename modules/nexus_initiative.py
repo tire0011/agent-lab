@@ -1819,7 +1819,7 @@ class NexusInitiativeService:
         self._record(decision)
         dispatched_at = _utcnow().isoformat()
         try:
-            self._dispatch(chosen)
+            review_retry_handled = self._dispatch(chosen)
         except Exception as exc:  # noqa: BLE001 - a failed dispatch is data, not a crash
             logger.exception("initiative: dispatch failed for %s %s", chosen.kind, chosen.ref)
             decision.decision = "error"
@@ -1827,7 +1827,8 @@ class NexusInitiativeService:
             self._record(decision, update=True)
             return decision
         # An adoption runs the paid reviewer; it has its own budget rule.
-        if chosen.kind != KIND_INTEGRATION and not self._dispatch_was_paid(dispatched_at):
+        if (chosen.kind != KIND_INTEGRATION and not review_retry_handled
+                and not self._dispatch_was_paid(dispatched_at)):
             self._record(InitiativeDecision(
                 _LOCAL_ONLY, detail=f"dispatch {tick_id} used only the local model", tick_id=f"local-{tick_id}",
             ))
@@ -1956,25 +1957,51 @@ class NexusInitiativeService:
         required = f"\n\n{REVIEW_FIX_REQUIRED}" if review_blocked_last else ""
         return f"\n\n{EARLIER_ATTEMPTS_HEADING}\n" + "\n".join(lines) + required
 
-    def _dispatch(self, candidate: Candidate) -> None:
+    def _try_local_review_retry(self, candidate: Candidate) -> tuple[bool, str]:
+        if candidate.reason != REVIEW_RETRY_REASON or getattr(self.adoption_service, "reviewer", None) is None:
+            return False, ""
+        from modules.local_review_fix import enabled, try_local_review_fix
+
+        if not enabled():
+            return False, ""
+        row = self._conn.execute(
+            """
+            SELECT e.id
+            FROM github_experiment_links l
+            JOIN experiments e ON e.id = l.experiment_id
+            WHERE l.issue_number = ?
+            ORDER BY e.created_at DESC, e.rowid DESC LIMIT 1
+            """,
+            (int(candidate.ref),),
+        ).fetchone()
+        if row is None:
+            return False, ""
+        return try_local_review_fix(self.adoption_service, str(row["id"]))
+
+    def _dispatch(self, candidate: Candidate) -> bool:
+        """Return true when a same-branch review retry handled the dispatch."""
         if candidate.kind == KIND_INTEGRATION:
             if self.adoption_service is None:
                 raise RuntimeError("no adoption service configured")
             self.adoption_service.start_adoption(candidate.ref)
-            return
+            return False
         if self.controller is None:
             raise RuntimeError("no controller configured")
         if candidate.kind == KIND_ISSUE:
             self._announce_plan(candidate)
+            handled, diagnostics = self._try_local_review_retry(candidate)
+            if handled:
+                return True
             self.controller.handle_issue(
                 int(candidate.ref),
                 title=candidate.title,
                 body=str(candidate.payload.get("body") or "") + self._earlier_attempts(int(candidate.ref)),
+                **({"retry_handover": diagnostics} if diagnostics else {}),
             )
-            return
+            return False
         if candidate.kind == KIND_IDEA:
             self.controller.handle_idea(candidate.ref)
-            return
+            return False
         raise RuntimeError(f"unknown candidate kind {candidate.kind!r}")
 
     def _announce_plan(self, candidate: Candidate) -> None:

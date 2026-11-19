@@ -110,6 +110,7 @@ class NexusControllerService:
         body: str,
         state: str | None = None,
         url: str | None = None,
+        retry_handover: str = "",
     ) -> TaskDecision | dict[str, str]:
         return self.handle_source(
             issue_source(
@@ -118,6 +119,7 @@ class NexusControllerService:
                 body=body,
                 state=state,
                 url=url,
+                retry_handover=retry_handover,
             )
         )
 

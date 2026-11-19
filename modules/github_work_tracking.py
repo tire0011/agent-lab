@@ -1369,10 +1369,13 @@ class GitHubWorkTrackingService:
         integrated_commit_sha: str,
         worktree_path: str,
         experiment_id: str,
+        expected_head_sha: str | None = None,
     ) -> str:
         """Append the verified integration tree to the existing checkpoint history."""
         self.require_lifecycle_ready()
         remote_sha = self._remote_branch_sha(ref.branch_name)
+        if expected_head_sha is not None and remote_sha != expected_head_sha:
+            raise GitHubWorkTrackingError("Issue branch moved during the local review fix")
         final_tree = self._git(
             ["rev-parse", f"{integrated_commit_sha}^{{tree}}"], cwd=worktree_path
         ).stdout.strip()
@@ -1392,8 +1395,12 @@ class GitHubWorkTrackingService:
                 ],
                 cwd=worktree_path,
             ).stdout.strip()
+            branch_ref = f"refs/heads/{ref.branch_name}"
+            # The fix was verified against the reviewed branch head. A lease
+            # also detects a concurrent rewind to one of its ancestors.
+            lease = [f"--force-with-lease={branch_ref}:{expected_head_sha}"] if expected_head_sha else []
             self._git(
-                ["push", "origin", f"{final_sha}:refs/heads/{ref.branch_name}"],
+                ["push", *lease, "origin", f"{final_sha}:{branch_ref}"],
                 cwd=worktree_path,
             )
         ref.checkpoint_sha = final_sha
