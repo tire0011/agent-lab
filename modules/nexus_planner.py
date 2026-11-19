@@ -19,7 +19,10 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Callable
+
+from modules.measurement_health import health_summary, read_health
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +156,18 @@ def planning_prompt(
     mission: str | None = None,
     budget_left: int | None = None,
     reflections: list[dict[str, str]] | None = None,
+    stuck_measurements: list[str] | None = None,
 ) -> str:
     lines = []
     for issue in issues:
         body = " ".join(str(issue.get("body") or "").split())[:_BODY_CHARS]
         lines.append(f"#{issue['number']} {issue['title']}\n{body}")
     history = [_history_line(r) for r in recent or []]
+    health = ""
+    if stuck_measurements:
+        health = "STUCK MEASUREMENT PIPELINES:\n" + "\n".join(stuck_measurements) + "\n\n"
     return (
-        (mission.strip() if mission and mission.strip() else DEFAULT_MISSION) + "\n\n"
+        health + (mission.strip() if mission and mission.strip() else DEFAULT_MISSION) + "\n\n"
         + _budget_line(budget_left)
         + (_EXPLORE if explore else "") +
         "Also suggest exactly ONE new issue of your own: a concrete, testable "
@@ -335,7 +342,13 @@ class IssuePlanner:
         splittable = allowed | {int(i["number"]) for i in exhausted or []}
         if not splittable:
             return None
+        pipelines = read_health(self._db_path, datetime.now(timezone.utc)) if self._db_path else {}
+        stuck_measurements = [
+            health_summary(name, result) for name, result in pipelines.items()
+            if "count" in result
+        ]
         context = dict(
+            stuck_measurements=stuck_measurements,
             exhausted=exhausted, proposals=proposals, decisions=decisions,
             mission=mission, budget_left=budget_left, reflections=reflections,
         )

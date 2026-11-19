@@ -344,7 +344,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             local_valid INTEGER NOT NULL CHECK (local_valid IN (0, 1)),
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
-            error TEXT
+            error TEXT,
+            created_at TEXT
         );
 
         CREATE TABLE IF NOT EXISTS local_localizations (
