@@ -439,14 +439,14 @@ def test_failed_inbox_write_leaves_no_temp_file_and_is_retried(lane, monkeypatch
 
 def test_a_failed_commit_withdraws_the_file_and_is_retried(lane, monkeypatch):
     job = submit(lane)
+    real_commit = mailbox_core.git_add_and_commit
     monkeypatch.setattr(mailbox_core, "git_add_and_commit", lambda *args: False)
     assert poll_runner._home_gpu_before_sync(lane.config, lane.db, mailbox_core, "test") == set()
     assert poll_runner._worktree_safe_for_mailbox_sync(mailbox_core, lane.nexus, ("outbox/",))
     assert collect.get_job(job["job_id"], db_path=lane.db)["publish_error"] == "commit_failed"
-    monkeypatch.undo()
-    monkeypatch.setenv("NEXUS_HOME_GPU", "1")
-    monkeypatch.setenv(batch_job.ENV_KEY_FILE, str(lane.tmp / "home-gpu.key"))
-    monkeypatch.setattr(jobs, "_ls_remote_main", lambda repo: lane.commit)
+    # Restore only the commit; monkeypatch.undo() would also drop the fixture's git
+    # identity, and CI runners have no global one.
+    monkeypatch.setattr(mailbox_core, "git_add_and_commit", real_commit)
     assert nexus_poll(lane)
     stored = collect.get_job(job["job_id"], db_path=lane.db)
     assert stored["published_at"] is not None and stored["publish_error"] is None
