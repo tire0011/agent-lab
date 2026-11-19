@@ -102,6 +102,17 @@ SAFEGUARD_WORDS = (
     "nexus_reviewer", "review rule", "paused", "mailbox command", "process_command",
     "proposal label", "proposal_wait",
 )
+# Every external coding provider is cooling down after a usage limit (#753):
+# nothing paid starts; detail holds the earliest reset time.
+DECISION_PROVIDERS_COOLING_DOWN = "providers_cooling_down"
+# Loop guard (#753): more than this many experiments on one issue ending within
+# _LOOP_GUARD_WINDOW without publishable changes stop that issue for
+# _LOOP_GUARD_PAUSE, whatever the provider.
+DECISION_SKIPPED_LOOP_GUARD = "skipped_loop_guard"
+_LOOP_GUARD_MAX_NO_CHANGE = 3
+_LOOP_GUARD_WINDOW = timedelta(hours=1)
+_LOOP_GUARD_PAUSE = timedelta(hours=6)
+_NO_CHANGE_STATUSES = ("failed", "timed_out", "rejected", "interrupted", "needs_review", "cancelled")
 # The planner split an issue into parts (#626); detail holds the part numbers.
 DECISION_SPLIT = "split"
 _MAX_SPLIT_DEPTH = 2
@@ -619,6 +630,7 @@ class NexusInitiativeService:
         if record_skips:
             self._close_finished_splits({int(i["number"]) for i in issues if i.get("number") is not None})
         linked, exhausted = self._issue_attempts()
+        looping = self._loop_guarded_issues()
         reported = self._exhausted_reports()
         review_blocked = self._review_blocked_issues()
         skipped = self._goal_policy_skips()
@@ -646,6 +658,9 @@ class NexusInitiativeService:
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
                     self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
+                continue
+            if int(number) in looping:
+                self._note_loop_guard(issue, looping[int(number)], record=record_skips)
                 continue
             raw_title = str(issue.get("title") or f"Issue #{number}")
             raw_body = str(issue.get("body") or "")
@@ -1054,6 +1069,123 @@ class NexusInitiativeService:
                 }
             blocked.add(number)
         return blocked, exhausted
+
+    def _loop_guarded_issues(self) -> dict[int, dict[str, Any]]:
+        """Issues stopped by the loop guard (#753): ``issue -> detail``.
+
+        More than ``_LOOP_GUARD_MAX_NO_CHANGE`` experiments on one issue that
+        ended within ``_LOOP_GUARD_WINDOW`` without publishable changes stop
+        the issue for ``_LOOP_GUARD_PAUSE`` after the last of them. Overloads
+        and limits count here: the guard is independent of the provider.
+        """
+        placeholders = ",".join("?" for _ in _NO_CHANGE_STATUSES)
+        try:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")}
+        except sqlite3.Error:
+            return {}
+        diff = "e.diff_text" if "diff_text" in columns else "NULL"
+        ends: dict[int, dict[str, datetime]] = {}
+        for table in ("github_experiment_links", "github_work_links"):
+            try:
+                rows = self._conn.execute(
+                    f"""
+                    SELECT l.issue_number AS issue_number, e.id AS experiment_id,
+                           e.status AS status, e.error AS error,
+                           e.ended_at AS ended_at, e.created_at AS created_at
+                    FROM {table} l JOIN experiments e ON e.id = l.experiment_id
+                    WHERE e.status IN ({placeholders})
+                      AND (COALESCE({diff}, '') = ''
+                           OR COALESCE(e.error, '') LIKE '%no publishable%')
+                    """,
+                    _NO_CHANGE_STATUSES,
+                ).fetchall()
+            except sqlite3.OperationalError:
+                continue
+            for row in rows:
+                if _is_goal_policy_rejection(row["status"], row["error"]):
+                    continue  # rejected before any work (#408)
+                ended = _parse_timestamp(row["ended_at"] or row["created_at"])
+                try:
+                    number = int(row["issue_number"])
+                except (TypeError, ValueError):
+                    continue
+                if ended is not None:
+                    ends.setdefault(number, {})[str(row["experiment_id"])] = ended
+        now = _utcnow()
+        guarded: dict[int, dict[str, Any]] = {}
+        quick = _LOOP_GUARD_MAX_NO_CHANGE + 1
+        for number, by_experiment in ends.items():
+            times = sorted(by_experiment.values())
+            trigger = None
+            for i in range(quick - 1, len(times)):
+                if times[i] - times[i - quick + 1] <= _LOOP_GUARD_WINDOW:
+                    trigger = times[i]
+            if trigger is None or now >= trigger + _LOOP_GUARD_PAUSE:
+                continue
+            guarded[number] = {
+                "issue": number,
+                "no_change_experiments": sum(
+                    1 for t in times if trigger - _LOOP_GUARD_WINDOW <= t <= trigger
+                ),
+                "window_minutes": int(_LOOP_GUARD_WINDOW.total_seconds() // 60),
+                "triggered_at": trigger.isoformat(),
+                "paused_until": (trigger + _LOOP_GUARD_PAUSE).isoformat(),
+            }
+        return guarded
+
+    def _note_loop_guard(self, issue: dict[str, Any], detail: dict[str, Any], *, record: bool) -> None:
+        """Log a loop-guard stop once per trigger (#753)."""
+        number = str(issue.get("number"))
+        logger.warning(
+            "initiative: loop guard stops issue #%s until %s (%s experiments without changes within %s min)",
+            number, detail["paused_until"], detail["no_change_experiments"], detail["window_minutes"],
+        )
+        if not record:
+            return
+        rows = self._conn.execute(
+            "SELECT detail FROM nexus_initiative_log WHERE decision = ? AND source_ref = ?",
+            (DECISION_SKIPPED_LOOP_GUARD, number),
+        ).fetchall()
+        for row in rows:
+            try:
+                if json.loads(row["detail"] or "{}").get("paused_until") == detail["paused_until"]:
+                    return
+            except ValueError:
+                continue
+        title = str(issue.get("title") or f"Issue #{number}")[:200]
+        self._record(
+            InitiativeDecision(
+                DECISION_SKIPPED_LOOP_GUARD,
+                candidate=Candidate(
+                    KIND_ISSUE, number, title,
+                    f"{detail['no_change_experiments']} experiments without publishable changes "
+                    f"within {detail['window_minutes']} min; paused until {detail['paused_until']}",
+                ),
+                detail=json.dumps(detail, sort_keys=True),
+                tick_id=uuid.uuid4().hex,
+            )
+        )
+
+    def _providers_cooling_down(self) -> dict[str, str] | None:
+        """``provider -> reset`` when every usable external provider is cooling
+        down after a usage limit (#753), else ``None``."""
+        from modules import coding_provider
+
+        try:
+            cooled = coding_provider.provider_cooldowns(db_path=self.db_path)
+            if not cooled:
+                return None
+            pinned = coding_provider.pinned_provider()
+            usable = (
+                [pinned] if pinned is not None
+                else coding_provider.available_providers() or coding_provider.allowed_providers()
+            )
+        except Exception as exc:  # noqa: BLE001 - unknown cooldowns must not stop the tick
+            logger.warning("initiative: cannot read provider cooldowns: %s", exc)
+            return None
+        if not usable or any(provider not in cooled for provider in usable):
+            return None
+        return {provider: cooled[provider].isoformat() for provider in usable}
 
     def _main_commit_time(self) -> datetime | None:
         """When origin/main last moved, from the local ref; ``None`` if unreadable."""
@@ -1585,6 +1717,18 @@ class NexusInitiativeService:
         # the busy and stale-service guards. A pass becomes an adoption candidate
         # below in this same tick; the reviewer is therefore never bypassed.
         self._reverify_parked()
+
+        cooling = self._providers_cooling_down()
+        if cooling is not None:
+            # Every paid coder would refuse at once (#753): start nothing paid.
+            # The local worker is not limited and keeps running its own work.
+            earliest = min(cooling.values())
+            logger.warning("initiative: all coding providers cooling down; earliest reset %s", earliest)
+            return self._record(InitiativeDecision(
+                DECISION_PROVIDERS_COOLING_DOWN,
+                detail=json.dumps({"earliest_reset": earliest, "providers": cooling}, sort_keys=True),
+                tick_id=tick_id,
+            ))
 
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back

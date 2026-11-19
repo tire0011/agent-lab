@@ -14,6 +14,7 @@ from modules.codex_worker import CodexResult
 from modules.coding_provider import (
     build_worker,
     is_provider_overload,
+    note_provider_limit,
     other_provider,
     provider_of,
 )
@@ -415,8 +416,17 @@ class ImplementationMixin:
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
 
+        if (
+            implementation_result.error
+            and not implementation_result.timed_out
+            and implementation_provider
+            and implementation_provider != "local"
+        ):
+            # A usage limit cools the provider down until it resets (#753), so the
+            # next run does not pick it again; this attempt moves on below.
+            self._note_provider_limit(implementation_provider, implementation_result.error, elog)
         fallback = (
-            other_provider(implementation_provider)
+            other_provider(implementation_provider, db_path=self.db_path)
             if implementation_provider and implementation_provider != "local"
             else None
         )
@@ -455,6 +465,8 @@ class ImplementationMixin:
             implementation_usage_json = self._usage_after_run(
                 experiment_id, implementation_result, live_state, elog
             )
+            if implementation_result.error and not implementation_result.timed_out:
+                self._note_provider_limit(fallback, implementation_result.error, elog)
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
 
@@ -517,6 +529,27 @@ class ImplementationMixin:
             github_work_tracking=github_work_tracking,
         )
 
+
+    def _note_provider_limit(self, provider: str | None, error: Any, elog: Any) -> None:
+        """Persist the cooldown of a provider that hit its usage limit (#753).
+
+        Best effort: a store error must not turn the run into a pipeline crash.
+        """
+        try:
+            until = note_provider_limit(provider, error, db_path=self.db_path)
+        except Exception as exc:  # noqa: BLE001
+            elog.warning(
+                "implementation", "provider_cooldown_failed",
+                f"could not persist the cooldown of {provider}: {type(exc).__name__}: {exc}",
+                provider=provider or "",
+            )
+            return
+        if until is not None:
+            elog.warning(
+                "implementation", "provider_cooldown",
+                f"{provider} hit its usage limit; not selected again until {until.isoformat()}",
+                provider=provider or "", cooldown_until=until.isoformat(),
+            )
 
     def _usage_after_run(
         self, experiment_id: str, run_result: Any, live_state: dict[str, int],
