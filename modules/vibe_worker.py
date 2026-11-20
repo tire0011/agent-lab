@@ -57,7 +57,7 @@ _DEFAULT_MAX_OUTPUT_BYTES = 512 * 1024
 _DEFAULT_TIMEOUT_SECONDS = 1800
 _READ_ONLY_TOOLS = ("read_file", "grep")
 #: Outcomes in export.json that mean the run finished normally.
-_SUCCESS_OUTCOMES = frozenset({"success", "succeeded", "completed", "complete", "done", "ok"})
+_SUCCESS_OUTCOMES = frozenset({"finished", "success", "succeeded", "completed", "complete", "done", "ok"})
 
 
 def default_vibe_bin() -> str:
@@ -86,11 +86,19 @@ def _final_message(stdout: str) -> str | None:
         if isinstance(messages, list):
             data = messages
     if isinstance(data, list):
+        # vibe 3.x: a list of journal entries; the answer is the last assistant
+        # message, whose content is a list of {"type": "text", "text": ...} parts.
         for item in reversed(data):
-            if isinstance(item, dict) and item.get("role") in (None, "assistant"):
-                value = item.get("content")
-                if isinstance(value, str) and value.strip():
-                    return value
+            if not isinstance(item, dict) or item.get("role") != "assistant":
+                continue
+            value = item.get("content")
+            if isinstance(value, list):
+                value = "".join(
+                    part.get("text", "") for part in value
+                    if isinstance(part, dict) and part.get("type") == "text"
+                )
+            if isinstance(value, str) and value.strip():
+                return value
     return text
 
 

@@ -28,7 +28,7 @@ FAKE_VIBE = textwrap.dedent('''\
     open(os.environ["FAKE_VIBE_RECORD"], "w").write(json.dumps(record))
     mode = os.environ.get("FAKE_VIBE_MODE", "ok")
     out = opt("--output-dir"); os.makedirs(out, exist_ok=True)
-    export = {{"outcome": "success", "error": None, "session_id": "s-1",
+    export = {{"outcome": "finished", "error": None, "session_id": "s-1",
                "usage": {{"input_tokens": 120, "output_tokens": 30, "cached_input_tokens": 0}}}}
     if mode == "402":
         export.update(outcome="infrastructure_failure",
@@ -39,7 +39,13 @@ FAKE_VIBE = textwrap.dedent('''\
     if "--auto-approve" in args:
         open(os.path.join(opt("--workdir"), "edited.txt"), "w").write("vibe was here\\n")
     open(os.path.join(out, "export.json"), "w").write(json.dumps(export))
-    print(json.dumps({{"result": "done: edited.txt"}}))
+    # The real vibe 3.x journal format (2026-11-20, checked on the VM).
+    print(json.dumps([
+        {{"type": "message", "role": "user", "content": [{{"type": "text", "text": "Add edited.txt"}}]}},
+        {{"type": "reasoning", "text": "simple"}},
+        {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "done: "}},
+                                                             {{"type": "text", "text": "edited.txt"}}]}},
+    ]))
 ''')
 
 
