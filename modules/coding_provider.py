@@ -219,11 +219,15 @@ def is_provider_overload(error: Any) -> bool:
 # A usage limit with a reset time (#753). 2026-11-18: "You've hit your weekly
 # limit · resets 12pm (UTC)" matched nothing above, so 15 runs started on Claude.
 # Codex/OpenAI say "usage limit", "quota exceeded" or "insufficient_quota".
+# 2026-11-20: the Mistral API answered "http_402" (payment required, no credit
+# left), matched nothing and kept Mistral in the rotation.
 _LIMIT_RE = re.compile(
     r"hit your (?:(?:weekly|daily|session|5[ -]?hour|monthly|usage) )?limit"
     r"|\blimit\b.{0,20}\bresets?\b"
     r"|usage[ _-]?limit|quota[ _-]?exceeded|exceeded (?:your|the) (?:current )?quota"
-    r"|insufficient[ _-]quota",
+    r"|insufficient[ _-]quota"
+    r"|\bhttp[ _-]?402\b|\b402\b[^\n]{0,20}payment|payment[ _-]required"
+    r"|insufficient[ _-](?:credits?|balance|funds)|out of credits",
     re.IGNORECASE,
 )
 
