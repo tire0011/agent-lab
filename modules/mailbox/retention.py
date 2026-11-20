@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .core import MAX_RETRY, STATUS_DONE
+from .core import MAX_RETRY, STATUS_DONE, _git
 
 logger = logging.getLogger(__name__)
 
@@ -26,8 +26,7 @@ DEFAULT_RETENTION_DAYS = 5
 # produces a reviewable commit; the rest is picked up by the next poll.
 MAX_DELETIONS_PER_POLL = 500
 
-# Outbox names are built by ``_outbox_filename`` and always start with a
-# ``YYYYMMDDHHMMSS`` stamp.
+# Outbox names built by ``_outbox_filename`` start with a ``YYYYMMDDHHMMSS`` stamp.
 _TIMESTAMP_PREFIX_LENGTH = 14
 
 
@@ -54,13 +53,14 @@ class PruneResult:
     inbox: list[Path] = field(default_factory=list)
     protected: int = 0
     truncated: bool = False
+    archive: list[Path] = field(default_factory=list)
 
     @property
     def paths(self) -> list[Path]:
-        return [*self.outbox, *self.inbox]
+        return [*self.outbox, *self.inbox, *self.archive]
 
     def __bool__(self) -> bool:
-        return bool(self.outbox or self.inbox)
+        return bool(self.outbox or self.inbox or self.archive)
 
     def summary(self) -> str:
         parts = []
@@ -68,19 +68,35 @@ class PruneResult:
             parts.append(f"{len(self.outbox)} outbox")
         if self.inbox:
             parts.append(f"{len(self.inbox)} inbox")
+        if self.archive:
+            parts.append(f"{len(self.archive)} archive")
         return ", ".join(parts) or "nothing"
 
 
 def message_timestamp(name: str) -> datetime | None:
-    """Parse an outbox filename's leading ``YYYYMMDDHHMMSS`` stamp; ``None`` when
-    absent, which callers treat as "do not touch" - an unrecognized file's age
-    cannot be established, so it is never old enough to delete."""
+    """Parse an outbox filename's leading ``YYYYMMDDHHMMSS`` stamp, if present."""
     prefix = name[:_TIMESTAMP_PREFIX_LENGTH]
     if len(prefix) < _TIMESTAMP_PREFIX_LENGTH or not prefix.isdigit():
         return None
     try:
         return datetime.strptime(prefix, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:
+        return None
+
+
+def _last_modified(path: Path) -> datetime | None:
+    """Use Git history so a fresh checkout preserves the file's age."""
+    try:
+        result = _git(
+            ["--literal-pathspecs", "log", "-1", "--format=%cI", "--", path.name],
+            path.parent,
+            check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return datetime.fromisoformat(result.stdout.strip())
+        return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+    except (OSError, ValueError):
+        logger.warning("could not determine retention age for %s", path.name)
         return None
 
 
@@ -94,8 +110,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 def protected_outbox_names(conn: sqlite3.Connection) -> set[str]:
     """Outbox files that are still needed and must never be pruned: ``mailbox_messages``
     rows not yet ``done`` (``retry_pending_git_commits()`` re-reads their file), and
-    ``operation_chains``/``mailbox_task_approvals`` rows whose ``publish_status`` is
-    not ``pushed``."""
+    publisher rows whose ``publish_status`` is not ``pushed``."""
     protected: set[str] = set()
 
     if _table_exists(conn, "mailbox_messages"):
@@ -106,20 +121,15 @@ def protected_outbox_names(conn: sqlite3.Connection) -> set[str]:
         ).fetchall()
         protected.update(Path(str(row[0])).name for row in rows if row[0])
 
-    for table in ("operation_chains", "mailbox_task_approvals"):
-        if not _table_exists(conn, table):
+    for table in ("operation_chains", "mailbox_task_approvals", "failure_analyses"):
+        columns = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if "outbox_file" not in columns:
             continue
-        try:
-            rows = conn.execute(
-                f"SELECT outbox_file FROM {table} "  # noqa: S608 - fixed table names
-                "WHERE outbox_file IS NOT NULL AND publish_status != 'pushed'"
-            ).fetchall()
-        except sqlite3.OperationalError:
-            # Older schema without publish tracking: protect everything this table
-            # references rather than guessing it is finished.
-            rows = conn.execute(
-                f"SELECT outbox_file FROM {table} WHERE outbox_file IS NOT NULL"  # noqa: S608
-            ).fetchall()
+        # Older schemas without publish tracking still protect every referenced file.
+        unfinished = " AND publish_status IS NOT 'pushed'" if "publish_status" in columns else ""
+        rows = conn.execute(
+            f"SELECT outbox_file FROM {table} WHERE outbox_file IS NOT NULL{unfinished}"  # noqa: S608
+        )
         protected.update(Path(str(row[0])).name for row in rows if row[0])
 
     return protected
@@ -160,11 +170,11 @@ def plan_prune(
     stale_outbox: list[Path] = []
     if outbox.is_dir():
         for path in sorted(outbox.iterdir()):
-            if not path.is_file() or path.suffix != ".md":
+            if path.is_symlink() or not path.is_file() or path.suffix != ".md":
                 continue
             if path.name in protected:
                 continue
-            stamp = message_timestamp(path.name)
+            stamp = message_timestamp(path.name) or _last_modified(path)
             if stamp is None or stamp >= cutoff:
                 continue
             stale_outbox.append(path)
@@ -174,19 +184,30 @@ def plan_prune(
         if path.exists() and path.parent == inbox
     ]
 
-    truncated = False
+    archive = outbox.parent / "archive"
+    stale_archive: list[Path] = []
+    if archive.is_dir() and not archive.is_symlink():
+        for path in sorted(archive.rglob("*")):
+            if path.is_symlink() or not path.is_file() or path.name == ".gitkeep":
+                continue
+            if path.name in protected:
+                continue
+            stamp = _last_modified(path)
+            if stamp is not None and stamp < cutoff:
+                stale_archive.append(path)
+
     budget = max(0, max_deletions)
-    if len(stale_outbox) + len(stale_inbox) > budget:
-        truncated = True
-        # Inbox messages come first: they are re-processed on every poll, so draining
-        # them matters more than reclaiming space.
-        keep_inbox = stale_inbox[:budget]
-        stale_outbox = stale_outbox[: max(0, budget - len(keep_inbox))]
-        stale_inbox = keep_inbox
+    truncated = len(stale_outbox) + len(stale_inbox) + len(stale_archive) > budget
+    # Drain terminal inbox messages first, then reclaim space in outbox and archive.
+    stale_inbox = stale_inbox[:budget]
+    budget -= len(stale_inbox)
+    stale_outbox = stale_outbox[:budget]
+    budget -= len(stale_outbox)
 
     return PruneResult(
         outbox=stale_outbox,
         inbox=stale_inbox,
         protected=len(protected),
         truncated=truncated,
+        archive=stale_archive[:budget],
     )

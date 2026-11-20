@@ -644,7 +644,7 @@ class MailboxProcessor:
         return git_is_clean(self._mailbox_repo_path)
 
     def prune_old_messages(self, *, now=None) -> Any:
-        """Delete finished outbox responses and dead inbox messages, as part of the
+        """Delete old outbox and archive files and dead inbox messages, as part of the
         normal poll after pending commits were retried (files still needed to finalize
         a commit are protected). Deletions are committed with explicit pathspecs and
         pushed by the poll's existing sync; a pass with nothing to prune commits
