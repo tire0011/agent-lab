@@ -107,6 +107,27 @@ class ProviderCredentialsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
 
 
+class ServicePathsTests(unittest.TestCase):
+    """Real service paths exported by the service env must not leak into tests."""
+
+    def test_log_dir_and_mailbox_path_are_temporary_even_when_exported(self):
+        import subprocess
+        import sys
+
+        env = dict(os.environ, AGENT_LOG_DIR="/real/service/logs",
+                   AGENT_MAILBOX_REPO_PATH="/real/service/mailbox")
+        probe = (
+            "import os, sys; sys.path.insert(0, 'tests'); import conftest; "
+            "bad = [n for n in ('AGENT_LOG_DIR', 'AGENT_MAILBOX_REPO_PATH') "
+            "if os.environ[n].startswith('/real/service')]; print(bad); sys.exit(1 if bad else 0)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+
+
 class IsolationTests(unittest.TestCase):
     """conftest's other guarantees, which are about not touching real state."""
 
