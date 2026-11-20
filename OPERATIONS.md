@@ -920,6 +920,30 @@ and values assigned to `password`/`api_key`/`token`/`secret`/... keys), but
 paths and URLs are shown unchanged, so the text stays analysable. The model
 name is not stored per job, so only `provider: local` is shown.
 
+### Local planner shadow (#671, #770)
+
+After the paid planner picks an issue, the local model is asked the same
+question on a background thread with a compact prompt (`compact_v1`): one line
+per open issue, the last five experiment outcomes, the stuck measurements and
+the budget. It never changes the paid choice.
+
+- `NEXUS_PLANNER_SHADOW=0` turns it off; `NEXUS_PLANNER_SHADOW_PROMPT_TOKENS`
+  (default 1500, bytes/4 estimate) bounds the prompt. Oldest issues are dropped
+  first, then old outcomes, then stuck lines. When even the fixed header and
+  one choosable issue do not fit, a row with `prompt budget too small` is
+  stored and the model is not called.
+- The answer schema allows only the issues listed in the prompt and choosable
+  by the planner; out-of-attempts issues are shown as context only.
+- The timeout is `prompt_tokens / prompt_tps + 120 / gen_tps + 10 s` from the
+  measured local rates, at most 240 s. A row is stored as `pending` before the
+  call; the tick process waits for it at exit (at most the timeout), and a row
+  left pending by a killed process is finished as `interrupted` by the next
+  shadow start.
+- `GET /planner/shadow` (MCP `planner_shadow_list`): `summary` is
+  all history; `rollout` covers only the latest 20 `compact_v1` rows with the
+  targets (valid share >= 0.8, median < 120 s) and `followup_ready` when the
+  agreement with the paid planner is >= 60% over a full window.
+
 ## Maintenance API (temporary remote-maintenance bridge)
 
 The maintenance API provides a fixed set of named operations for remote VM

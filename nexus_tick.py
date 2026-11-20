@@ -287,24 +287,28 @@ def _planner(repo_root: str, db_path: str | None = None):
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
+    from modules.llama_cpp_client import LlamaCppClient
+    from modules.local_model_rates import LocalModelRates
 
-    def shadow(prompt: str) -> str:
-        client = LlamaCppClient(timeout=55, stream=False)
+    def _rates() -> LocalModelRates:
+        return LocalModelRates(model=LlamaCppClient(stream=False).model)
+
+    def shadow(prompt: str, *, response_format: dict, timeout: float) -> dict:
+        # Compact prompt, schema with the allowed issues, timeout from the
+        # measured rates (#770); the planner runs this on a daemon thread.
+        client = LlamaCppClient(timeout=timeout, stream=False)
         response = asyncio.run(client.chat_completion(
             [{"role": "user", "content": prompt}], max_tokens=120,
-            response_format=json_schema_response_format(
-                "planner_shadow",
-                {"type": "object", "properties": {
-                    "issue": {"type": "integer"}, "reason": {"type": "string"}},
-                 "required": ["issue", "reason"], "additionalProperties": False},
-            ),
+            response_format=response_format,
         ))
-        return str(response["choices"][0]["message"]["content"])
+        timings = client.last_timings or {}
+        _rates().record(timings)
+        return {"content": str(response["choices"][0]["message"]["content"]),
+                "tokens_cached": timings.get("tokens_cached")}
 
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
-        shadow=shadow,
+        shadow=shadow, shadow_rates=lambda: _rates().medians(),
         db_path=db_path or os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db"),
     )
 
@@ -443,6 +447,25 @@ def _wait_for_experiments(service=None) -> None:
                 thread.join(timeout=_STALL_SWEEP_INTERVAL_SECONDS)
                 if thread.is_alive() and service is not None:
                     _sweep_stalled_experiments(service)
+
+
+def _wait_for_planner_shadow() -> None:
+    """Let a running local planner shadow store its outcome before exit (#770).
+
+    The planning decision never waits on the shadow; only the process stays
+    alive, at most the shadow's own timeout, so a tick that ends quickly still
+    records the result or the timeout. It also ends before the shadow replay
+    asks whether the local server is idle.
+    """
+    from modules.nexus_planner import wait_for_shadow
+
+    try:
+        left = wait_for_shadow()
+    except Exception as exc:  # noqa: BLE001 - never fails the tick
+        logger.warning("could not wait for the planner shadow: %s", exc)
+        return
+    if left:
+        logger.warning("planner shadow still running at exit; its row is finished as interrupted later")
 
 
 def _shadow_replay(repo_root: str, db_path: str) -> None:
@@ -666,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.decision != "error" else 1
     finally:
         _wait_for_experiments(None if args.dry_run else service)
+        _wait_for_planner_shadow()
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
             if not args.integration_only:

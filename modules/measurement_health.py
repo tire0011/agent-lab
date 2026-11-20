@@ -53,8 +53,12 @@ def check_pipelines(
 
     planner_time = "NULL"
     planner_join = ""
+    planner_where = ""
     if "planner_shadow" in tables:
         columns = {row[1] for row in db.execute("PRAGMA table_info(planner_shadow)")}
+        if "status" in columns:
+            # A pending row has no outcome yet (#770).
+            planner_where = " WHERE p.status IS NULL OR p.status != 'pending'"
         if "created_at" in columns:
             planner_time = "p.created_at"
         if "nexus_initiative_log" in tables:
@@ -90,7 +94,8 @@ def check_pipelines(
         ("planner_shadow", not paused and os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() != "0",
          True, "valid",
          "SELECT p.id, CASE p.local_valid WHEN 1 THEN 'valid' ELSE 'invalid' END, "
-         f"p.error, {planner_time} AS measured_at FROM planner_shadow AS p {planner_join}"),
+         f"p.error, {planner_time} AS measured_at FROM planner_shadow AS p {planner_join}"
+         f"{planner_where}"),
         # Bake-offs are run manually and have no expected cadence.
         ("local_model_bakeoffs", True, False, "completed",
          "SELECT id, status, error, created_at AS measured_at FROM local_model_bakeoffs WHERE status != 'not_run'"),
