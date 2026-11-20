@@ -128,6 +128,24 @@ class ServicePathsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
 
 
+class NexusSwitchesTests(unittest.TestCase):
+    def test_service_runtime_switches_do_not_reach_the_tests(self):
+        import subprocess
+        import sys
+
+        env = dict(os.environ, AGENT_CODING_PROVIDERS="codex,claude", NEXUS_REVERIFY_PARKED="0",
+                   NEXUS_TEST_CLOCK_DRIFT_MS="50")
+        probe = (
+            "import os, sys; sys.path.insert(0, 'tests'); import conftest; "
+            "leaked = [n for n in ('AGENT_CODING_PROVIDERS', 'NEXUS_REVERIFY_PARKED') if n in os.environ]; "
+            "kept = os.environ.get('NEXUS_TEST_CLOCK_DRIFT_MS') == '50'; "
+            "print(leaked, kept); sys.exit(0 if not leaked and kept else 1)"
+        )
+        result = subprocess.run([sys.executable, "-c", probe], cwd=_REPO_ROOT, env=env,
+                                capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+
+
 class IsolationTests(unittest.TestCase):
     """conftest's other guarantees, which are about not touching real state."""
 

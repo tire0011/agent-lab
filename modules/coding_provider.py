@@ -32,6 +32,7 @@ from modules.local_coding_worker import (
     local_samples, sample_temperatures,
 )
 from modules.mistral_worker import PROVIDER as PROVIDER_MISTRAL, MistralWorker, coding_model
+from modules.vibe_worker import VibeWorker, vibe_available
 from modules.run_store import DEFAULT_DB_PATH, init_db
 
 logger = logging.getLogger("modules.coding_provider")
@@ -66,10 +67,11 @@ def provider_binary(provider: str) -> str:
 
 def is_available(provider: str) -> bool:
     """Whether this provider can run here: its CLI is installed and executable
-    (Codex, Claude), or - Mistral has no CLI - a coding-role registry model with
-    its API key is configured."""
+    (Codex, Claude). Mistral runs through the ``vibe`` CLI on the owner's Vibe
+    subscription when it is installed, else through the API with a coding-role
+    registry model whose key is configured."""
     if _normalize(provider) == PROVIDER_MISTRAL:
-        return coding_model() is not None
+        return vibe_available() or coding_model() is not None
     try:
         binary = provider_binary(provider)
     except UnknownProviderError:
@@ -434,6 +436,10 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
     if provider == PROVIDER_CLAUDE:
         return ClaudeWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_MISTRAL:
+        # The Vibe CLI bills the Vibe Code subscription; the API worker needs
+        # credit in the separate API workspace (HTTP 402 on 2026-11-20).
+        if vibe_available():
+            return VibeWorker(db_path=db_path, **kwargs)
         return MistralWorker(db_path=db_path, **kwargs)
     if provider == PROVIDER_LOCAL:
         # #598: split into small subtasks first unless LOCAL_TASK_SPLIT turns it off.
