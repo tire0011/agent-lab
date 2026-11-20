@@ -11,6 +11,7 @@ label.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -195,6 +196,153 @@ def planning_prompt(
     )
 
 
+# The compact local shadow prompt (#770): the full prompt above is about 6-9k
+# tokens, which the CPU llama-server cannot read within any useful timeout.
+COMPACT_PROMPT_VARIANT = "compact_v1"
+SHADOW_PROMPT_TOKENS_ENV = "NEXUS_PLANNER_SHADOW_PROMPT_TOKENS"
+DEFAULT_SHADOW_PROMPT_TOKENS = 1500
+_COMPACT_TITLE_CHARS = 90
+_COMPACT_LINE_CHARS = 160
+_COMPACT_RECENT = 5
+_SHADOW_REASON_CHARS = 160
+_SHADOW_MAX_TOKENS = 120
+_SHADOW_TIMEOUT_CAP = 240.0
+_SHADOW_TIMEOUT_SLACK = 10.0
+_SHADOW_JOIN_GRACE = 5.0
+
+# Fixed first, so llama-server's prompt cache (#685) reuses it on every tick.
+_COMPACT_HEADER = (
+    "You are Nexus, an agent that develops its own code. Pick the ONE open issue "
+    "that is the most useful to work on next. Prefer issues that unblock or "
+    "simplify later work. Skip issues that need a human decision, a purchase or "
+    "setup outside the repository. An issue tagged out-of-attempts cannot be "
+    "done now; blocked-by-review means the last attempt passed its tests but the "
+    "review stopped it.\n"
+    'Answer with exactly one JSON object: {"issue": <number from OPEN ISSUES>, '
+    '"reason": "<one short sentence>"}\n\n'
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """The bytes/4 estimate used for the shadow prompt budget."""
+    return max(1, len(text.encode("utf-8")) // 4)
+
+
+def _one_line(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_issue_line(issue: dict[str, Any]) -> str:
+    left = issue.get("attempts_left")
+    tags = []
+    if left is not None and int(left) <= 0:
+        tags.append("out-of-attempts")
+    if issue.get("review_blocked"):
+        tags.append("blocked-by-review")
+    line = f"#{issue['number']} {_one_line(issue.get('title'), _COMPACT_TITLE_CHARS)}"
+    if left is not None:
+        line += f" | attempts left: {max(0, int(left))}"
+    return line + "".join(f" [{tag}]" for tag in tags)
+
+
+def _compact_recent_line(r: dict[str, Any]) -> str:
+    if "adoption_status" in r:
+        reason = str(r.get("adoption_reason") or "")
+        outcome = f"{r.get('status', '')} / merge: {_merge_label(str(r['adoption_status']), reason)}"
+    else:
+        outcome = str(r.get("status", ""))
+    return _one_line(f"- {outcome}: {r.get('title', '')}", _COMPACT_LINE_CHARS)
+
+
+def compact_planning_prompt(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, Any]] | None,
+    stuck_measurements: list[str] | None,
+    budget_left: int | None,
+    max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+) -> str:
+    """A short planning prompt for the local model (#770).
+
+    One line per open issue (no bodies, no owner decisions), the last five
+    experiment outcomes, the stuck measurement pipelines and the budget. The
+    fixed header comes first and the lines that change from tick to tick come
+    last, so the server's prompt cache can reuse the prefix. The oldest
+    (lowest numbered) issues are dropped first until the bytes/4 estimate fits
+    *max_tokens*; the newest issue is always kept.
+    """
+    ordered = sorted(issues, key=lambda i: int(i["number"]))
+    issue_lines = [_compact_issue_line(i) for i in ordered]
+    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
+    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
+    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
+
+    def build(kept: list[str]) -> str:
+        return (
+            _COMPACT_HEADER
+            + "OPEN ISSUES:\n" + "\n".join(kept) + "\n\n"
+            + "RECENT EXPERIMENTS:\n" + ("\n".join(recent_lines) or "(none yet)") + "\n\n"
+            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_lines) or "(none)") + "\n\n"
+            + f"Paid starts left today: {budget}\n"
+        )
+
+    start = 0
+    prompt = build(issue_lines)
+    while estimate_tokens(prompt) > max_tokens and start < len(issue_lines) - 1:
+        start += 1
+        prompt = build(issue_lines[start:])
+    return prompt
+
+
+def shadow_response_format(allowed: set[int]) -> dict[str, Any]:
+    """The schema the local answer must match: an allowed issue and a short reason."""
+    from modules.llama_cpp_client import json_schema_response_format
+
+    return json_schema_response_format("planner_shadow", {
+        "type": "object",
+        "properties": {
+            "issue": {"type": "integer", "enum": sorted(allowed)},
+            "reason": {"type": "string", "maxLength": _SHADOW_REASON_CHARS},
+        },
+        "required": ["issue", "reason"],
+        "additionalProperties": False,
+    })
+
+
+def shadow_timeout(prompt_tokens: int, prompt_tps: float | None, gen_tps: float | None,
+                   fallback: float) -> float:
+    """Seconds the local shadow may take, from the measured local rates (#770).
+
+    ``prompt_tokens / prompt_tps + 120 / gen_tps + 10 s``, at most 240 s.
+    Without both measured rates *fallback* is used, with the same cap.
+    """
+    if (isinstance(prompt_tps, (int, float)) and isinstance(gen_tps, (int, float))
+            and prompt_tps > 0 and gen_tps > 0):
+        seconds = (prompt_tokens / float(prompt_tps) + _SHADOW_MAX_TOKENS / float(gen_tps)
+                   + _SHADOW_TIMEOUT_SLACK)
+    else:
+        seconds = float(fallback)
+    return min(_SHADOW_TIMEOUT_CAP, seconds)
+
+
+def _shadow_prompt_budget() -> int:
+    try:
+        value = int(os.environ.get(SHADOW_PROMPT_TOKENS_ENV, "") or DEFAULT_SHADOW_PROMPT_TOKENS)
+    except ValueError:
+        return DEFAULT_SHADOW_PROMPT_TOKENS
+    return value if value > 0 else DEFAULT_SHADOW_PROMPT_TOKENS
+
+
+def _accepts_keywords(func: Callable[..., Any], *names: str) -> bool:
+    try:
+        params = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params):
+        return True
+    present = {p.name for p in params}
+    return all(name in present for name in names)
+
+
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
     """Ideas from your own post-experiment reflections (#630), with their evidence."""
     if not reflections:
@@ -318,13 +466,21 @@ class IssuePlanner:
         shadow: Callable[[str], str] | None = None,
         *,
         db_path: str | None = None,
-        shadow_timeout: float = 60.0,
+        shadow_timeout: float = _SHADOW_TIMEOUT_CAP,
+        shadow_rates: Callable[[], tuple[float | None, float | None]] | None = None,
     ) -> None:
+        """*shadow* is the local model: ``shadow(prompt)`` or, when it accepts
+        them, ``shadow(prompt, response_format=..., timeout=...)``. It returns
+        the answer text or ``{"content": ..., "tokens_cached": ...}``.
+        *shadow_rates* gives the measured ``(prompt, generation)`` tokens/s that
+        size the shadow timeout; *shadow_timeout* is used while they are unknown.
+        """
         self._complete = complete
         self._explore = explore
         self._shadow = shadow
         self._db_path = db_path
         self._shadow_timeout = shadow_timeout
+        self._shadow_rates = shadow_rates
 
     def choose(
         self,
@@ -371,36 +527,57 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = planning_prompt(issues, recent, explore=False, **context) + (
-            '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
-            'object with only {"issue": <number>, "reason": "<short reason>"}.'
+        prompt = compact_planning_prompt(
+            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
+            max_tokens=_shadow_prompt_budget(),
         )
-        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+        prompt_tokens = estimate_tokens(prompt)
+        response_format = shadow_response_format(allowed)
+        shadow = self._shadow
 
         def monitor() -> None:
-            result: list[str] = []
+            rates: tuple[float | None, float | None] = (None, None)
+            if self._shadow_rates is not None:
+                try:
+                    rates = self._shadow_rates()
+                except Exception as exc:  # noqa: BLE001 - unknown rates use the fallback
+                    logger.warning("planner shadow: could not read local rates: %s", exc)
+            timeout = shadow_timeout(prompt_tokens, rates[0], rates[1], self._shadow_timeout)
+            result: list[Any] = []
             failure: list[BaseException] = []
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt))  # type: ignore[misc]
+                    if _accepts_keywords(shadow, "response_format", "timeout"):  # type: ignore[arg-type]
+                        result.append(shadow(  # type: ignore[misc]
+                            prompt, response_format=response_format, timeout=timeout))
+                    else:
+                        result.append(shadow(prompt))  # type: ignore[misc]
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
             started = time.monotonic()
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(self._shadow_timeout)
+            # A short grace lets the client's own timeout error (with its rates) arrive.
+            worker.join(timeout + min(_SHADOW_JOIN_GRACE, 0.1 * timeout))
             elapsed = time.monotonic() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
+            cached: int | None = None
             if worker.is_alive():
-                error = f"timeout after {self._shadow_timeout:g}s"
+                error = f"timeout after {timeout:g}s"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
-                data = _json_object(result[0] if result else "")
+                answer = result[0] if result else ""
+                if isinstance(answer, dict):
+                    raw_cached = answer.get("tokens_cached")
+                    if isinstance(raw_cached, (int, float)) and not isinstance(raw_cached, bool):
+                        cached = int(raw_cached)
+                    answer = answer.get("content") or ""
+                data = _json_object(str(answer or ""))
                 if data is None:
                     error = "invalid JSON"
                 else:
@@ -416,7 +593,8 @@ class IssuePlanner:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error)
+                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
+                       prompt_variant=COMPACT_PROMPT_VARIANT, cached_prompt_tokens=cached)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store result: %s", exc)
 

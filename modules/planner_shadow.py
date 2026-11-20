@@ -8,6 +8,14 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+# created_at (#716); prompt_variant and cached_prompt_tokens (#770).
+_LATER_COLUMNS = (
+    ("created_at", "TEXT"),
+    ("prompt_variant", "TEXT"),
+    ("cached_prompt_tokens", "INTEGER"),
+)
+
+
 def ensure_table(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
@@ -20,24 +28,33 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
             error TEXT,
-            created_at TEXT
+            created_at TEXT,
+            prompt_variant TEXT,
+            cached_prompt_tokens INTEGER
         )
         """
     )
+    # Columns added after the first rows were written: nullable, added in place.
+    present = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+    for name, kind in _LATER_COLUMNS:
+        if name not in present:
+            conn.execute(f"ALTER TABLE planner_shadow ADD COLUMN {name} {kind}")
 
 
 def record(db_path: str, **values: Any) -> None:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
-        if "created_at" not in {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}:
-            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
         values.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        values.setdefault("prompt_variant", None)
+        values.setdefault("cached_prompt_tokens", None)
         conn.execute(
             """INSERT INTO planner_shadow
-               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, created_at)
+               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error,
+                created_at, prompt_variant, cached_prompt_tokens)
                VALUES (:tick_id, :paid_issue, :local_issue, :local_valid,
-                       :prompt_tokens, :seconds, :error, :created_at)""",
+                       :prompt_tokens, :seconds, :error, :created_at,
+                       :prompt_variant, :cached_prompt_tokens)""",
             values,
         )
 
@@ -47,7 +64,8 @@ def list_shadow(db_path: str, limit: int = 20) -> dict[str, Any]:
         conn.row_factory = sqlite3.Row
         ensure_table(conn)
         rows = [dict(row) for row in conn.execute(
-            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error "
+            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, "
+            "prompt_variant, cached_prompt_tokens "
             "FROM planner_shadow ORDER BY id DESC LIMIT ?", (limit,)
         )]
         all_rows = conn.execute(

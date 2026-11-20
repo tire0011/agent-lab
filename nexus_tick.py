@@ -287,24 +287,28 @@ def _planner(repo_root: str, db_path: str | None = None):
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
+    from modules.llama_cpp_client import LlamaCppClient
+    from modules.local_model_rates import LocalModelRates
 
-    def shadow(prompt: str) -> str:
-        client = LlamaCppClient(timeout=55, stream=False)
+    def _rates() -> LocalModelRates:
+        return LocalModelRates(model=LlamaCppClient(stream=False).model)
+
+    def shadow(prompt: str, *, response_format: dict, timeout: float) -> dict:
+        # Compact prompt, schema with the allowed issues, timeout from the
+        # measured rates (#770); the planner runs this on a daemon thread.
+        client = LlamaCppClient(timeout=timeout, stream=False)
         response = asyncio.run(client.chat_completion(
             [{"role": "user", "content": prompt}], max_tokens=120,
-            response_format=json_schema_response_format(
-                "planner_shadow",
-                {"type": "object", "properties": {
-                    "issue": {"type": "integer"}, "reason": {"type": "string"}},
-                 "required": ["issue", "reason"], "additionalProperties": False},
-            ),
+            response_format=response_format,
         ))
-        return str(response["choices"][0]["message"]["content"])
+        timings = client.last_timings or {}
+        _rates().record(timings)
+        return {"content": str(response["choices"][0]["message"]["content"]),
+                "tokens_cached": timings.get("tokens_cached")}
 
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
-        shadow=shadow,
+        shadow=shadow, shadow_rates=lambda: _rates().medians(),
         db_path=db_path or os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db"),
     )
 

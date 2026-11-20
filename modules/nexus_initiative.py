@@ -1055,6 +1055,10 @@ class NexusInitiativeService:
             if counted[number] >= limit[number] and number not in blocked
         }
         blocked.update(n for n, count in counted.items() if count >= limit[n])
+        # Attempts each tried issue still has; the compact shadow prompt shows it (#770).
+        self._issue_attempts_left = {
+            number: max(0, limit[number] - counted[number]) for number in counted
+        }
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():
@@ -1449,8 +1453,12 @@ class NexusInitiativeService:
         if not issues and not (act and self._exhausted_issues and self._issue_creator is not None):
             return []
         self._planner_called = True
+        attempts_left = getattr(self, "_issue_attempts_left", {}) or {}
         choice = self._planner.choose(
-            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
+            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", ""),
+              # Only the compact local shadow prompt reads these two (#770).
+              "attempts_left": attempts_left.get(int(c.ref), _MAX_ISSUE_ATTEMPTS),
+              "review_blocked": c.reason == REVIEW_RETRY_REASON} for c in issues],
             recent=self._recent_experiments(),
             exhausted=self._exhausted_issues,
             proposals=self._open_proposal_titles,
