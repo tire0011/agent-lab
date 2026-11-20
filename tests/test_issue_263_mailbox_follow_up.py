@@ -28,7 +28,10 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.experiments = {}
         exp_service = MagicMock()
         exp_service.get_experiment.side_effect = lambda experiment_id: self.experiments[experiment_id]
-        self.svc = _make_service(self.tmp, exp_service=exp_service)
+        self.failure_analysis = MagicMock()
+        self.svc = _make_service(
+            self.tmp, exp_service=exp_service, failure_analysis_service=self.failure_analysis,
+        )
         self.svc.operations_registry.db_path = str(self.tmp / "test.db")
         self.svc._start_thread = lambda *_args: None
         self.addCleanup(self.svc.close)
@@ -160,6 +163,10 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.store.set_status(self.session.id, "failed")
         self.svc.poll_running()
         self.assertEqual(self.svc.get(self.approval_id).status, _STATUS_FAILED)
+        # A barrier on the single-worker executor proves the second poll would
+        # have invoked the live analyzer without the fixture.
+        self.svc._failure_analysis_executor.submit(lambda: None).result(timeout=5)
+        self.failure_analysis.analyze_from_logs.assert_called_once()
 
     def test_poll_still_finishes_a_succeeded_task(self):
         self._run_experiment("exp1", "succeeded", test_exit_code=0)

@@ -263,6 +263,25 @@ error.
 - GitHub mailbox webhook: `POST /mailbox/webhook/github` — authenticated via `X-Hub-Signature-256`
 - `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for queued tasks to hand to Nexus
 
+### Parked branch re-verification
+
+The initiative tick hands re-verification to the local API service as a
+background job. One parked branch is checked at a time, once per experiment
+and main commit, and the check uses no coding budget. Failed, stalled, and
+timed-out attempts leave the experiment parked.
+
+- `NEXUS_REVERIFY_PARKED=0` disables the tick hand-off.
+- `NEXUS_REVERIFY_TIMEOUT_SECONDS` sets the deadline for the whole branch
+  attempt. The default is 2700 seconds (45 minutes). The worker kills the
+  process group and records `reverify_timeout` at the deadline.
+- `NEXUS_REVERIFY_STALL_SECONDS` sets the maximum time without a test start or
+  completion. The default is 600 seconds (10 minutes). A stall stops the tests
+  and records `hung_test` with the active test ID when available.
+
+The tick logs each start-to-start interval and the maximum interval ending in
+the preceding 72 hours. Search the `nexus-tick.service` journal for
+`initiative tick start gap`. A gap of 1200 seconds or more is logged as a warning.
+
 ## Operational checks
 
 1. Verify API liveness via `/health`.

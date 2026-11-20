@@ -18,6 +18,7 @@ from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
 from modules import timing_check as timing_check_module
 from modules.verification_runner import (
+    HungTest,
     VerificationRunResult,
     WatchdogConfig,
     run_verification_test_monitored,
@@ -283,7 +284,7 @@ class VerificationMixin:
 
     def _run_timing_check(
         self, experiment_id: str, worktree_path: str, head_diff: str,
-        elog: ExperimentLogger,
+        elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None,
     ) -> tuple[str, str] | None:
         """Slow-machine check (#689): rerun the affected tests with clock drift.
 
@@ -322,21 +323,26 @@ class VerificationMixin:
             def track(process: subprocess.Popen[str] | None) -> None:
                 self._track_process(experiment_id, process)
 
+            options = {"watchdog": watchdog, "run_id": f"{experiment_id}-timing"} if watchdog else {}
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
-                tails=drift_tails,
+                tails=drift_tails, **options,
             )
             control = None
             flagged = timing_check_module.flagged_tests(result)
             if flagged:
                 # The normal run may have been GitHub CI, so a flag only counts
                 # when the same test passes here without drift.
+                if watchdog is not None:
+                    options["run_id"] = f"{experiment_id}-timing-control"
                 control = timing_check_module.control_check(
                     worktree_path, flagged, on_process=track,
-                    python=self.test_python_executable, tails=control_tails,
+                    python=self.test_python_executable, tails=control_tails, **options,
                 )
                 if control is None:
                     result = "error: control run without drift gave no verdict"
+        except HungTest:
+            raise
         except (KeyboardInterrupt, SystemExit) as exc:
             result, control = f"error: interrupted ({type(exc).__name__})", None
         except Exception as exc:  # noqa: BLE001 - a crashed check is no verdict
@@ -375,6 +381,14 @@ class VerificationMixin:
         return STATUS_NEEDS_REVIEW, error
 
 
+    def _next_verification_iteration(self, experiment_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COALESCE(MAX(iteration), -1) + 1 FROM verification_runs "
+                "WHERE experiment_id = ?", (experiment_id,)
+            ).fetchone()
+        return int(row[0])
+
     def _record_verification_run(
         self, experiment_id: str, iteration: int, status: str,
         command: list[str] | None, exit_code: int | None, output: str | None,
@@ -408,6 +422,7 @@ class VerificationMixin:
         github_work_tracking: Any | None = None,
         repair_iteration: int = 0,
         soft_findings_to_reviewer: bool | None = None,
+        abort_on_test_stall: bool = False,
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
@@ -592,11 +607,22 @@ class VerificationMixin:
                 run_id=experiment_id,
                 config=watchdog,
                 expected_total=expected_total,
+                tests_only_progress=abort_on_test_stall,
                 # Publishing the test heartbeat into this experiment's log keeps the global Nexus
                 # heartbeat alive during a long suite; per-test entries stay in the dedicated test log.
                 on_heartbeat=global_heartbeat_bridge(elog, "verifying"),
                 on_process=lambda process: self._track_process(experiment_id, process),
             )
+            if abort_on_test_stall and test_run.stalled:
+                test_id = test_run.aborted_test_id
+                reason = test_id or "no active unittest reported"
+                self._record_verification_run(
+                    experiment_id, self._next_verification_iteration(experiment_id),
+                    "hung_test", test_command, None,
+                    _truncate_text(test_run.output, self.max_test_output_bytes, label="test output"),
+                    reason,
+                )
+                raise HungTest(reason)
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             test_exit_code = test_run.exit_code
@@ -712,9 +738,17 @@ class VerificationMixin:
             )
         else:
             elog.info("verifying", "tests_passed", "Verification tests passed")
-            timing_failure = self._run_timing_check(
-                experiment_id, worktree_path, diff_proc.stdout, elog,
-            )
+            try:
+                options = {"watchdog": self._get_test_watchdog_config()} if abort_on_test_stall else {}
+                timing_failure = self._run_timing_check(
+                    experiment_id, worktree_path, diff_proc.stdout, elog, **options,
+                )
+            except HungTest as exc:
+                self._record_verification_run(
+                    experiment_id, self._next_verification_iteration(experiment_id),
+                    "hung_test", test_command, None, test_output_capped, str(exc),
+                )
+                raise
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             if timing_failure is not None:
@@ -776,14 +810,9 @@ class VerificationMixin:
                     "Exception while running deterministic quality evaluation", exc=exc,
                 )
 
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COALESCE(MAX(iteration), -1) + 1 FROM verification_runs "
-                "WHERE experiment_id = ?", (experiment_id,)
-            ).fetchone()
         self._record_verification_run(
             experiment_id,
-            int(row[0]),
+            self._next_verification_iteration(experiment_id),
             final_status,
             test_command,
             test_exit_code,
