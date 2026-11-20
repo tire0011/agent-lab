@@ -318,6 +318,8 @@ def run_mailbox_poll_once(
     from modules.experiment_service import ExperimentService
     from modules import mailbox as mailbox_module
     from modules.mailbox import MailboxLock, MailboxProcessor
+    from modules.home_gpu.collect import collect_replies
+    from modules.home_gpu.jobs import home_gpu_enabled
     from .development import install as install_mailbox_development
     from modules.operation_chain_publisher import OperationChainPublisher
     from modules.operation_chain_service import OperationChainService
@@ -470,6 +472,15 @@ def run_mailbox_poll_once(
                 result = MailboxPollRunResult(
                     status=outcome.status, results=outcome.results
                 )
+                if home_gpu_enabled():
+                    try:
+                        collect_replies(mailbox_config.mailbox_repo_path, processor.conn)
+                    except Exception as exc:  # noqa: BLE001 - retry at the next poll
+                        logger.warning(
+                            "Home-GPU reply collection failed run=%s type=%s",
+                            run_name,
+                            type(exc).__name__,
+                        )
         else:
             # A dry run touches neither git nor the inbox, so there is nothing to
             # resync between passes; the rescan still catches a message that lands

@@ -722,6 +722,12 @@ from api_routers import (
 )
 from api_routers import chat as chat_routes
 from api_routers import health as health_routes
+from api_routers import home_gpu as home_gpu_routes
+from api_routers.home_gpu import (
+    HOME_GPU_JOBS_DEFAULT_LIMIT,
+    HOME_GPU_JOBS_MAX_LIMIT,
+    list_home_gpu_jobs,
+)
 from api_routers import ideas as ideas_routes
 from api_routers import status as status_routes
 
@@ -885,6 +891,7 @@ _include_router(ideas_routes.router)
 _include_router(chat_routes.router)
 _include_router(codex.router)
 _include_router(mailbox.router)
+_include_router(home_gpu_routes.router)
 _include_router(experiments.router)
 _include_router(logs.router)
 _include_router(experiments.adoption_router)
