@@ -43,6 +43,9 @@ LIMIT_MESSAGES = (
     "insufficient_quota",  # OpenAI
     "Error code: 429 - {'error': {'code': 'insufficient_quota'}}",
     "quota exceeded for model gpt-5-codex; try again at 2026-11-18T14:00:00Z",
+    "http_402; GitHub checkpoint failed: implementation produced no publishable source/test/documentation changes",  # Mistral, 2026-11-20
+    "Error: 402 Payment Required",
+    "insufficient credits on this API key",
 )
 NORMAL_FAILURES = (
     "tests failed (exit code 1): tests/test_a.py::test_rate_limit_resets",
@@ -51,6 +54,7 @@ NORMAL_FAILURES = (
     "implementation phase timed out",
     "Claude produced no parseable result object",
     "verification failed: AssertionError: limit must be positive",
+    "tests failed (exit code 1): tests/test_issue_402_widgets.py::test_payment",
 )
 NOW = datetime(2026, 11, 18, 8, 0, tzinfo=timezone.utc)
 ISSUE = [{"number": 745, "author": {"login": "tire0011"}, "title": "Gate preflight", "body": ""}]
