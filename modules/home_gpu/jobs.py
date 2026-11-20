@@ -7,6 +7,7 @@ copy::
     type: batch_job
     to: home-gpu
     created_by: nexus
+    id: <job_id>
     job_id: <job_id>
     kind: <kind>
     deadline: <ISO UTC>
@@ -32,11 +33,13 @@ import json
 import os
 import re
 import uuid
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from modules import run_store
 from modules.mailbox import core as mailbox_core
 
 ENV_FLAG = "NEXUS_HOME_GPU"
@@ -168,6 +171,7 @@ def submit_job(
     *,
     mailbox_dir: Path | str,
     commit: bool,
+    db_path: str | Path | None = None,
 ) -> SubmittedJob:
     """Write a ``batch_job`` for the home GPU into ``<mailbox_dir>/inbox``.
 
@@ -202,6 +206,7 @@ def submit_job(
         f"type: {JOB_TYPE}\n"
         f"to: {RECIPIENT}\n"
         f"created_by: {CREATED_BY}\n"
+        f"id: {job_id}\n"
         f"job_id: {job_id}\n"
         f"kind: {kind}\n"
         f"deadline: {deadline}\n"
@@ -213,7 +218,19 @@ def submit_job(
     inbox = repo / "inbox"
     inbox.mkdir(exist_ok=True)
     path = inbox / f"{job_id}.md"
-    mailbox_core._atomic_write(path, content)
+    with closing(run_store.init_db(db_path)) as db, db:
+        db.execute(
+            """INSERT INTO home_gpu_jobs
+               (job_id, kind, status, submitted_at, deadline, input_sha256)
+               VALUES (?, ?, 'queued', ?, ?, ?)""",
+            (job_id, kind, _iso(now), deadline, digest),
+        )
+        try:
+            mailbox_core._atomic_write(path, content)
+            db.commit()
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
 
     committed = pushed = False
     if commit:

@@ -378,6 +378,16 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(description="GET /home-gpu/jobs", structured_output=True)
+    def home_gpu_jobs_list(limit: int | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        if limit is None:
+            limit = nexus_api.HOME_GPU_JOBS_DEFAULT_LIMIT
+        limit = _validate_limit(
+            limit, minimum=nexus_api.LIMIT_MIN, maximum=nexus_api.HOME_GPU_JOBS_MAX_LIMIT
+        )
+        return _call_api(nexus_api.list_home_gpu_jobs, x_api_key=_internal_api_key(), limit=limit)
+
     @mcp.tool(description="GET /experiments", structured_output=True)
     def experiments_list(limit: int | None = None) -> dict[str, Any]:
         nexus_api = _api()
