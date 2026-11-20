@@ -151,6 +151,8 @@ os.environ["AGENT_CODEX_BIN"] = str(Path(_LOG_DIR) / "no-codex-binary-in-tests")
 # finds nothing installed and falls back to codex, which keeps the suite
 # deterministic as well.
 os.environ["AGENT_CLAUDE_BIN"] = str(Path(_LOG_DIR) / "no-claude-binary-in-tests")
+# Same for the Mistral Vibe CLI: a test must never start the real `vibe`.
+os.environ["AGENT_VIBE_BIN"] = str(Path(_LOG_DIR) / "no-vibe-binary-in-tests")
 
 # Same isolation for the local model server: llama-server runs on the VM, so
 # an accidentally default-constructed client can otherwise make a real request
