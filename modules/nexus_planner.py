@@ -14,6 +14,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -232,16 +233,23 @@ def _one_line(value: Any, limit: int) -> str:
     return " ".join(str(value or "").split())[:limit]
 
 
-def _compact_issue_line(issue: dict[str, Any]) -> str:
+def _attempts_left(issue: dict[str, Any]) -> int | None:
     left = issue.get("attempts_left")
+    if isinstance(left, bool) or not isinstance(left, (int, float)) or left != left:
+        return None
+    return max(0, int(min(left, 1_000_000)))
+
+
+def _compact_issue_line(issue: dict[str, Any]) -> str:
+    left = _attempts_left(issue)
     tags = []
-    if left is not None and int(left) <= 0:
+    if left is not None and left <= 0:
         tags.append("out-of-attempts")
     if issue.get("review_blocked"):
         tags.append("blocked-by-review")
-    line = f"#{issue['number']} {_one_line(issue.get('title'), _COMPACT_TITLE_CHARS)}"
+    line = f"#{int(issue['number'])} {_one_line(issue.get('title'), _COMPACT_TITLE_CHARS)}"
     if left is not None:
-        line += f" | attempts left: {max(0, int(left))}"
+        line += f" | attempts left: {left}"
     return line + "".join(f" [{tag}]" for tag in tags)
 
 
@@ -254,12 +262,110 @@ def _compact_recent_line(r: dict[str, Any]) -> str:
     return _one_line(f"- {outcome}: {r.get('title', '')}", _COMPACT_LINE_CHARS)
 
 
+class ShadowPromptBudgetError(ValueError):
+    """Not even the fixed header and one selectable issue fit the budget."""
+
+    def __init__(self, needed: int, budget: int) -> None:
+        super().__init__(
+            f"prompt budget too small: needs at least {needed} tokens, budget {budget}")
+        self.needed = needed
+        self.budget = budget
+
+
+@dataclass(frozen=True, slots=True)
+class CompactShortlist:
+    prompt: str
+    selectable: frozenset[int]  # listed in the prompt and allowed as the answer
+    listed: tuple[int, ...]  # every issue number in the prompt, oldest first
+    tokens: int
+
+
+def compact_shortlist(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, Any]] | None,
+    stuck_measurements: list[str] | None,
+    budget_left: int | None,
+    max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+    *,
+    exhausted: list[dict[str, Any]] | None = None,
+    eligible: set[int] | None = None,
+) -> CompactShortlist:
+    """The compact prompt and the issues it lets the local model choose (#770).
+
+    *issues* are the open issues the planner may pick; *exhausted* are open
+    issues out of attempts, shown as context with the ``out-of-attempts`` tag
+    and never selectable. Selectable means: listed in the prompt, in
+    *eligible* (default: every number in *issues*) and not out of attempts.
+
+    The result never exceeds *max_tokens* (bytes/4). Trimming order: the
+    oldest issue lines (the last selectable one is always kept), then the
+    oldest experiment outcomes, then the stuck-measurement lines. When the
+    fixed header with one selectable issue still does not fit, or nothing is
+    selectable, :class:`ShadowPromptBudgetError` is raised.
+    """
+    max_tokens = int(max_tokens)
+    if eligible is None:
+        eligible = {int(i["number"]) for i in issues}
+    by_number: dict[int, tuple[str, bool]] = {}
+    for item in exhausted or []:
+        number = int(item["number"])
+        by_number[number] = (_compact_issue_line({**item, "attempts_left": 0}), False)
+    for item in issues:  # an issue the planner may pick wins over a stale exhausted entry
+        number = int(item["number"])
+        left = _attempts_left(item)
+        by_number[number] = (_compact_issue_line(item),
+                             number in eligible and (left is None or left > 0))
+    entries = [(n, *by_number[n]) for n in sorted(by_number)]
+    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
+    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
+    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
+
+    def build(kept: list[tuple[int, str, bool]], recent_kept: list[str],
+              stuck_kept: list[str]) -> str:
+        return (
+            _COMPACT_HEADER
+            + "OPEN ISSUES:\n" + "\n".join(line for _, line, _ in kept) + "\n\n"
+            + "RECENT EXPERIMENTS:\n" + ("\n".join(recent_kept) or "(none yet)") + "\n\n"
+            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_kept) or "(none)") + "\n\n"
+            + f"Paid starts left today: {budget}\n"
+        )
+
+    if not any(selectable for _, _, selectable in entries):
+        raise ShadowPromptBudgetError(estimate_tokens(build([], [], [])), max_tokens)
+
+    def fits() -> bool:
+        return estimate_tokens(build(entries, recent_lines, stuck_lines)) <= max_tokens
+
+    while not fits():
+        selectable_left = sum(1 for _, _, sel in entries if sel)
+        drop = next((i for i, (_, _, sel) in enumerate(entries)
+                     if not sel or selectable_left > 1), None)
+        if drop is not None and len(entries) > 1:
+            del entries[drop]
+        elif recent_lines:
+            recent_lines.pop()  # newest first: the oldest outcome goes first
+        elif stuck_lines:
+            stuck_lines.pop()
+        else:
+            raise ShadowPromptBudgetError(
+                estimate_tokens(build(entries, [], [])), max_tokens)
+    prompt = build(entries, recent_lines, stuck_lines)
+    return CompactShortlist(
+        prompt=prompt,
+        selectable=frozenset(n for n, _, sel in entries if sel),
+        listed=tuple(n for n, _, _ in entries),
+        tokens=estimate_tokens(prompt),
+    )
+
+
 def compact_planning_prompt(
     issues: list[dict[str, Any]],
     recent: list[dict[str, Any]] | None,
     stuck_measurements: list[str] | None,
     budget_left: int | None,
     max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+    *,
+    exhausted: list[dict[str, Any]] | None = None,
 ) -> str:
     """A short planning prompt for the local model (#770).
 
@@ -268,29 +374,10 @@ def compact_planning_prompt(
     fixed header comes first and the lines that change from tick to tick come
     last, so the server's prompt cache can reuse the prefix. The oldest
     (lowest numbered) issues are dropped first until the bytes/4 estimate fits
-    *max_tokens*; the newest issue is always kept.
+    *max_tokens*; see :func:`compact_shortlist` for the strict bound.
     """
-    ordered = sorted(issues, key=lambda i: int(i["number"]))
-    issue_lines = [_compact_issue_line(i) for i in ordered]
-    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
-    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
-    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
-
-    def build(kept: list[str]) -> str:
-        return (
-            _COMPACT_HEADER
-            + "OPEN ISSUES:\n" + "\n".join(kept) + "\n\n"
-            + "RECENT EXPERIMENTS:\n" + ("\n".join(recent_lines) or "(none yet)") + "\n\n"
-            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_lines) or "(none)") + "\n\n"
-            + f"Paid starts left today: {budget}\n"
-        )
-
-    start = 0
-    prompt = build(issue_lines)
-    while estimate_tokens(prompt) > max_tokens and start < len(issue_lines) - 1:
-        start += 1
-        prompt = build(issue_lines[start:])
-    return prompt
+    return compact_shortlist(issues, recent, stuck_measurements, budget_left, max_tokens,
+                             exhausted=exhausted).prompt
 
 
 def shadow_response_format(allowed: set[int]) -> dict[str, Any]:
@@ -451,6 +538,119 @@ def parse_choice(raw: str, allowed: set[int], splittable: set[int] | None = None
     return choice
 
 
+SHADOW_MONITOR_THREAD = "planner-shadow-monitor"
+_SHADOW_CALL_THREAD = "planner-shadow-call"
+_SQLITE_MAX_INT = 2 ** 63 - 1
+
+
+def _sqlite_int(value: Any) -> int | None:
+    """*value* as a non-negative SQLite integer, or ``None`` when it is not one."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            return None
+        value = int(value)
+    if isinstance(value, int) and 0 <= value <= _SQLITE_MAX_INT:
+        return value
+    return None
+
+
+def _cached_tokens(value: Any) -> int | None:
+    return _sqlite_int(value)
+
+
+def _finite_rates(rates: Any) -> tuple[float | None, float | None]:
+    try:
+        prompt_tps, gen_tps = rates
+    except (TypeError, ValueError):
+        return None, None
+
+    def clean(value: Any) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) and value > 0 else None
+
+    return clean(prompt_tps), clean(gen_tps)
+
+
+def _describe_failure(exc: BaseException) -> str:
+    try:
+        text = f"{type(exc).__name__}: {exc}"
+    except Exception:  # noqa: BLE001 - a broken __str__ must not lose the row
+        text = type(exc).__name__
+    return text[:500]
+
+
+_SHADOW_FIELDS = frozenset({"issue", "reason"})
+
+
+def validate_shadow_answer(answer: Any, allowed: set[int] | frozenset[int]
+                           ) -> tuple[int | None, bool, str | None]:
+    """``(local_issue, valid, error)`` for one local answer (#770).
+
+    The answer must be exactly ``{"issue": <int>, "reason": <str>}``: the issue
+    a JSON integer (not a boolean, not a fraction) in *allowed*, the reason a
+    non-empty string of at most 160 characters, no other fields. A disallowed
+    integer is kept as ``local_issue`` with ``issue is not allowed``.
+    """
+    if not isinstance(answer, str):
+        return None, False, "invalid JSON"
+    data = _json_object(answer)
+    if data is None:
+        return None, False, "invalid JSON"
+    raw_issue = data.get("issue")
+    if isinstance(raw_issue, bool) or not isinstance(raw_issue, int):
+        return None, False, "invalid issue"
+    if not -_SQLITE_MAX_INT - 1 <= raw_issue <= _SQLITE_MAX_INT:  # cannot be stored
+        return None, False, "invalid issue"
+    issue = raw_issue
+    if issue not in allowed:
+        return issue, False, "issue is not allowed"
+    reason = data.get("reason")
+    if not isinstance(reason, str) or not reason.strip():
+        return issue, False, "invalid reason"
+    if len(reason) > _SHADOW_REASON_CHARS:
+        return issue, False, "reason too long"
+    if set(data) != _SHADOW_FIELDS:
+        return issue, False, "unexpected fields"
+    return issue, True, None
+
+
+def _store_shadow(db_path: str, row_id: int | None, values: dict[str, Any]) -> None:
+    """Persist one outcome: fill the pending row, or insert when there is none."""
+    try:
+        from modules.planner_shadow import finish, record
+
+        if row_id is not None:
+            outcome = {key: values[key] for key in (
+                "local_issue", "local_valid", "prompt_tokens", "seconds", "error",
+                "cached_prompt_tokens")}
+            if not finish(db_path, row_id, **outcome):
+                logger.warning("planner shadow: row %s was already finished", row_id)
+        else:
+            record(db_path, **values)
+    except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+        logger.warning("planner shadow: could not store result: %s", exc)
+
+
+def wait_for_shadow(max_seconds: float = _SHADOW_TIMEOUT_CAP + 2 * _SHADOW_JOIN_GRACE) -> int:
+    """Keep the process alive until running shadow monitors stored their outcome.
+
+    The tick runs as a oneshot unit whose exit ends daemon threads (#770).
+    Each monitor ends within its own timeout, so this waits at most
+    *max_seconds*; the planning decision never waits on it. Returns how many
+    monitors were still running when the wait gave up.
+    """
+    deadline = time.monotonic() + max(0.0, max_seconds)
+    for thread in threading.enumerate():
+        if thread.name == SHADOW_MONITOR_THREAD and thread is not threading.current_thread():
+            thread.join(max(0.0, deadline - time.monotonic()))
+    return sum(1 for t in threading.enumerate()
+               if t.name == SHADOW_MONITOR_THREAD and t.is_alive())
+
+
 class IssuePlanner:
     """Ask a model which open issue comes next.
 
@@ -527,22 +727,50 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = compact_planning_prompt(
-            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
-            max_tokens=_shadow_prompt_budget(),
-        )
-        prompt_tokens = estimate_tokens(prompt)
-        response_format = shadow_response_format(allowed)
+        db_path = self._db_path
+        budget = _shadow_prompt_budget()
+        try:
+            shortlist = compact_shortlist(
+                issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
+                max_tokens=budget, exhausted=context.get("exhausted"), eligible=allowed,
+            )
+        except ShadowPromptBudgetError as exc:
+            # Nothing that fits can be asked: recorded, the model is not called.
+            _store_shadow(db_path, None, dict(
+                tick_id=tick_id, paid_issue=paid_issue, local_issue=None, local_valid=0,
+                prompt_tokens=exc.needed, seconds=0.0, error=str(exc)[:500],
+                prompt_variant=COMPACT_PROMPT_VARIANT, cached_prompt_tokens=None))
+            return
+        prompt = shortlist.prompt
+        prompt_tokens = shortlist.tokens
+        # The enum, the prompt and the validation all use this one set.
+        selectable = set(shortlist.selectable)
+        response_format = shadow_response_format(selectable)
         shadow = self._shadow
+        row_ids: list[int | None] = [None]
 
         def monitor() -> None:
+            # The pending row is written here, not on the tick's thread, so a
+            # locked database never delays the planning decision.
+            try:
+                from modules.planner_shadow import begin
+
+                row_ids[0] = begin(
+                    db_path, tick_id=tick_id, paid_issue=paid_issue,
+                    prompt_tokens=prompt_tokens, prompt_variant=COMPACT_PROMPT_VARIANT)
+            except Exception as exc:  # noqa: BLE001 - the outcome is stored at the end instead
+                logger.warning("planner shadow: could not store the pending row: %s", exc)
+            row_id = row_ids[0]
             rates: tuple[float | None, float | None] = (None, None)
             if self._shadow_rates is not None:
                 try:
                     rates = self._shadow_rates()
                 except Exception as exc:  # noqa: BLE001 - unknown rates use the fallback
                     logger.warning("planner shadow: could not read local rates: %s", exc)
-            timeout = shadow_timeout(prompt_tokens, rates[0], rates[1], self._shadow_timeout)
+            try:
+                timeout = shadow_timeout(prompt_tokens, *_finite_rates(rates), self._shadow_timeout)
+            except Exception:  # noqa: BLE001 - malformed rates use the fallback
+                timeout = min(_SHADOW_TIMEOUT_CAP, float(self._shadow_timeout))
             result: list[Any] = []
             failure: list[BaseException] = []
 
@@ -557,48 +785,35 @@ class IssuePlanner:
                     failure.append(exc)
 
             started = time.monotonic()
-            worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
+            worker = threading.Thread(target=call, name=_SHADOW_CALL_THREAD, daemon=True)
             worker.start()
             # A short grace lets the client's own timeout error (with its rates) arrive.
             worker.join(timeout + min(_SHADOW_JOIN_GRACE, 0.1 * timeout))
             elapsed = time.monotonic() - started
-            local_issue: int | None = None
-            valid = False
-            error: str | None = None
             cached: int | None = None
             if worker.is_alive():
-                error = f"timeout after {timeout:g}s"
+                local_issue, valid, error = None, False, f"timeout after {timeout:g}s"
             elif failure:
-                error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
+                local_issue, valid, error = None, False, _describe_failure(failure[0])
             else:
                 answer = result[0] if result else ""
                 if isinstance(answer, dict):
-                    raw_cached = answer.get("tokens_cached")
-                    if isinstance(raw_cached, (int, float)) and not isinstance(raw_cached, bool):
-                        cached = int(raw_cached)
-                    answer = answer.get("content") or ""
-                data = _json_object(str(answer or ""))
-                if data is None:
-                    error = "invalid JSON"
-                else:
-                    try:
-                        local_issue = int(data.get("issue"))
-                    except (TypeError, ValueError):
-                        error = "invalid issue"
-                    else:
-                        valid = local_issue in allowed
-                        if not valid:
-                            error = "issue is not allowed"
-            try:
-                from modules.planner_shadow import record
-                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
-                       local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
-                       prompt_variant=COMPACT_PROMPT_VARIANT, cached_prompt_tokens=cached)
-            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
-                logger.warning("planner shadow: could not store result: %s", exc)
+                    cached = _cached_tokens(answer.get("tokens_cached"))
+                    answer = answer.get("content")
+                local_issue, valid, error = validate_shadow_answer(answer, selectable)
+            _store_shadow(db_path, row_id, dict(
+                tick_id=tick_id, paid_issue=paid_issue, local_issue=local_issue,
+                local_valid=int(valid), prompt_tokens=prompt_tokens, seconds=elapsed,
+                error=error, prompt_variant=COMPACT_PROMPT_VARIANT,
+                cached_prompt_tokens=cached))
 
-        threading.Thread(target=monitor, name="planner-shadow", daemon=True).start()
+        try:
+            threading.Thread(target=monitor, name=SHADOW_MONITOR_THREAD, daemon=True).start()
+        except Exception as exc:  # noqa: BLE001 - e.g. no thread left: record, never raise
+            _store_shadow(db_path, None, dict(
+                tick_id=tick_id, paid_issue=paid_issue, local_issue=None, local_valid=0,
+                prompt_tokens=prompt_tokens, seconds=0.0, error=_describe_failure(exc),
+                prompt_variant=COMPACT_PROMPT_VARIANT, cached_prompt_tokens=None))
 
     @staticmethod
     def _ask(model: Callable[[str], str], prompt: str, allowed: set[int],

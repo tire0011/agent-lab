@@ -449,6 +449,25 @@ def _wait_for_experiments(service=None) -> None:
                     _sweep_stalled_experiments(service)
 
 
+def _wait_for_planner_shadow() -> None:
+    """Let a running local planner shadow store its outcome before exit (#770).
+
+    The planning decision never waits on the shadow; only the process stays
+    alive, at most the shadow's own timeout, so a tick that ends quickly still
+    records the result or the timeout. It also ends before the shadow replay
+    asks whether the local server is idle.
+    """
+    from modules.nexus_planner import wait_for_shadow
+
+    try:
+        left = wait_for_shadow()
+    except Exception as exc:  # noqa: BLE001 - never fails the tick
+        logger.warning("could not wait for the planner shadow: %s", exc)
+        return
+    if left:
+        logger.warning("planner shadow still running at exit; its row is finished as interrupted later")
+
+
 def _shadow_replay(repo_root: str, db_path: str) -> None:
     """One local shadow replay of a merged paid experiment (#637), best effort.
 
@@ -670,6 +689,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if decision.decision != "error" else 1
     finally:
         _wait_for_experiments(None if args.dry_run else service)
+        _wait_for_planner_shadow()
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
             if not args.integration_only:

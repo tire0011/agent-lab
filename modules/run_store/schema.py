@@ -347,7 +347,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT,
             created_at TEXT,
             prompt_variant TEXT,
-            cached_prompt_tokens INTEGER
+            cached_prompt_tokens INTEGER,
+            status TEXT
         );
 
         CREATE TABLE IF NOT EXISTS local_localizations (
