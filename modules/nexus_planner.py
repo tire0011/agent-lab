@@ -500,15 +500,15 @@ class IssuePlanner:
             '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
             'object with only {"issue": <number>, "reason": "<short reason>"}.'
         )
-        # #790 (part 1b of #781): the shadow gets the compact prompt, capped by
-        # NEXUS_PLANNER_SHADOW_PROMPT_TOKENS. The paid prompt above is untouched.
+        # Reserve the suffix's UTF-8 bytes, rounding up to whole estimated tokens.
         try:
-            shadow_max_tokens = int(os.environ.get("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS") or 1500)
-        except (TypeError, ValueError):
-            shadow_max_tokens = 1500
+            shadow_max_tokens = int(os.environ.get("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS")
+                                    or DEFAULT_SHADOW_PROMPT_TOKENS)
+        except ValueError:
+            shadow_max_tokens = DEFAULT_SHADOW_PROMPT_TOKENS
         compact = compact_planning_prompt(
             issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
-            max_tokens=shadow_max_tokens,
+            max_tokens=shadow_max_tokens - estimate_tokens(shadow_instructions),
         )
         if compact is None:
             # Over budget even after trimming: record the skip synchronously and

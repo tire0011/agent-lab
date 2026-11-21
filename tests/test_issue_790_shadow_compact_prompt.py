@@ -2,7 +2,7 @@
 
 Part 1b of #781: the shadow callable gets ``compact_planning_prompt(...)`` plus
 the fixed shadow-instruction suffix, capped by ``NEXUS_PLANNER_SHADOW_PROMPT_TOKENS``
-(default 1500 tokens, i.e. at most 4*1500 utf-8 bytes for the compact part).
+(default 1500 tokens, i.e. at most 6000 UTF-8 bytes including the suffix).
 When even the trimmed compact prompt does not fit, no model call is made and
 one ``planner_shadow`` row with ``error="skipped: prompt_over_budget"`` is
 written synchronously. The paid planner prompt stays byte-for-byte what main
@@ -11,6 +11,7 @@ renders for the same input.
 
 import hashlib
 import os
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -59,6 +60,10 @@ class ShadowCompactPromptTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.db = str(Path(self.tmp.name) / "agent.db")
+        env = patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS", None)
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -79,44 +84,49 @@ class ShadowCompactPromptTests(unittest.TestCase):
         suffix_bytes = len(SHADOW_INSTRUCTIONS.encode("utf-8"))
         suffix_tokens = estimate_tokens(SHADOW_INSTRUCTIONS)
         received = []
+        issues = many_issues(80)
+        for issue in issues:
+            issue["title"] = "界" * 14
+        outcomes = nine_outcomes()
+        cap = 4 * DEFAULT_SHADOW_PROMPT_TOKENS
+        unreserved = compact_planning_prompt(issues, outcomes, [], 3)
+        self.assertGreater(len(unreserved.encode("utf-8")) + suffix_bytes, cap)
 
         def fake_shadow(prompt):
             received.append(prompt)
-            return '{"issue": 101, "reason": "local"}'
+            return '{"issue": 179, "reason": "local"}'
 
         # A fresh temp db has no health rows, so stuck_measurements is empty.
         choice = self.planner(fake_shadow, paid=PAID_MANY).choose(
-            many_issues(), nine_outcomes(), budget_left=3, tick_id="tick-bytes")
+            issues, outcomes, budget_left=3, tick_id="tick-bytes")
         self.assertEqual(choice.issue, 139)
         row = self.wait_for_row()  # the shadow runs on a background thread
         self.assertEqual(len(received), 1)
         prompt = received[0]
         # The whole prompt the local model reads stays within 4*1500 bytes.
-        self.assertLessEqual(len(prompt.encode("utf-8")), 4 * DEFAULT_SHADOW_PROMPT_TOKENS)
-        self.assertLessEqual(estimate_tokens(prompt), DEFAULT_SHADOW_PROMPT_TOKENS + suffix_tokens)
+        self.assertLessEqual(len(prompt.encode("utf-8")), cap)
         # Compact prompt first (fixed header), then the shadow instructions.
         self.assertTrue(prompt.startswith(HEADER))
         self.assertTrue(prompt.endswith(SHADOW_INSTRUCTIONS))
         compact = prompt[: -len(SHADOW_INSTRUCTIONS)]
-        self.assertEqual(compact, compact_planning_prompt(many_issues(), nine_outcomes(), [], 3))
-        self.assertLessEqual(len(compact.encode("utf-8")), 4 * DEFAULT_SHADOW_PROMPT_TOKENS)
+        self.assertEqual(compact, compact_planning_prompt(
+            issues, outcomes, [], 3, DEFAULT_SHADOW_PROMPT_TOKENS - suffix_tokens))
         # No paid-prompt content leaks into the shadow prompt.
         self.assertNotIn("body text", compact)  # no issue bodies
         self.assertNotIn("You are Nexus, an independent agent", prompt)  # no DEFAULT_MISSION
         self.assertNotIn("boom " * 100, prompt)  # outcome errors are cut
         self.assertEqual(row["tick_id"], "tick-bytes")
         self.assertEqual(row["paid_issue"], 139)
-        self.assertEqual(row["local_issue"], 101)
+        self.assertEqual(row["local_issue"], 179)
         self.assertEqual(row["local_valid"], 1)
         self.assertIsNone(row["error"])
         # prompt_tokens reflects the compact shadow prompt that was sent.
         self.assertEqual(row["prompt_tokens"], estimate_tokens(prompt))
-        self.assertLessEqual(row["prompt_tokens"], DEFAULT_SHADOW_PROMPT_TOKENS + suffix_tokens)
+        self.assertLessEqual(row["prompt_tokens"], DEFAULT_SHADOW_PROMPT_TOKENS)
 
     def test_env_token_budget_shrinks_the_shadow_prompt(self):
-        suffix_tokens = estimate_tokens(SHADOW_INSTRUCTIONS)
         received = []
-        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "200"}):
+        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "250"}):
             choice = self.planner(
                 lambda p: received.append(p) or '{"issue": 139, "reason": "x"}',
                 paid=PAID_MANY,
@@ -124,7 +134,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         self.assertEqual(choice.issue, 139)
         row = self.wait_for_row()  # the shadow runs on a background thread
         self.assertEqual(len(received), 1)
-        self.assertLessEqual(estimate_tokens(received[0]), 200 + suffix_tokens)
+        self.assertLessEqual(len(received[0].encode("utf-8")), 4 * 250)
         self.assertEqual(row["prompt_tokens"], estimate_tokens(received[0]))
         self.assertIsNone(row["error"])
 
@@ -146,7 +156,44 @@ class ShadowCompactPromptTests(unittest.TestCase):
         self.assertIsNone(row["local_issue"])
         self.assertEqual(row["local_valid"], 0)
         self.assertEqual(row["error"], "skipped: prompt_over_budget")
+        self.assertEqual(row["prompt_tokens"], 0)
         self.assertEqual(row["seconds"], 0.0)
+
+    def test_interrupted_insert_rolls_back_and_replaying_tick_keeps_one_skip(self):
+        called = []
+        list_shadow(self.db)  # Create the table before adding a failure trigger.
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("""
+                CREATE TRIGGER interrupt_shadow AFTER INSERT ON planner_shadow
+                BEGIN SELECT RAISE(ABORT, 'interrupted write'); END
+            """)
+        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
+            planner = self.planner(lambda p: called.append(p) or "{}")
+            with self.assertLogs(nexus_planner.logger, level="WARNING") as logs:
+                self.assertEqual(planner.choose(ISSUES, tick_id="replay").issue, 2)
+            self.assertIn("interrupted write", logs.output[0])
+            self.assertEqual(list_shadow(self.db)["rows"], [])
+            with sqlite3.connect(self.db) as conn:
+                conn.execute("DROP TRIGGER interrupt_shadow")
+            self.assertEqual(planner.choose(ISSUES, tick_id="replay").issue, 2)
+            saved = list_shadow(self.db)["rows"]
+            self.assertEqual(len(saved), 1)
+            self.assertEqual(saved[0]["error"], "skipped: prompt_over_budget")
+            self.assertEqual(planner.choose(ISSUES, tick_id="replay").issue, 2)
+        self.assertEqual(list_shadow(self.db)["rows"], saved)
+        self.assertEqual(called, [])
+
+    def test_shadow_worker_exit_records_a_complete_failure_row(self):
+        def exiting_shadow(_):
+            raise SystemExit("worker interrupted")
+
+        self.assertEqual(self.planner(exiting_shadow).choose(ISSUES, tick_id="exit").issue, 2)
+        row = self.wait_for_row()
+        self.assertEqual(row["tick_id"], "exit")
+        self.assertEqual(row["error"], "SystemExit: worker interrupted")
+        self.assertIsNone(row["local_issue"])
+        self.assertEqual(row["local_valid"], 0)
+        self.assertEqual(list_shadow(self.db)["count"], 1)
 
     def test_default_budget_never_writes_a_skip_row(self):
         with patch.dict(os.environ, {}, clear=False):
@@ -183,10 +230,12 @@ class PaidPromptUnchangedTests(unittest.TestCase):
         paid_prompts = []
         planner = IssuePlanner(
             lambda p: paid_prompts.append(p) or PAID_SNAP,
-            shadow=lambda p: '{"issue": 11, "reason": "local"}',
+            shadow=lambda _: self.fail("over-budget shadow should be skipped"),
             db_path=db,
         )
-        choice = planner.choose(self.ISSUES, self.RECENT, tick_id="tick-snap", **self.CONTEXT)
+        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "1",
+                                     "NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
+            choice = planner.choose(self.ISSUES, self.RECENT, tick_id="tick-snap", **self.CONTEXT)
         self.assertEqual(choice.issue, 12)
         self.assertEqual(len(paid_prompts), 1)
         # A fresh db has no stuck measurements, exactly like the snapshot input.

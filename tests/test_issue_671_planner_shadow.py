@@ -3,7 +3,9 @@ import sqlite3
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 from unittest.mock import patch
 
 from modules.nexus_planner import IssuePlanner
@@ -72,13 +74,33 @@ class PlannerShadowTests(unittest.TestCase):
         self.assertIn("timeout", self.wait_for_row()["error"])
 
     def test_summary_rates(self):
-        for values in ((1, 1, 1, .1), (2, 1, 1, .3), (1, 99, 0, .2)):
-            record(self.db, tick_id="t", paid_issue=values[0], local_issue=values[1],
+        for tick, values in enumerate(((1, 1, 1, .1), (2, 1, 1, .3), (1, 99, 0, .2))):
+            record(self.db, tick_id=f"tick-{tick}", paid_issue=values[0], local_issue=values[1],
                    local_valid=values[2], prompt_tokens=10, seconds=values[3], error=None)
         summary = list_shadow(self.db)["summary"]
         self.assertEqual(summary["agreement"], .5)
         self.assertAlmostEqual(summary["valid_share"], 2 / 3)
         self.assertEqual(summary["median_seconds"], .2)
+
+    def test_concurrent_result_and_skip_for_one_tick_store_one_complete_row(self):
+        ready = Barrier(2, timeout=2)
+        result = dict(local_issue=1, local_valid=1, prompt_tokens=100, seconds=0.1, error=None)
+        skip = dict(local_issue=None, local_valid=0, prompt_tokens=0, seconds=0.0,
+                    error="skipped: prompt_over_budget")
+
+        def write(values):
+            ready.wait()
+            record(self.db, tick_id="replayed-tick", paid_issue=2, **values)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(write, (result, skip)))
+
+        rows = list_shadow(self.db)["rows"]
+        self.assertEqual(len(rows), 1)
+        self.assertIn(rows[0], [
+            dict(tick_id="replayed-tick", paid_issue=2, **values)
+            for values in (result, skip)
+        ])
 
     def test_zero_disables_shadow_call(self):
         called = []
