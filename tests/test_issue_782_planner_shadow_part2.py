@@ -81,7 +81,7 @@ class ShadowPart2Tests(unittest.TestCase):
     def test_schema_enum_is_exactly_the_allowed_set(self):
         calls = []
 
-        def fake_shadow(prompt, response_format, timeout):
+        def fake_shadow(prompt, response_format, deadline):
             calls.append((prompt, response_format))
             return '{"issue": 3, "reason": "local pick"}'
 
@@ -120,7 +120,7 @@ class ShadowPart2Tests(unittest.TestCase):
         # The schema cannot be produced by a conforming server, but the fake
         # returns a disallowed number anyway: it must still be recorded as
         # invalid with the "issue is not allowed" error.
-        def fake_shadow(prompt, response_format, timeout):
+        def fake_shadow(prompt, response_format, deadline):
             return '{"issue": 99, "reason": "not on the list"}'
 
         self.planner(fake_shadow).choose(ISSUES, tick_id="tick-99")
@@ -144,7 +144,7 @@ class ShadowPart2Tests(unittest.TestCase):
         self.assertIsNone(row["cached_prompt_tokens"])
 
     def test_cached_prompt_tokens_from_the_shadow_answer_are_stored(self):
-        def fake_shadow(prompt, response_format, timeout):
+        def fake_shadow(prompt, response_format, deadline):
             return {"content": '{"issue": 3, "reason": "cached prefix reused"}',
                     "cached_prompt_tokens": 812}
 
@@ -241,9 +241,11 @@ class ShadowTimeoutTests(unittest.TestCase):
 
         release = threading.Event()
 
-        def slow_shadow(prompt, response_format, timeout):
-            release.wait(30)  # blocked until the test has seen the row
-            return "{}"
+        def slow_shadow(prompt, response_format, deadline):
+            # Blocked until the shared deadline, then gives up like the
+            # production call (which cancels its request at the deadline).
+            release.wait(max(0.0, deadline - time.monotonic()) + 0.01)
+            raise TimeoutError("deadline")
 
         rates = FakeRates(10.0, 20.0)
         planner = IssuePlanner(lambda _: PAID, shadow=slow_shadow, db_path=self.db,
@@ -272,9 +274,9 @@ class ShadowTimeoutTests(unittest.TestCase):
 
         release = threading.Event()
 
-        def slow_shadow(prompt, response_format, timeout):
-            release.wait(30)
-            return "{}"
+        def slow_shadow(prompt, response_format, deadline):
+            release.wait(max(0.0, deadline - time.monotonic()) + 0.01)
+            raise TimeoutError("deadline")
 
         # Huge rates give ~10 s; the constructor cap brings it to 0.05 s.
         planner = IssuePlanner(lambda _: PAID, shadow=slow_shadow, db_path=self.db,
@@ -375,8 +377,8 @@ class ShadowDeadlineTests(_ShadowCase):
     def test_callable_receives_the_computed_budget(self):
         seen = []
 
-        def fake_shadow(prompt, response_format, timeout):
-            seen.append(timeout)
+        def fake_shadow(prompt, response_format, deadline):
+            seen.append(deadline - time.monotonic())
             return '{"issue": 3, "reason": "ok"}'
 
         IssuePlanner(lambda _: PAID, shadow=fake_shadow, db_path=self.db,
@@ -385,16 +387,18 @@ class ShadowDeadlineTests(_ShadowCase):
         self.wait_for_row()
         # prompt part ~0, 120 / 20 = 6, slack 10.
         self.assertEqual(len(seen), 1)
-        self.assertAlmostEqual(seen[0], 16.0, places=3)
+        self.assertAlmostEqual(seen[0], 16.0, delta=1.0)
 
     def test_callable_budget_is_the_capped_value(self):
         seen = []
         IssuePlanner(lambda _: PAID,
-                     shadow=lambda p, rf, t: seen.append(t) or '{"issue": 3, "reason": "x"}',
+                     shadow=lambda p, rf, d: (seen.append(d - time.monotonic())
+                                              or '{"issue": 3, "reason": "x"}'),
                      db_path=self.db, shadow_timeout=None,
                      rates=FakeRates(0.001, 0.001)).choose(ISSUES, tick_id="tick-capped")
         self.wait_for_row()
-        self.assertEqual(seen, [240.0])
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 240.0, delta=1.0)
 
     def _patched_client(self, handler):
         import httpx
@@ -427,12 +431,14 @@ class ShadowDeadlineTests(_ShadowCase):
 
         patcher, created = self._patched_client(handler)
         with patcher, self.assertRaises(TimeoutError):
-            nexus_tick._local_shadow("prompt", shadow_response_format(ALLOWED), 0.2)
+            nexus_tick._local_shadow("prompt", shadow_response_format(ALLOWED),
+                                     time.monotonic() + 0.2)
         # The request was cancelled (connection released), not left running;
         # without the deadline the handler would have finished its 30 s sleep.
         self.assertTrue(state["cancelled"])
         self.assertFalse(state["finished"])
-        self.assertEqual(created[0].timeout, 0.2)
+        self.assertGreater(created[0].timeout, 0.0)
+        self.assertLessEqual(created[0].timeout, 0.2)
 
     def test_production_shadow_returns_content_and_cached_tokens(self):
         import json as json_module
@@ -452,11 +458,11 @@ class ShadowDeadlineTests(_ShadowCase):
         patcher, created = self._patched_client(handler)
         response_format = shadow_response_format(ALLOWED)
         with patcher:
-            result = nexus_tick._local_shadow("prompt", response_format, 30.0)
+            result = nexus_tick._local_shadow("prompt", response_format, time.monotonic() + 30.0)
         self.assertEqual(result["content"], '{"issue": 3, "reason": "r"}')
         self.assertEqual(bodies[0]["response_format"], response_format)
         self.assertEqual(bodies[0]["max_tokens"], 120)
-        self.assertEqual(created[0].timeout, 30.0)
+        self.assertAlmostEqual(created[0].timeout, 30.0, delta=1.0)
         if result["cached_prompt_tokens"] is not None:
             self.assertEqual(result["cached_prompt_tokens"], 42)
 
@@ -467,11 +473,12 @@ class ShadowDeadlineTests(_ShadowCase):
         def handler(request):
             return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
 
-        for broken in (float("nan"), float("inf"), 0, -5, None, "x"):
+        for broken in (float("nan"), float("inf"), float("-inf"), None, "x"):
             patcher, created = self._patched_client(handler)
             with patcher:
                 nexus_tick._local_shadow("prompt", None, broken)
-            self.assertEqual(created[0].timeout, SHADOW_TIMEOUT_FALLBACK_SECONDS, broken)
+            self.assertAlmostEqual(created[0].timeout, SHADOW_TIMEOUT_FALLBACK_SECONDS,
+                                   delta=1.0, msg=broken)
 
     def test_planner_wiring_uses_the_deadline_shadow(self):
         import nexus_tick
@@ -517,12 +524,14 @@ class ShadowRatesOffTickTests(_ShadowCase):
                           side_effect=RuntimeError("store broken")) as store:
             choice = IssuePlanner(
                 lambda _: PAID,
-                shadow=lambda p, rf, t: seen.append(t) or '{"issue": 7, "reason": "x"}',
+                shadow=lambda p, rf, d: (seen.append(d - time.monotonic())
+                                         or '{"issue": 7, "reason": "x"}'),
                 db_path=self.db, shadow_timeout=None).choose(ISSUES, tick_id="tick-store")
             self.assertEqual(choice.issue, 5)
             row = self.wait_for_row()
         self.assertTrue(store.called)
-        self.assertEqual(seen, [SHADOW_TIMEOUT_FALLBACK_SECONDS])
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], SHADOW_TIMEOUT_FALLBACK_SECONDS, delta=1.0)
         self.assertEqual((row["local_issue"], row["local_valid"]), (7, 1))
 
     def test_default_store_is_built_on_the_daemon_thread(self):
@@ -546,11 +555,13 @@ class ShadowRatesOffTickTests(_ShadowCase):
                 return "fast"
 
         seen = []
-        IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: seen.append(t) or "{}",
+        IssuePlanner(lambda _: PAID,
+                     shadow=lambda p, rf, d: seen.append(d - time.monotonic()) or "{}",
                      db_path=self.db, shadow_timeout=None, rates=Garbage()).choose(
             ISSUES, tick_id="tick-garbage")
         self.wait_for_row()
-        self.assertEqual(seen, [SHADOW_TIMEOUT_FALLBACK_SECONDS])
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], SHADOW_TIMEOUT_FALLBACK_SECONDS, delta=1.0)
 
 
 class ShadowMigrationRaceTests(unittest.TestCase):
@@ -755,7 +766,7 @@ class ShadowFailureModeTests(_ShadowCase):
         self.assertEqual(list_shadow(self.db)["summary"]["total"], 1)
 
     def test_interrupted_shadow_call_records_the_failure(self):
-        def interrupted(prompt, response_format, timeout):
+        def interrupted(prompt, response_format, deadline):
             raise KeyboardInterrupt("stopped")
 
         choice = IssuePlanner(lambda _: PAID, shadow=interrupted, db_path=self.db,
@@ -766,14 +777,15 @@ class ShadowFailureModeTests(_ShadowCase):
         self.assertTrue(row["error"].startswith("KeyboardInterrupt"))
 
     def test_deadline_error_from_the_callable_is_recorded(self):
-        def deadline(prompt, response_format, timeout):
-            raise TimeoutError(f"planner shadow deadline of {timeout:g}s exceeded")
+        def deadline(prompt, response_format, deadline):
+            # Fails well before the shared deadline: recorded as the error.
+            raise TimeoutError("upstream gave up")
 
         IssuePlanner(lambda _: PAID, shadow=deadline, db_path=self.db,
                      shadow_timeout=None, rates=FakeRates(None, None)).choose(
             ISSUES, tick_id="tick-deadline")
         row = self.wait_for_row()
-        self.assertEqual(row["error"], "TimeoutError: planner shadow deadline of 120s exceeded")
+        self.assertEqual(row["error"], "TimeoutError: upstream gave up")
 
     def test_unwritable_database_never_breaks_the_paid_choice(self):
         bad_db = self.tmp.name  # a directory, sqlite cannot open it
@@ -782,6 +794,227 @@ class ShadowFailureModeTests(_ShadowCase):
                               db_path=bad_db, shadow_timeout=30).choose(ISSUES, tick_id="tick-bad")
         self.assertEqual(choice.issue, 5)
         time.sleep(0.2)  # the daemon logs and drops the row; nothing propagates
+
+
+
+class ShadowSharedDeadlineTests(_ShadowCase):
+    """Review 2, blocker 1: one monotonic deadline across monitor, worker and HTTP."""
+
+    def _delay_worker_start(self, seconds):
+        """Make the shadow call thread start *seconds* late (a busy VM)."""
+        import threading
+
+        original = threading.Thread
+
+        class LateThread(original):
+            def __init__(self, *args, target=None, name=None, **kwargs):
+                if name == "planner-shadow-call" and target is not None:
+                    inner = target
+
+                    def target():
+                        time.sleep(seconds)
+                        inner()
+                super().__init__(*args, target=target, name=name, **kwargs)
+
+        return patch.object(threading, "Thread", LateThread)
+
+    def test_late_worker_start_never_sends_after_the_deadline(self):
+        calls = []
+        with self._delay_worker_start(0.4):
+            IssuePlanner(lambda _: PAID,
+                         shadow=lambda p, rf, d: calls.append(d) or '{"issue": 3, "reason": "x"}',
+                         db_path=self.db, shadow_timeout=0.1).choose(ISSUES, tick_id="tick-late")
+            row = self.wait_for_row()
+        # The worker woke up after the shared deadline and refused to send.
+        self.assertEqual(calls, [])
+        self.assertEqual(row["error"], "timeout after 0.1s (not sent)")
+        self.assertEqual(row["local_valid"], 0)
+        # The row was written once the worker had finished, not before.
+        self.assertGreaterEqual(row["seconds"], 0.4)
+
+    def test_late_worker_start_gets_only_the_remaining_budget(self):
+        seen = []
+
+        def fake_shadow(prompt, response_format, deadline):
+            seen.append(deadline - time.monotonic())
+            return '{"issue": 3, "reason": "x"}'
+
+        with self._delay_worker_start(0.3):
+            IssuePlanner(lambda _: PAID, shadow=fake_shadow, db_path=self.db,
+                         shadow_timeout=1.0).choose(ISSUES, tick_id="tick-remaining")
+            row = self.wait_for_row()
+        self.assertEqual(len(seen), 1)
+        # Not a fresh 1 s budget: the 0.3 s start delay was already spent.
+        self.assertLess(seen[0], 0.75)
+        self.assertGreater(seen[0], 0.0)
+        self.assertEqual((row["local_issue"], row["local_valid"], row["error"]), (3, 1, None))
+
+    def test_timeout_row_is_written_after_the_call_released_its_connection(self):
+        released = []
+
+        def honouring(prompt, response_format, deadline):
+            # Cancelling and closing the connection takes a moment after the
+            # deadline; the monitor must wait for it.
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.3)
+            released.append(time.monotonic())
+            raise TimeoutError("cancelled")
+
+        IssuePlanner(lambda _: PAID, shadow=honouring, db_path=self.db,
+                     shadow_timeout=0.1).choose(ISSUES, tick_id="tick-release")
+        deadline = time.monotonic() + 30
+        while not list_shadow(self.db)["count"]:
+            self.assertLess(time.monotonic(), deadline, "row never written")
+            time.sleep(0.005)
+        # When the row became visible, the call had already released.
+        self.assertEqual(len(released), 1)
+        row = list_shadow(self.db)["rows"][0]
+        self.assertEqual(row["error"], "timeout after 0.1s")
+        self.assertGreaterEqual(row["seconds"], 0.35)
+
+    def test_answer_arriving_after_the_deadline_counts_as_timeout(self):
+        def late(prompt, response_format, deadline):
+            time.sleep(max(0.0, deadline - time.monotonic()) + 0.05)
+            return '{"issue": 3, "reason": "too late"}'
+
+        IssuePlanner(lambda _: PAID, shadow=late, db_path=self.db,
+                     shadow_timeout=0.1).choose(ISSUES, tick_id="tick-too-late")
+        row = self.wait_for_row()
+        self.assertEqual((row["local_valid"], row["error"]), (0, "timeout after 0.1s"))
+
+    def test_callable_ignoring_the_deadline_is_recorded_after_the_grace(self):
+        import threading
+
+        release = threading.Event()
+        self.addCleanup(release.set)
+        with patch.object(nexus_planner, "SHADOW_CANCEL_GRACE_SECONDS", 0.1):
+            IssuePlanner(lambda _: PAID, shadow=lambda p, rf, d: release.wait(30) and "{}",
+                         db_path=self.db, shadow_timeout=0.05).choose(ISSUES, tick_id="tick-ignore")
+            row = self.wait_for_row()
+        self.assertEqual(row["error"], "timeout after 0.05s (call still running)")
+        release.set()
+
+    def test_production_shadow_refuses_to_send_after_the_deadline(self):
+        import nexus_tick
+        from modules.nexus_planner import ShadowDeadlineExpired
+
+        sent = []
+
+        def handler(request):
+            sent.append(request)
+            raise AssertionError("must not be sent")
+
+        patcher, created = ShadowDeadlineTests._patched_client(self, handler)
+        with patcher:
+            for expired in (time.monotonic(), time.monotonic() - 5):
+                with self.assertRaises(ShadowDeadlineExpired):
+                    nexus_tick._local_shadow("prompt", None, expired)
+        self.assertEqual(created, [])
+        self.assertEqual(sent, [])
+        self.assertTrue(issubclass(ShadowDeadlineExpired, TimeoutError))
+
+    def test_production_shadow_cancels_at_the_shared_deadline_not_a_fresh_budget(self):
+        import asyncio
+        import nexus_tick
+
+        state = {"cancelled": False}
+
+        async def handler(request):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+
+        deadline = time.monotonic() + 0.5
+        time.sleep(0.3)  # the worker started late: only ~0.2 s are left
+        patcher, created = ShadowDeadlineTests._patched_client(self, handler)
+        started = time.monotonic()
+        with patcher, self.assertRaises(TimeoutError):
+            nexus_tick._local_shadow("prompt", None, deadline)
+        finished = time.monotonic()
+        self.assertTrue(state["cancelled"])
+        self.assertLessEqual(created[0].timeout, 0.21)
+        # Returned at the shared deadline (plus scheduling slack), not 0.5 s later.
+        self.assertLess(finished - started, 0.45)
+        self.assertGreaterEqual(finished, deadline - 0.01)
+
+    def test_production_shadow_end_to_end_through_the_planner(self):
+        import asyncio
+        import nexus_tick
+
+        state = {"cancelled": False}
+
+        async def handler(request):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+
+        patcher, _created = ShadowDeadlineTests._patched_client(self, handler)
+        with patcher:
+            IssuePlanner(lambda _: PAID, shadow=nexus_tick._local_shadow, db_path=self.db,
+                         shadow_timeout=0.2).choose(ISSUES, tick_id="tick-e2e")
+            row = self.wait_for_row()
+        # The connection was released before the timeout row was written.
+        self.assertTrue(state["cancelled"])
+        self.assertEqual(row["error"], "timeout after 0.2s")
+
+
+class ShadowStrictJsonTests(_ShadowCase):
+    """Review 2, blocker 2: the whole answer must be one top-level JSON object."""
+
+    def _row_for(self, answer, tick):
+        IssuePlanner(lambda _: PAID, shadow=lambda p, rf, d: answer,
+                     db_path=self.db, shadow_timeout=30).choose(ISSUES, tick_id=tick)
+        return self.wait_for_row()
+
+    def test_validate_rejects_anything_but_a_bare_object(self):
+        validate = nexus_planner.validate_shadow_answer
+        for text in ('[{"issue": 3, "reason": "ok"}]',
+                     'Sure! {"issue": 3, "reason": "ok"}',
+                     '{"issue": 3, "reason": "ok"} trailing',
+                     '```json\n{"issue": 3, "reason": "ok"}\n```',
+                     '{"issue": 3, "reason": "ok"}{"issue": 5, "reason": "ok"}',
+                     '"{\\"issue\\": 3, \\"reason\\": \\"ok\\"}"',
+                     '{"issue": %s, "reason": "ok"}' % ("9" * 5000)):
+            with self.subTest(text=text[:60]):
+                self.assertEqual(validate(text, ALLOWED), (None, False, "invalid JSON"))
+        # Surrounding whitespace is still one JSON value.
+        self.assertEqual(validate('\n {"issue": 3, "reason": "ok"} \n', ALLOWED), (3, True, None))
+
+    def test_array_answer_is_persisted_as_invalid(self):
+        row = self._row_for('[{"issue": 3, "reason": "ok"}]', "tick-array")
+        self.assertEqual((row["local_issue"], row["local_valid"], row["error"]),
+                         (None, 0, "invalid JSON"))
+
+    def test_embedded_object_is_persisted_as_invalid(self):
+        row = self._row_for('I pick {"issue": 3, "reason": "ok"} because', "tick-embedded")
+        self.assertEqual((row["local_valid"], row["error"]), (0, "invalid JSON"))
+
+    def test_lone_surrogate_key_is_persisted_with_an_encodable_error(self):
+        answer = '{"issue": 3, "reason": "ok", "\\ud800": 1}'
+        local_issue, valid, error = nexus_planner.validate_shadow_answer(answer, ALLOWED)
+        self.assertFalse(valid)
+        error.encode("utf-8")  # must not raise
+        self.assertEqual(error, "unexpected keys: '\\ud800'")
+        row = self._row_for(answer, "tick-surrogate")
+        self.assertEqual((row["local_issue"], row["local_valid"]), (3, 0))
+        self.assertEqual(row["error"], "unexpected keys: '\\ud800'")
+
+    def test_surrogate_in_an_exception_message_still_writes_the_row(self):
+        def broken(prompt, response_format, deadline):
+            raise RuntimeError("bad \ud800 bytes")
+
+        IssuePlanner(lambda _: PAID, shadow=broken, db_path=self.db,
+                     shadow_timeout=30).choose(ISSUES, tick_id="tick-exc-surrogate")
+        row = self.wait_for_row()
+        self.assertEqual(row["error"], "RuntimeError: bad \\ud800 bytes")
+
+    def test_encodable_text(self):
+        self.assertIsNone(nexus_planner.encodable_text(None))
+        self.assertEqual(nexus_planner.encodable_text("plain ä"), "plain ä")
+        self.assertEqual(nexus_planner.encodable_text("x\udc80"), "x\\udc80")
 
 
 if __name__ == "__main__":

@@ -332,6 +332,14 @@ SHADOW_TIMEOUT_SLACK_SECONDS = 10.0
 SHADOW_TIMEOUT_CAP_SECONDS = 240.0
 # Used when no local rate sample exists at all, so the timeout is never zero.
 SHADOW_TIMEOUT_FALLBACK_SECONDS = 120.0
+# After the deadline the monitor waits at most this long for the call to
+# honour it (cancel the request, close the connection) before it records the
+# timeout row anyway, noting that the call is still running.
+SHADOW_CANCEL_GRACE_SECONDS = 15.0
+
+
+class ShadowDeadlineExpired(TimeoutError):
+    """The shared shadow deadline passed before the request was sent (#782)."""
 
 
 def shadow_response_format(allowed: set[int]) -> dict[str, Any]:
@@ -408,20 +416,49 @@ def _storable_int(value: Any) -> int | None:
     return None
 
 
+def encodable_text(text: str | None) -> str | None:
+    """*text* with anything UTF-8 cannot encode (lone surrogates) escaped.
+
+    SQLite stores TEXT as UTF-8; a lone surrogate (e.g. from an escaped
+    ``"\\ud800"`` JSON key or an exception message) would make the INSERT
+    fail and lose the whole measurement row (#782).
+    """
+    if text is None:
+        return None
+    return str(text).encode("utf-8", "backslashreplace").decode("utf-8")
+
+
+def _strict_json_object(text: str) -> dict[str, Any] | None:
+    """The whole *text* parsed as one JSON value, if that value is an object.
+
+    Unlike the paid planner's permissive :func:`_json_object`, nothing is
+    extracted from surrounding text, code fences or arrays: the shadow call
+    was sent with a json_schema, so anything but a bare top-level object
+    (surrounding whitespace aside) does not conform (#782).
+    """
+    try:
+        value = json.loads(text)
+    except (ValueError, RecursionError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def validate_shadow_answer(text: str, allowed: set[int]) -> tuple[int | None, bool, str | None]:
     """Check a shadow answer against the requested schema (#782).
 
-    Returns ``(local_issue, valid, error)``. The answer is valid only when it
-    is a JSON object with exactly ``issue`` (an integer from *allowed*) and
-    ``reason`` (a string of at most 160 characters). Nothing is coerced: a
-    float such as ``3.9`` or ``3.0``, a bool, ``NaN`` or ``Infinity`` is an
-    ``invalid issue``. An integer outside the allowed set keeps the historic
-    ``issue is not allowed`` error and is reported as ``local_issue`` when it
-    fits a SQLite INTEGER. Never raises.
+    Returns ``(local_issue, valid, error)``. The answer is valid only when the
+    entire text is one JSON object with exactly ``issue`` (an integer from
+    *allowed*) and ``reason`` (a string of at most 160 characters). An array,
+    a fenced block or an object embedded in other text is ``invalid JSON``.
+    Nothing is coerced: a float such as ``3.9`` or ``3.0``, a bool, ``NaN``
+    or ``Infinity`` is an ``invalid issue``. An integer outside the allowed
+    set keeps the historic ``issue is not allowed`` error and is reported as
+    ``local_issue`` when it fits a SQLite INTEGER. The error is always
+    UTF-8-encodable. Never raises.
     """
     try:
-        data = _json_object(text)
-    except Exception:  # noqa: BLE001 - e.g. RecursionError on absurd nesting
+        data = _strict_json_object(text) if isinstance(text, str) else None
+    except Exception:  # noqa: BLE001 - a malformed answer is a measurement
         data = None
     if data is None:
         return None, False, "invalid JSON"
@@ -438,7 +475,10 @@ def validate_shadow_answer(text: str, allowed: set[int]) -> tuple[int | None, bo
         return local_issue, False, "reason too long"
     extra = sorted(str(key) for key in data if key not in ("issue", "reason"))
     if extra:
-        return local_issue, False, ("unexpected keys: " + ", ".join(extra))[:200]
+        # ascii() escapes lone surrogates and control characters, so the
+        # error always fits a SQLite TEXT column; plain names stay readable.
+        names = (key if key.isascii() and key.isprintable() else ascii(key) for key in extra)
+        return local_issue, False, ("unexpected keys: " + ", ".join(names))[:200]
     return local_issue, True, None
 
 
@@ -592,9 +632,10 @@ class IssuePlanner:
     or when exploring fails.
 
     *shadow* is the non-blocking local comparison (#671, #782): it is called as
-    ``shadow(prompt, response_format, timeout)`` on a daemon thread, where
-    *timeout* is the end-to-end deadline in seconds the callable must enforce
-    itself, and may return the raw answer string or a dict
+    ``shadow(prompt, response_format, deadline)`` on a daemon thread, where
+    *deadline* is an absolute :func:`time.monotonic` value - the same one the
+    monitor uses - that the callable must enforce end to end (no request
+    after it, cancel the request at it), and may return the raw answer string or a dict
     ``{"content": ..., "cached_prompt_tokens": ...}`` when the server reported
     reused prompt tokens. *rates* is a
     LocalModelRates-like object whose ``medians()`` size the shadow timeout;
@@ -705,27 +746,54 @@ class IssuePlanner:
             # here on the daemon thread: reading the rates file never stalls
             # the tick, and a broken store cannot lose the paid choice (#782).
             timeout = _resolve_shadow_timeout(prompt_tokens, rates, cap)
+            # One absolute monotonic deadline shared by the monitor, the
+            # worker and the production HTTP request (#782): a worker that
+            # starts late gets only what is left and never sends after it.
+            started = time.monotonic()
+            deadline = started + timeout
+            finished_at: list[float] = []
 
             def call() -> None:
                 try:
-                    # The callable gets the budget as an end-to-end deadline, so
-                    # a call that outlives the monitor's join is cancelled and
-                    # releases its connection instead of running on (#782).
-                    result.append(self._shadow(prompt, response_format, timeout))  # type: ignore[misc]
+                    if time.monotonic() >= deadline:
+                        raise ShadowDeadlineExpired(
+                            f"deadline of {timeout:g}s passed before the request was sent")
+                    # The callable must enforce *deadline* (a time.monotonic()
+                    # value) end to end, so it cancels the request and releases
+                    # its connection instead of running on (#782).
+                    result.append(self._shadow(prompt, response_format, deadline))  # type: ignore[misc]
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
+                finally:
+                    finished_at.append(time.monotonic())
 
-            started = time.monotonic()
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(timeout)
+            worker.join(max(0.0, deadline - time.monotonic()))
+            timed_out = worker.is_alive()
+            still_running = False
+            if timed_out:
+                # Record the timeout only after the call honoured the deadline
+                # and released its connection; a callable that ignores it is
+                # waited for at most the grace period.
+                worker.join(SHADOW_CANCEL_GRACE_SECONDS)
+                still_running = worker.is_alive()
+            elif finished_at and finished_at[0] >= deadline:
+                # Finished, but only at or after the shared deadline.
+                timed_out = True
+            if failure and isinstance(failure[0], ShadowDeadlineExpired):
+                timed_out = True
             elapsed = time.monotonic() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
             cached_prompt_tokens: int | None = None
-            if worker.is_alive():
+            if timed_out:
                 error = f"timeout after {timeout:g}s"
+                if still_running:
+                    error += " (call still running)"
+                elif failure and isinstance(failure[0], ShadowDeadlineExpired):
+                    error += " (not sent)"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
@@ -748,7 +816,8 @@ class IssuePlanner:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
+                       prompt_tokens=prompt_tokens, seconds=elapsed,
+                       error=encodable_text(error),
                        prompt_variant=SHADOW_PROMPT_VARIANT,
                        cached_prompt_tokens=cached_prompt_tokens)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort

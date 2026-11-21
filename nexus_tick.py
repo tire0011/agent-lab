@@ -295,39 +295,52 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
     return result.final_message or ""
 
 
-def _local_shadow(prompt: str, response_format: dict | None, timeout: float) -> dict:
+def _local_shadow(prompt: str, response_format: dict | None, deadline: float) -> dict:
     """The production planner shadow call to the local llama-server (#671, #782).
 
-    *timeout* is an end-to-end deadline: the HTTP client gets it as its own
-    timeout and the whole request is wrapped in ``asyncio.wait_for``, so when
-    the budget is used up the request is cancelled, the httpx client is closed
-    and the connection is released - the call never runs on after the planner
-    recorded the timeout row. Raises :class:`TimeoutError` on the deadline.
+    *deadline* is the absolute ``time.monotonic()`` value the planner's
+    monitor also waits for - one deadline for both layers. Nothing is sent
+    once it has passed (:class:`ShadowDeadlineExpired`); otherwise the HTTP
+    client gets only the remaining time and the whole request is wrapped in
+    ``asyncio.wait_for`` with that remainder, so at the deadline the request
+    is cancelled, the httpx client is closed and the connection is released
+    before :class:`TimeoutError` is raised. A non-finite or missing deadline
+    falls back to 120 s from now.
     """
     import asyncio
     import math
+    import time
 
     from modules.llama_cpp_client import LlamaCppClient
+    from modules.nexus_planner import SHADOW_TIMEOUT_FALLBACK_SECONDS, ShadowDeadlineExpired
 
     try:
-        budget = float(timeout)
+        deadline = float(deadline)
     except (TypeError, ValueError):
-        budget = 0.0
-    if not math.isfinite(budget) or budget <= 0:
-        from modules.nexus_planner import SHADOW_TIMEOUT_FALLBACK_SECONDS
-        budget = SHADOW_TIMEOUT_FALLBACK_SECONDS
-    client = LlamaCppClient(timeout=budget, stream=False)
+        deadline = math.nan
+    if not math.isfinite(deadline):
+        deadline = time.monotonic() + SHADOW_TIMEOUT_FALLBACK_SECONDS
+
+    def remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise ShadowDeadlineExpired("planner shadow deadline passed before the request was sent")
+        return left
+
+    client = LlamaCppClient(timeout=remaining(), stream=False)
     kwargs = {}
     if response_format is not None:
         kwargs["response_format"] = response_format
 
     async def request():
+        # Re-checked here: starting the event loop also takes time.
+        budget = remaining()
         try:
             return await asyncio.wait_for(client.chat_completion(
                 [{"role": "user", "content": prompt}], max_tokens=120, **kwargs,
             ), budget)
         except asyncio.TimeoutError as exc:
-            raise TimeoutError(f"planner shadow deadline of {budget:g}s exceeded") from exc
+            raise TimeoutError(f"planner shadow deadline exceeded after {budget:.3g}s") from exc
 
     response = asyncio.run(request())
     content = str(response["choices"][0]["message"]["content"])
