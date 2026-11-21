@@ -95,6 +95,32 @@ class VerificationEnvSecretExclusionTests(unittest.TestCase):
         self.assertEqual(built, {"AGENT_API_KEY": "test-key"})
 
 
+class VerificationEnvDatabaseIsolationTests(unittest.TestCase):
+    def test_production_db_path_is_replaced_with_a_temporary_one(self):
+        # #766: the tick exports AGENT_DB_PATH pointing at the production
+        # database. The verification suite also runs via unittest discovery,
+        # where tests/conftest.py does not execute, so the built environment
+        # itself must keep the subprocess away from that database - otherwise
+        # a default-path service opens and locks the production DB while the
+        # API service writes it, and the suite hangs inside the tick.
+        parent_env = {"PATH": "/usr/bin", "AGENT_DB_PATH": "/var/lib/nexus/agent.db"}
+        built = build_verification_test_env(parent_env)
+        self.assertIn("AGENT_DB_PATH", built)
+        self.assertNotEqual(built["AGENT_DB_PATH"], "/var/lib/nexus/agent.db")
+        self.assertNotIn("/var/lib/nexus/agent.db", built.values())
+        self.assertTrue(built["AGENT_DB_PATH"].endswith("agent.db"))
+
+    def test_db_path_absent_in_parent_stays_absent(self):
+        built = build_verification_test_env({"PATH": "/usr/bin"})
+        self.assertNotIn("AGENT_DB_PATH", built)
+
+    def test_default_base_env_keeps_no_production_db_path(self):
+        # Whatever the real process environment holds, the built environment
+        # must never carry the production database path through.
+        built = build_verification_test_env()
+        self.assertNotEqual(built.get("AGENT_DB_PATH"), "/var/lib/nexus/agent.db")
+
+
 class VerificationEnvSafeRuntimeTests(unittest.TestCase):
     def test_safe_runtime_variables_pass_through_when_present(self):
         parent_env = {

@@ -282,6 +282,14 @@ The tick logs each start-to-start interval and the maximum interval ending in
 the preceding 72 hours. Search the `nexus-tick.service` journal for
 `initiative tick start gap`. A gap of 1200 seconds or more is logged as a warning.
 
+The verification test environment (`build_verification_test_env`) also replaces
+`AGENT_DB_PATH` with a temporary database when the parent sets it, so a suite run
+inside the tick (`python -m unittest discover`, where `tests/conftest.py` does not
+run) can never open or lock the production database. `MailboxTaskService.close()`
+waits at most `NEXUS_FAILURE_ANALYSIS_CLOSE_GRACE_SECONDS` (default 5) for a running
+failure analysis before abandoning it - a diagnosis stuck on the local LLM or a
+locked database can never wedge the poll process again (#766).
+
 ## Operational checks
 
 1. Verify API liveness via `/health`.

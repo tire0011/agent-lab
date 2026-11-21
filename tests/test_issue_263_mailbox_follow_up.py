@@ -28,6 +28,14 @@ class MailboxFollowUpTests(unittest.TestCase):
         self.experiments = {}
         exp_service = MagicMock()
         exp_service.get_experiment.side_effect = lambda experiment_id: self.experiments[experiment_id]
+        # #766: inject the analyzer. Without this, poll_running's terminal
+        # transition lazily builds the real FailureAnalysisService, which under
+        # the tick's verification environment (unittest discovery: conftest.py
+        # does not run, so AGENT_DB_PATH is the production DB and LOCAL_MODEL_URL
+        # the real llama-server) opens the production database and queues a
+        # local-LLM job with a 15-minute watchdog - and close() used to wait
+        # for it unboundedly. That is what hung this test at 1401/3257 inside
+        # the tick on 2026-11-19.
         self.failure_analysis = MagicMock()
         self.svc = _make_service(
             self.tmp, exp_service=exp_service, failure_analysis_service=self.failure_analysis,

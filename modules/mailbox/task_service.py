@@ -13,9 +13,11 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import os
 import re
 import sqlite3
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -154,6 +156,26 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+# How long ``close()`` still waits for a failure analysis that is already
+# running before abandoning it (#766). The unbounded ``shutdown(wait=True)``
+# before this let one stuck diagnosis - the analyzer's local-LLM job can wait
+# on a real server for minutes - wedge the whole process, which is how a
+# single test hung a tick-run suite for hours.
+_CLOSE_GRACE_ENV_VAR = "NEXUS_FAILURE_ANALYSIS_CLOSE_GRACE_SECONDS"
+_DEFAULT_CLOSE_GRACE_SECONDS = 5.0
+
+
+def _failure_analysis_close_grace_seconds() -> float:
+    raw = (os.environ.get(_CLOSE_GRACE_ENV_VAR) or "").strip()
+    if not raw:
+        return _DEFAULT_CLOSE_GRACE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return _DEFAULT_CLOSE_GRACE_SECONDS
+    return max(0.0, value)
+
+
 def _redact(text: str) -> str:
     return re.sub(
         r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
@@ -249,9 +271,33 @@ class MailboxTaskService:
         )
 
     def close(self) -> None:
-        # Finish queued diagnoses before closing their shared service/SQLite
-        # connection. Analysis runs outside the mailbox poll loop.
-        self._failure_analysis_executor.shutdown(wait=True)
+        # Bounded shutdown (#766): a diagnosis stuck on a real service, lock or
+        # network - e.g. the shared local-LLM job queue or the production
+        # database while a tick runs the test suite - must never wedge this
+        # process again. Queued diagnoses are cancelled, a running one gets a
+        # short grace period, and anything still stuck is abandoned (its done
+        # callback absorbs the error of the shared service being closed below).
+        with self._failure_analysis_futures_lock:
+            futures = list(self._failure_analysis_futures)
+        for future in futures:
+            future.cancel()
+        self._failure_analysis_executor.shutdown(wait=False, cancel_futures=True)
+        grace = _failure_analysis_close_grace_seconds()
+        if grace > 0:
+            deadline = time.monotonic() + grace
+            for future in futures:
+                if not future.running():
+                    continue
+                try:
+                    future.result(timeout=max(0.0, deadline - time.monotonic()))
+                except Exception:  # noqa: BLE001 - shutdown must never raise here
+                    pass
+                if future.running():
+                    logger.warning(
+                        "mailbox_task: close abandons a failure analysis still "
+                        "running after %.1fs", grace,
+                    )
+                    break
         nexus_task_store = getattr(self, "_nexus_task_store", None)
         if nexus_task_store is not None:
             nexus_task_store.close()

@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Mapping
 
 _SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization|openai|azure|codex|ssh|agent_mailbox)")
@@ -59,4 +61,16 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
     env.pop(CLOCK_DRIFT_ENV, None)
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
+    # The service environment exports ``AGENT_DB_PATH`` pointing at the
+    # production database (nexus-tick.service sets it), and the verification
+    # suite also runs via ``python -m unittest discover`` - where
+    # ``tests/conftest.py`` does not execute. Without this, ``DEFAULT_DB_PATH``
+    # binds to the production database at import time and any test using a
+    # default path opens and locks it while the API service is writing; a
+    # suite run inside the tick hung for hours on exactly this (#766).
+    # Under pytest, conftest.py assigns its own temporary path anyway.
+    if "AGENT_DB_PATH" in source:
+        env["AGENT_DB_PATH"] = str(
+            Path(tempfile.mkdtemp(prefix="nexus-verification-db-")) / "agent.db"
+        )
     return env
