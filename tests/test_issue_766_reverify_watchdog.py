@@ -232,6 +232,42 @@ class ReverifyWatchdogTests(unittest.TestCase):
                 release.set()
                 finished.wait(2)
 
+    def test_tick_hand_off_uses_configured_url_and_never_waits_long(self):
+        import socket
+        import time
+
+        import nexus_tick
+
+        listener = socket.socket()
+        self.addCleanup(listener.close)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        seen: list[bytes] = []
+
+        def silent_api():  # accepts, reads the request, never answers
+            connection, _ = listener.accept()
+            with connection:
+                seen.append(connection.recv(4096))
+                time.sleep(5)
+
+        server = threading.Thread(target=silent_api, daemon=True)
+        server.start()
+        url = f"http://127.0.0.1:{port}/internal/reverify-parked"
+        with patch.dict(os.environ, {"AGENT_API_KEY": "test-key", "NEXUS_REVERIFY_URL": url}):
+            started = time.monotonic()
+            with self.assertRaises(OSError):  # socket timeout, logged by the tick
+                nexus_tick._launch_parked_reverification()
+            self.assertLess(time.monotonic() - started, 4)
+        self.assertTrue(seen[0].startswith(b"POST /internal/reverify-parked "))
+        self.assertIn(b"x-api-key: test-key", seen[0])
+        with (
+            patch.dict(os.environ, {"AGENT_API_KEY": "test-key",
+                                    "NEXUS_REVERIFY_URL": "https://example.invalid/x"}),
+            self.assertRaisesRegex(RuntimeError, "NEXUS_REVERIFY_URL"),
+        ):
+            nexus_tick._launch_parked_reverification()
+
     def test_tick_start_logs_rolling_maximum(self):
         start = datetime(2026, 11, 20, tzinfo=timezone.utc)
         _record_tick_start(self.db, start)

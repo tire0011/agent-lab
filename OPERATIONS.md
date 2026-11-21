@@ -271,6 +271,10 @@ and main commit, and the check uses no coding budget. Failed, stalled, and
 timed-out attempts leave the experiment parked.
 
 - `NEXUS_REVERIFY_PARKED=0` disables the tick hand-off.
+- `NEXUS_REVERIFY_URL` sets the hand-off endpoint. The default is
+  `http://127.0.0.1:8000/internal/reverify-parked`. The tick waits at most
+  2 seconds for the `202` response, so an API that does not respond cannot
+  block the tick.
 - `NEXUS_REVERIFY_TIMEOUT_SECONDS` sets the deadline for the whole branch
   attempt. The default is 2700 seconds (45 minutes). The worker kills the
   process group and records `reverify_timeout` at the deadline.

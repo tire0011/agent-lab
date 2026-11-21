@@ -18,6 +18,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -51,13 +52,27 @@ def _service_diagnostics() -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
+_REVERIFY_URL_ENV = "NEXUS_REVERIFY_URL"
+_DEFAULT_REVERIFY_URL = "http://127.0.0.1:8000/internal/reverify-parked"
+
+
 def _launch_parked_reverification() -> None:
+    """Hand parked re-verification to the API service; never wait for it (#766).
+
+    The short timeout bounds only the hand-off itself. The API answers 202 at
+    once and runs the attempt in its own background thread.
+    """
     key = os.environ.get("AGENT_API_KEY")
     if not key:
         return
-    connection = http.client.HTTPConnection("127.0.0.1", 8000, timeout=2)
+    # Configurable like NEXUS_DIAGNOSTICS_URL and NEXUS_MCP_URL; plain HTTP
+    # only, because the endpoint is the loopback uvicorn behind nginx.
+    url = urllib.parse.urlsplit(os.environ.get(_REVERIFY_URL_ENV) or _DEFAULT_REVERIFY_URL)
+    if url.scheme != "http" or not url.hostname:
+        raise RuntimeError(f"{_REVERIFY_URL_ENV} must be an http:// URL")
+    connection = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=2)
     try:
-        connection.request("POST", "/internal/reverify-parked", headers={"x-api-key": key})
+        connection.request("POST", url.path or "/", headers={"x-api-key": key})
         with connection.getresponse() as response:
             if response.status != 202:
                 raise RuntimeError(f"re-verification hand-off returned HTTP {response.status}")
