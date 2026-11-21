@@ -212,6 +212,10 @@ def _last_reason(attempts: dict[str, tuple[str, str]]) -> str:
     return sanitized_reason(" ".join(max(attempts.values())[1].split())) or "no reason recorded"
 
 
+#: ``detail`` of a dispatch paid from ``extra_budget_<provider>``.
+PROVIDER_EXTRA_PREFIX = "provider_extra:"
+
+
 @dataclass(slots=True)
 class Candidate:
     kind: str
@@ -477,6 +481,44 @@ class NexusInitiativeService:
             return max(0, int(row[0]))
         except (sqlite3.Error, ValueError, TypeError):
             return 0
+
+    def _provider_extra_left(self) -> str | None:
+        """A coding provider with an unused ``extra_budget_<provider>`` (mailbox,
+        valid 24 hours), installed and not cooling down; ``None`` if there is none."""
+        from modules.coding_provider import available_providers, provider_cooldowns
+
+        try:
+            cooled = provider_cooldowns(db_path=self.db_path)
+            providers = available_providers()
+        except Exception:  # noqa: BLE001 - no extra start rather than a broken tick
+            return None
+        now = _utcnow()
+        for provider in providers:
+            if provider in cooled:
+                continue
+            try:
+                row = self._conn.execute(
+                    "SELECT value, updated_at FROM service_settings WHERE key = ?",
+                    (f"nexus.extra_budget.{provider}",),
+                ).fetchone()
+                if not row:
+                    continue
+                set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+                if set_at.tzinfo is None:
+                    set_at = set_at.replace(tzinfo=timezone.utc)
+                if now - set_at > timedelta(days=1):
+                    continue
+                since = max(set_at, now - timedelta(days=1)).isoformat()
+                used = self._conn.execute(
+                    "SELECT COUNT(*) FROM nexus_initiative_log "
+                    "WHERE decision = 'dispatched' AND detail = ? AND created_at >= ?",
+                    (PROVIDER_EXTRA_PREFIX + provider, since),
+                ).fetchone()[0]
+                if int(row[0]) > int(used):
+                    return provider
+            except (sqlite3.Error, ValueError, TypeError):
+                continue
+        return None
 
     def _spent_today(self) -> int:
         since = (_utcnow() - timedelta(days=1)).isoformat()
@@ -1713,6 +1755,7 @@ class NexusInitiativeService:
                 tick_id=tick_id,
             ))
 
+        extra_provider: str | None = None
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back
             # to the coder, when the budget for new work is used up (#538).
@@ -1722,6 +1765,14 @@ class NexusInitiativeService:
             ]
             if self.controller:
                 found += [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON]
+            if not found and self.controller:
+                # Provider-specific extra budget (mailbox ``extra_budget_<provider>``):
+                # new work that is pinned to that provider.
+                extra_provider = self._provider_extra_left()
+                if extra_provider is not None:
+                    found = [c for c in self.candidates() if c.kind in (KIND_ISSUE, KIND_IDEA)]
+                    if not found:
+                        extra_provider = None
             if not found:
                 return self._record(
                     InitiativeDecision(
@@ -1797,6 +1848,12 @@ class NexusInitiativeService:
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
+        if extra_provider is not None and chosen.kind in (KIND_ISSUE, KIND_IDEA):
+            # Counted against extra_budget_<provider>; the coding run uses it.
+            from modules.coding_provider import pin_next_provider
+
+            decision.detail = PROVIDER_EXTRA_PREFIX + extra_provider
+            pin_next_provider(extra_provider, db_path=self.db_path)
         # Persist the intent *before* acting, so a crash mid-dispatch leaves a
         # record of what Nexus was trying to do rather than a silent gap.
         self._record(decision)

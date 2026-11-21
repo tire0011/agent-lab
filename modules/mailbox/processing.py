@@ -359,6 +359,12 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "daily_budget": ("nexus.daily_budget", 0, 50),
     # Starts on top of the daily budget for the next 24 hours (#523).
     "extra_budget": ("nexus.extra_budget", 0, 20),
+    # The same, but only for runs on one coding provider: when the general
+    # budget is used up, Nexus may still start this many runs, each pinned to
+    # that provider (e.g. Mistral on the owner's Vibe subscription).
+    "extra_budget_codex": ("nexus.extra_budget.codex", 0, 20),
+    "extra_budget_claude": ("nexus.extra_budget.claude", 0, 20),
+    "extra_budget_mistral": ("nexus.extra_budget.mistral", 0, 20),
     # 1 pauses all new work (no starts, adoptions or retries); 0 resumes.
     "paused": ("nexus.paused", 0, 1),
     # 0 disables the free post-experiment reflection sweep; 1 enables it.
@@ -426,7 +432,7 @@ def _process_setting(
         (db_key, str(value), _now_iso()),
     )
     conn.commit()
-    if key == "extra_budget":
+    if key.startswith("extra_budget"):
         return f"Setting {key} is now {value} for the next 24 hours.", None
     return f"Setting {key} is now {value}.", None
 
@@ -644,7 +650,7 @@ class MailboxProcessor:
         return git_is_clean(self._mailbox_repo_path)
 
     def prune_old_messages(self, *, now=None) -> Any:
-        """Delete finished outbox responses and dead inbox messages, as part of the
+        """Delete old outbox and archive files and dead inbox messages, as part of the
         normal poll after pending commits were retried (files still needed to finalize
         a commit are protected). Deletions are committed with explicit pathspecs and
         pushed by the poll's existing sync; a pass with nothing to prune commits

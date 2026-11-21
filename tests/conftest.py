@@ -71,8 +71,21 @@ def _clock_drift(request, monkeypatch):
 # /agent/state/experiment-logs alongside real history - which is how test
 # controller turns were first mistaken for production data while measuring
 # escalation rates for #158.
+# Nexus' own runtime switches from the service environment (e.g.
+# AGENT_CODING_PROVIDERS=codex,claude, NEXUS_REVERIFY_PARKED=0) must not change
+# test results: the timing check runs the suite with that environment, and the
+# provider-rotation tests failed on the VM only (2026-11-20). Tests that need a
+# switch set it themselves. NEXUS_TEST_* stays: the timing check passes its
+# drift setting that way.
+for _name in [n for n in os.environ if n.startswith(("NEXUS_", "AGENT_CODING_"))
+              and not n.startswith("NEXUS_TEST_")]:
+    del os.environ[_name]
+
 _LOG_DIR = tempfile.mkdtemp(prefix="nexus-test-logs-")
-os.environ.setdefault("AGENT_LOG_DIR", _LOG_DIR)
+# Assigned, not setdefault: the timing check runs the suite with the service
+# environment, whose AGENT_LOG_DIR is the real log directory - the public logs
+# API tests then counted 305 production entries instead of their 5.
+os.environ["AGENT_LOG_DIR"] = _LOG_DIR
 
 # api.py reads this at module level, and several service defaults resolve the
 # database path at import time. Without it a suite run can touch the real
@@ -124,7 +137,9 @@ os.environ.setdefault("NEXUS_DB_DURABILITY", "relaxed")
 
 # Mailbox configuration is required at import time by api.py. Point it at an
 # isolated canonical-layout checkout so tests can never fall back to /agent.
-os.environ.setdefault("AGENT_MAILBOX_REPO_PATH", str(Path(_LOG_DIR) / "mailbox-repo"))
+# Assigned, not setdefault: the service environment exports the real mailbox
+# checkout, and a test must never read or write the real mailbox.
+os.environ["AGENT_MAILBOX_REPO_PATH"] = str(Path(_LOG_DIR) / "mailbox-repo")
 
 # The suite must never reach a real model provider. It could: the controller
 # escalates to `codex_readonly` when a prompt exceeds the local budget, and on
@@ -146,6 +161,8 @@ os.environ["AGENT_CODEX_BIN"] = str(Path(_LOG_DIR) / "no-codex-binary-in-tests")
 # finds nothing installed and falls back to codex, which keeps the suite
 # deterministic as well.
 os.environ["AGENT_CLAUDE_BIN"] = str(Path(_LOG_DIR) / "no-claude-binary-in-tests")
+# Same for the Mistral Vibe CLI: a test must never start the real `vibe`.
+os.environ["AGENT_VIBE_BIN"] = str(Path(_LOG_DIR) / "no-vibe-binary-in-tests")
 
 # Same isolation for the local model server: llama-server runs on the VM, so
 # an accidentally default-constructed client can otherwise make a real request

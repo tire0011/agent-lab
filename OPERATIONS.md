@@ -488,9 +488,19 @@ rate that was never measured. Admission: when the rates leave fewer than
 ends `local_too_slow` with the numbers. The experiment hands over to the paid
 coder as for `context_too_small`, and a shadow replay stores status
 `local_too_slow`. Admission only applies to a measured generation rate (a guess
-never locks the worker out). Because a refused call measures nothing, delete
-the rates file after making the server faster (threads, model), or the old
-measurements keep refusing. Rates files written before #667 may hold
+never locks the worker out). A refused call measures nothing, so before
+refusing the worker may re-probe the rates (#772): one tiny llama-server call
+(fixed ~150-token prompt, 48 output tokens, `cache_prompt` off, fixed seed)
+whose timings replace the rate window. It runs when this would be the
+`NEXUS_RATE_REPROBE_AFTER`-th refusal in a row (default `3`) or the newest
+sample is older than `NEXUS_RATE_MAX_AGE_H` hours (default `12`), and not
+within `NEXUS_RATE_REPROBE_COOLDOWN_MIN` minutes of the last probe (default
+`60`); `0` disables a trigger. Each probe logs `rate_reprobe` (old/new medians,
+admitted or not), and the refusal message ends with
+`[rates: newest sample … h old; …]`. Samples carry UTC `sampled_at`
+timestamps; the refusal counter and `last_probe_at` live in the same rates
+file. Files without timestamps count as old. Deleting the rates file after
+making the server faster still works. Rates files written before #667 may hold
 guessed values among the measured ones; delete the file once after deploying
 #667.
 
