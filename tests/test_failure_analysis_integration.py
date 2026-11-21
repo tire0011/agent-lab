@@ -13,13 +13,14 @@ decided on.
 
 from __future__ import annotations
 
+import os
 import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules.mailbox.task_service import (
     MailboxTaskService,
@@ -209,6 +210,41 @@ class MailboxTaskFailureIntegrationTests(unittest.TestCase):
             self.assertTrue(_wait_for_failure_analyses(svc, timeout=2))
 
         self.assertEqual(analyzer.analyze_from_logs.call_count, 2)
+
+    def test_close_does_not_wait_indefinitely_for_a_stuck_diagnosis(self):
+        # #766: under the tick's environment the lazily-built real analyzer can
+        # wait on a real service, lock or network (production database, local
+        # LLM server) for many minutes. close() must still return promptly -
+        # the old unbounded shutdown(wait=True) is how one stuck diagnosis
+        # wedged a whole suite run inside the tick.
+        analyzer = MagicMock()
+        started = threading.Event()
+        release = threading.Event()
+        self.addCleanup(release.set)  # never leak a stuck worker into this process
+
+        def stuck_analysis(**_kwargs):
+            started.set()
+            release.wait(30)
+
+        analyzer.analyze_from_logs.side_effect = stuck_analysis
+        exp_service = MagicMock()
+        exp_service.get_experiment.return_value = _make_exp(
+            id="exp-stuck", status="failed", error="boom"
+        )
+        svc = _make_service(self.tmp, exp_service, failure_analysis_service=analyzer)
+        approval_id = _submit(svc, "exp-stuck")
+
+        svc.poll_running()
+        self.assertTrue(started.wait(2))
+        self.assertEqual(svc.get(approval_id).status, _STATUS_FAILED)
+        with patch.dict(os.environ, {"NEXUS_FAILURE_ANALYSIS_CLOSE_GRACE_SECONDS": "0.5"}):
+            began = time.monotonic()
+            svc.close()  # must return although the analysis is still stuck
+            elapsed = time.monotonic() - began
+        self.assertLess(elapsed, 5)
+        # Reap the worker afterwards so the test process itself can exit.
+        release.set()
+        svc._failure_analysis_executor.shutdown(wait=True)
 
     def test_lazy_construction_failure_degrades_silently(self):
         # No failure_analysis_service injected: the base class tries to
