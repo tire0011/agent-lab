@@ -195,6 +195,124 @@ def planning_prompt(
     )
 
 
+# The compact local shadow prompt (#770, part 1 in #781): the full prompt
+# above is about 6-9k tokens, which the CPU llama-server cannot read within
+# any useful timeout.
+SHADOW_PROMPT_TOKENS_ENV = "NEXUS_PLANNER_SHADOW_PROMPT_TOKENS"
+DEFAULT_SHADOW_PROMPT_TOKENS = 1500
+_COMPACT_TITLE_CHARS = 90
+_COMPACT_TITLE_CHARS_TRIMMED = 40
+_COMPACT_LINE_CHARS = 160
+_COMPACT_RECENT = 5
+
+# Fixed first, so llama-server's prompt cache (#685) reuses it on every tick.
+_COMPACT_HEADER = (
+    "You are Nexus, an agent that develops its own code. Pick the ONE open issue "
+    "that is the most useful to work on next. Prefer issues that unblock or "
+    "simplify later work. Skip issues that need a human decision, a purchase or "
+    "setup outside the repository. An issue tagged out-of-attempts cannot be "
+    "done now; blocked-by-review means the last attempt passed its tests but the "
+    "review stopped it.\n"
+    'Answer with exactly one JSON object: {"issue": <number from OPEN ISSUES>, '
+    '"reason": "<one short sentence>"}\n\n'
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """The bytes/4 estimate used for the shadow prompt budget."""
+    return max(1, len(text.encode("utf-8")) // 4)
+
+
+def _shadow_prompt_budget() -> int:
+    """The hard token budget for the compact shadow prompt, from the env."""
+    try:
+        value = int(os.environ.get(SHADOW_PROMPT_TOKENS_ENV, "") or DEFAULT_SHADOW_PROMPT_TOKENS)
+    except ValueError:
+        return DEFAULT_SHADOW_PROMPT_TOKENS
+    return value if value > 0 else DEFAULT_SHADOW_PROMPT_TOKENS
+
+
+def _one_line(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_issue_line(issue: dict[str, Any], title_chars: int = _COMPACT_TITLE_CHARS) -> str:
+    left = issue.get("attempts_left")
+    tags = []
+    if left is not None and int(left) <= 0:
+        tags.append("out-of-attempts")
+    if issue.get("review_blocked"):
+        tags.append("blocked-by-review")
+    line = f"#{issue['number']} {_one_line(issue.get('title'), title_chars)}"
+    if left is not None:
+        line += f" | attempts left: {max(0, int(left))}"
+    return line + "".join(f" [{tag}]" for tag in tags)
+
+
+def _compact_recent_line(r: dict[str, Any]) -> str:
+    if "adoption_status" in r:
+        reason = str(r.get("adoption_reason") or "")
+        outcome = f"{r.get('status', '')} / merge: {_merge_label(str(r['adoption_status']), reason)}"
+    else:
+        outcome = str(r.get("status", ""))
+    return _one_line(f"- {outcome}: {r.get('title', '')}", _COMPACT_LINE_CHARS)
+
+
+def compact_planning_prompt(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, Any]] | None,
+    stuck_measurements: list[str] | None,
+    budget_left: int | None,
+    max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+) -> str | None:
+    """A short planning prompt for the local model (#770, #781).
+
+    One line per open issue (number, title, attempts left, blocked/out-of-
+    attempts tag - no bodies), the last five experiment outcomes, the stuck
+    measurement pipelines and the budget last. The fixed header comes first
+    and is byte-stable across calls, so the server's prompt cache can reuse
+    the prefix.
+
+    The result never exceeds *max_tokens* (bytes/4 estimate). Trimming order:
+    the oldest outcomes first, then the oldest (lowest numbered) issues - the
+    newest issue is always kept - then the titles cut to 40 characters. When
+    even that does not fit (tiny budgets), ``None`` is returned instead of an
+    over-budget prompt (#773's codex finding).
+    """
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = DEFAULT_SHADOW_PROMPT_TOKENS
+    ordered = sorted(issues, key=lambda i: int(i["number"]))
+    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
+    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
+    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
+
+    def build(kept: list[dict[str, Any]], outcomes: list[str], title_chars: int) -> str:
+        return (
+            _COMPACT_HEADER
+            + "OPEN ISSUES:\n" + "\n".join(_compact_issue_line(i, title_chars) for i in kept) + "\n\n"
+            + "RECENT EXPERIMENTS:\n" + ("\n".join(outcomes) or "(none yet)") + "\n\n"
+            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_lines) or "(none)") + "\n\n"
+            + f"Paid starts left today: {budget}\n"
+        )
+
+    kept = list(ordered)
+    outcomes = list(recent_lines)
+    prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while estimate_tokens(prompt) > max_tokens and outcomes:
+        outcomes.pop()  # newest first: the oldest outcome goes first
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while estimate_tokens(prompt) > max_tokens and len(kept) > 1:
+        kept.pop(0)  # oldest issue first; the newest one stays
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    if estimate_tokens(prompt) > max_tokens:
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS_TRIMMED)
+    if estimate_tokens(prompt) > max_tokens:
+        return None
+    return prompt
+
+
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
     """Ideas from your own post-experiment reflections (#630), with their evidence."""
     if not reflections:
@@ -371,11 +489,22 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = planning_prompt(issues, recent, explore=False, **context) + (
-            '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
-            'object with only {"issue": <number>, "reason": "<short reason>"}.'
+        prompt = compact_planning_prompt(
+            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
+            _shadow_prompt_budget(),
         )
-        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+        if prompt is None:
+            # Not even the fixed header with one issue fits the budget: record
+            # the skip and never call the model with an over-budget prompt (#781).
+            try:
+                from modules.planner_shadow import record
+                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
+                       local_issue=None, local_valid=0, prompt_tokens=0, seconds=0.0,
+                       error="skipped: prompt_over_budget")
+            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+                logger.warning("planner shadow: could not store result: %s", exc)
+            return
+        prompt_tokens = estimate_tokens(prompt)
 
         def monitor() -> None:
             result: list[str] = []
