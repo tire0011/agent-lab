@@ -1,4 +1,14 @@
-"""Durable observations from the non-blocking local issue planner (#671)."""
+"""Durable observations from the non-blocking local issue planner (#671).
+
+Each row is one shadow call of one tick: which issue the paid planner chose,
+what the local model answered, whether that answer was one of the allowed
+issues, how long the call took and what went wrong. Since #782 the row also
+records the prompt variant (``prompt_variant``, e.g. ``compact_v1``) and the
+prompt tokens llama-server reused from its cache (``cached_prompt_tokens``,
+NULL when the shadow callable did not report them). Both columns are nullable
+and are added to older tables with ``ALTER TABLE``, exactly like
+``created_at``.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +16,14 @@ import sqlite3
 import statistics
 from datetime import datetime, timezone
 from typing import Any
+
+# Columns an older planner_shadow table may lack; added with ALTER TABLE,
+# in the same way created_at has always been migrated (#782).
+_MIGRATED_COLUMNS = (
+    ("created_at", "TEXT"),
+    ("prompt_variant", "TEXT"),
+    ("cached_prompt_tokens", "INTEGER"),
+)
 
 
 def ensure_table(conn: sqlite3.Connection) -> None:
@@ -20,10 +38,41 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
             error TEXT,
-            created_at TEXT
+            created_at TEXT,
+            prompt_variant TEXT,
+            cached_prompt_tokens INTEGER
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+    for name, declaration in _MIGRATED_COLUMNS:
+        if name not in columns:
+            conn.execute(f"ALTER TABLE planner_shadow ADD COLUMN {name} {declaration}")
+
+
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+    return bool(columns) and all(name in columns for name, _ in _MIGRATED_COLUMNS)
+
+
+def _ensure_schema_serialized(conn: sqlite3.Connection) -> None:
+    """Create or migrate the table for a reader without racing writers (#782).
+
+    A current schema needs no lock. Otherwise the inspection and every
+    ``ALTER TABLE`` happen inside one ``BEGIN IMMEDIATE`` write transaction -
+    the same lock :func:`record` takes - so a concurrent ``record`` or
+    ``list_shadow`` that migrated first is seen by the re-inspection under the
+    lock, and no connection adds a column twice.
+    """
+    if _schema_is_current(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        ensure_table(conn)
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
 
 
 def record(db_path: str, **values: Any) -> None:
@@ -31,14 +80,16 @@ def record(db_path: str, **values: Any) -> None:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
-        if "created_at" not in {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}:
-            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
         values.setdefault("created_at", datetime.now(timezone.utc).isoformat())
+        values.setdefault("prompt_variant", None)
+        values.setdefault("cached_prompt_tokens", None)
         conn.execute(
             """INSERT INTO planner_shadow
-               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, created_at)
+               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error,
+                created_at, prompt_variant, cached_prompt_tokens)
                SELECT :tick_id, :paid_issue, :local_issue, :local_valid,
-                      :prompt_tokens, :seconds, :error, :created_at
+                      :prompt_tokens, :seconds, :error, :created_at,
+                      :prompt_variant, :cached_prompt_tokens
                WHERE NOT EXISTS (SELECT 1 FROM planner_shadow WHERE tick_id = :tick_id)""",
             values,
         )
@@ -47,9 +98,10 @@ def record(db_path: str, **values: Any) -> None:
 def list_shadow(db_path: str, limit: int = 20) -> dict[str, Any]:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
-        ensure_table(conn)
+        _ensure_schema_serialized(conn)
         rows = [dict(row) for row in conn.execute(
-            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error "
+            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, "
+            "prompt_variant, cached_prompt_tokens "
             "FROM planner_shadow ORDER BY id DESC LIMIT ?", (limit,)
         )]
         all_rows = conn.execute(
