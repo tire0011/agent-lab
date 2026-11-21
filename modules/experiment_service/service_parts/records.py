@@ -129,7 +129,7 @@ class RecordsMixin:
         self.selection_worker = (
             selection_worker
             if selection_worker is not None
-            else build_random_worker(db_path=db_path)[1]
+            else build_random_worker(db_path=db_path, use_pin=False)[1]
         )
         # One provider per worktree/scratch dir, i.e. one agent per experiment: the
         # implementation call and any repair iteration share it, the next experiment rotates.

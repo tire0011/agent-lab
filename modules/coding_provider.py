@@ -190,7 +190,7 @@ def _take_next_pin(conn: Any, candidates: list[str]) -> str | None:
 
 
 def choose_provider(
-    rng: Any | None = None, *, db_path: str = DEFAULT_DB_PATH
+    rng: Any | None = None, *, db_path: str = DEFAULT_DB_PATH, use_pin: bool = True
 ) -> str:
     """Select the next provider in a persistent, concurrency-safe rotation. ``rng``
     is an unused compatibility argument; pins bypass the rotation; the allow list
@@ -218,7 +218,10 @@ def choose_provider(
     conn = init_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
-        once = _take_next_pin(conn, candidates)
+        # use_pin=False: a helper worker (e.g. ExperimentService's selection
+        # worker, built eagerly) must not use up an extra start meant for the
+        # implementation (2026-11-21: the Mistral start ran on Claude).
+        once = _take_next_pin(conn, candidates) if use_pin else None
         if once is not None:
             # A provider-specific extra start: this run uses that provider and
             # the rotation position stays where it was.
@@ -510,10 +513,10 @@ def build_worker(provider: str, *, db_path: str | None = None, **kwargs: Any) ->
 
 
 def build_random_worker(
-    *, db_path: str | None = None, rng: Any | None = None, **kwargs: Any
+    *, db_path: str | None = None, rng: Any | None = None, use_pin: bool = True, **kwargs: Any
 ) -> tuple[str, Any]:
     """Select a provider and return ``(provider, worker)``."""
-    provider = choose_provider(rng, db_path=db_path or DEFAULT_DB_PATH)
+    provider = choose_provider(rng, db_path=db_path or DEFAULT_DB_PATH, use_pin=use_pin)
     return provider, build_worker(provider, db_path=db_path, **kwargs)
 
 
