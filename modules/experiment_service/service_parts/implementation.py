@@ -49,8 +49,14 @@ from ..prompts import (
     _build_repair_implementation_prompt,
 )
 from ..text_utils import _truncate_text, _utcnow_iso
-from modules.redaction import sanitized_reason
+from modules.redaction import redact, sanitized_reason
 from .core import _is_stalled
+
+# Outcomes of a conditional worker launch (#763).
+_LAUNCH_OK = "launch_ok"
+_LAUNCH_STOPPED = "launch_stopped"          # cancelled, stalled, budget stop, status moved
+_LAUNCH_GUARDED = "launch_guarded"          # the free-tier guard now blocks this provider
+_LAUNCH_NO_ELIGIBLE = "launch_no_eligible"  # guarded and no other coder is available
 
 
 def _take_model_written_tests(worker: Any, worktree_path: str) -> str:
@@ -308,33 +314,23 @@ class ImplementationMixin:
             and not self._must_use_external_provider(experiment)
         )
 
-        def eligible_worker(candidate: Any) -> tuple[Any, str | None] | None:
-            provider = provider_of(candidate)
-            if provider not in FREE_TIER_CODERS or not self._free_tier_blocked(experiment, elog):
-                return candidate, provider
-            replacement = self._select_implementation_fallback(provider, experiment, elog, set())
-            if replacement is None:
-                self._transition(
-                    experiment_id, STATUS_IMPLEMENTING, STATUS_FAILED,
-                    ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
-                    error=NO_ELIGIBLE_CODER,
-                )
-                return None
-            if self._ended_from_outside(experiment_id):
-                return None
+        def defer_without_coder() -> Experiment:
+            # The guard leaves no coder for this work. Only the initial launch
+            # defers like this, before any coder ran; it is an ordinary failed
+            # attempt and stays in the paid-start budget (the planner was paid).
             elog.warning(
-                "implementation", "free_tier_guard_skipped",
-                f"Free-tier guard routes {experiment.complexity or 'unknown'} work to {replacement}",
-                provider=replacement, skipped_provider=provider,
+                "implementation", "free_tier_guard_deferred", NO_ELIGIBLE_CODER,
+                complexity=experiment.complexity or "",
             )
-            return build_worker(replacement, db_path=self.db_path), replacement
-
-        selected = eligible_worker(
-            self.local_worker_factory(worktree_path) if use_local else self.worker_factory(worktree_path)
-        )
-        if selected is None:
+            self._transition(
+                experiment_id, STATUS_IMPLEMENTING, STATUS_FAILED,
+                ended_at=_utcnow_iso(), implementation_ended_at=_utcnow_iso(),
+                error=NO_ELIGIBLE_CODER,
+            )
             return self.get_experiment(experiment_id)
-        worker, implementation_provider = selected
+
+        worker = self.local_worker_factory(worktree_path) if use_local else self.worker_factory(worktree_path)
+        implementation_provider = provider_of(worker)
         if implementation_provider != "local":
             implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
 
@@ -342,16 +338,34 @@ class ImplementationMixin:
         tried_providers: set[str] = set()
         free_format_handoff = False
 
-        def run_worker(event: str, message: str, **fields: Any) -> tuple[CodexResult, str | None] | None:
+        def run_worker(event: str, message: str, **fields: Any) -> tuple[CodexResult, str | None] | str:
+            """Launch *worker* once; ``_LAUNCH_STOPPED`` / ``_LAUNCH_NO_ELIGIBLE`` if it must not run.
+
+            The free-tier guard is decided inside the conditional launch claim, so a
+            guard that tripped during provider selection, worker construction or
+            prompt setup still reroutes the launch (#763).
+            """
+            nonlocal worker, implementation_provider
             live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
-            if not self._claim_worker_launch(experiment_id, STATUS_IMPLEMENTING, implementation_provider):
-                return None
+            launch = self._claim_eligible_launch(
+                experiment_id, STATUS_IMPLEMENTING, worker, implementation_provider,
+                experiment, elog, tried_providers,
+            )
+            if isinstance(launch, str):
+                return launch
+            worker, implementation_provider = launch
             if implementation_provider is not None:
                 tried_providers.add(implementation_provider)
+            if "paid_fallback_used" in fields:
+                fields["paid_fallback_used"] = free_tier_guard.is_paid(implementation_provider)
             log = elog.info if event == "implementation_provider_selected" else elog.warning
-            log("implementation", event, message, provider=implementation_provider or "", **fields)
+            log(
+                "implementation", event,
+                message.replace("{provider}", implementation_provider or "unknown"),
+                provider=implementation_provider or "", **fields,
+            )
             if self._ended_from_outside(experiment_id):
-                return None
+                return _LAUNCH_STOPPED
             task = implementation_prompt
             if free_format_handoff and free_tier_guard.is_paid(implementation_provider):
                 task = f"{task.rstrip()}\n\n{FORMAT_FALLBACK_NOTE}\n"
@@ -368,13 +382,17 @@ class ImplementationMixin:
             )
             usage = self._usage_after_run(experiment_id, result, live_state, elog)
             self._note_free_tier_outcome(experiment_id, implementation_provider, result, elog)
+            if result.error and not result.timed_out and implementation_provider not in (None, "local"):
+                # A usage limit cools the provider down until it resets (#753).
+                self._note_provider_limit(implementation_provider, result.error, elog)
             return result, usage
 
         run = run_worker(
-            "implementation_provider_selected",
-            f"Implementation runs on coding agent {implementation_provider or 'unknown'}",
+            "implementation_provider_selected", "Implementation runs on coding agent {provider}",
         )
-        if run is None or self._ended_from_outside(experiment_id):
+        if run == _LAUNCH_NO_ELIGIBLE:
+            return defer_without_coder()
+        if isinstance(run, str) or self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
         implementation_result, implementation_usage_json = run
 
@@ -417,13 +435,11 @@ class ImplementationMixin:
                 )
             else:
                 implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
-            selected = eligible_worker(self.worker_factory(worktree_path))
-            if selected is None:
-                return self.get_experiment(experiment_id)
-            worker, implementation_provider = selected
+            worker = self.worker_factory(worktree_path)
+            implementation_provider = provider_of(worker)
             run = run_worker(
                 "implementation_provider_fallback",
-                f"Local attempt requires fallback to {implementation_provider or 'unknown'}",
+                "Local attempt requires fallback to {provider}",
                 reason=fallback_reason,
                 tests_generated=generated_test_count,
                 tests_failing_on_base=generated_test_count,
@@ -431,32 +447,20 @@ class ImplementationMixin:
                 paid_fallback_used=free_tier_guard.is_paid(implementation_provider),
                 model_written_tests_handed_over=bool(model_written_tests),
             )
-            if run is None or self._ended_from_outside(experiment_id):
+            if run == _LAUNCH_NO_ELIGIBLE:
+                return defer_without_coder()
+            if isinstance(run, str) or self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             implementation_result, implementation_usage_json = run
 
-        while implementation_result.error and not implementation_result.timed_out and implementation_provider:
-            error = implementation_result.error
-            fields = {}
-            if free_tier_guard.is_format_failure(error):
-                if implementation_provider not in FREE_TIER_CODERS or not self._worktree_untouched(
-                    worktree_path, elog,
-                ):
-                    break
-                fields = {
-                    "reason": "free_tier_format_failure",
-                    "free_tier_provider": implementation_provider,
-                    "free_answer": str(
-                        implementation_result.final_message or implementation_result.stdout or ""
-                    )[:300],
-                }
-                message = f"{implementation_provider} returned no usable edit"
-            elif implementation_provider != "local" and is_provider_overload(error):
-                self._note_provider_limit(implementation_provider, error, elog)
-                message = f"{implementation_provider} is overloaded"
-            else:
-                break
-
+        # One same-run handoff at most, as before #763: a free-tier format failure
+        # and an overload share it, so a second overload (or a format failure
+        # followed by an overload) never launches a third coder.
+        handoff = self._handoff_decision(
+            implementation_result, implementation_provider, worktree_path, elog,
+        )
+        if handoff is not None:
+            message, fields = handoff
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
             fallback = self._select_implementation_fallback(
@@ -464,20 +468,24 @@ class ImplementationMixin:
             )
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
-            if fallback is None:
-                break
-            if fields:
-                fields["paid_fallback_used"] = free_tier_guard.is_paid(fallback)
-                free_format_handoff = True
-            worker = build_worker(fallback, db_path=self.db_path)
-            implementation_provider = fallback
-            run = run_worker(
-                "implementation_provider_fallback", f"{message}; implementation runs on {fallback}",
-                **fields,
-            )
-            if run is None or self._ended_from_outside(experiment_id):
-                return self.get_experiment(experiment_id)
-            implementation_result, implementation_usage_json = run
+            if fallback is not None:
+                previous = (worker, implementation_provider)
+                if fields:
+                    fields["paid_fallback_used"] = free_tier_guard.is_paid(fallback)
+                    free_format_handoff = True
+                worker = build_worker(fallback, db_path=self.db_path)
+                implementation_provider = fallback
+                run = run_worker(
+                    "implementation_provider_fallback", f"{message}; implementation runs on {{provider}}",
+                    **fields,
+                )
+                if run == _LAUNCH_NO_ELIGIBLE:
+                    # No coder is eligible any more: the first result stands as today.
+                    worker, implementation_provider = previous
+                elif isinstance(run, str) or self._ended_from_outside(experiment_id):
+                    return self.get_experiment(experiment_id)
+                else:
+                    implementation_result, implementation_usage_json = run
 
         if self._ended_from_outside(experiment_id):
             return self.get_experiment(experiment_id)
@@ -553,31 +561,105 @@ class ImplementationMixin:
     def _select_implementation_fallback(
         self, provider: str | None, experiment: Experiment, elog: Any, tried: set[str],
     ) -> str | None:
-        excluded = tried | (FREE_TIER_CODERS if self._free_tier_blocked(experiment, elog) else set())
+        excluded = set(tried) | (FREE_TIER_CODERS if self._free_tier_blocked(experiment, elog) else set())
         fallback = other_provider(provider, db_path=self.db_path, exclude=excluded)
         return fallback if fallback != provider and fallback not in excluded else None
 
+    def _handoff_decision(
+        self, result: CodexResult, provider: str | None, worktree_path: str, elog: Any,
+    ) -> tuple[str, dict[str, Any]] | None:
+        """The one same-run handoff a finished result may get: ``(message, log fields)``.
+
+        Exactly one decision per result: a format rejection is never also read as
+        an overload (its text can quote "429"), so a dirty tree after a free-tier
+        rejection keeps the result instead of slipping into the overload branch.
+        """
+        error = result.error
+        if not error or result.timed_out or not provider or provider == "local":
+            return None
+        if free_tier_guard.is_format_failure(error):
+            if provider not in FREE_TIER_CODERS or not self._worktree_untouched(worktree_path, elog):
+                return None
+            # Redact the whole answer first: a credential that crosses the cutoff
+            # must not leave a prefix the central redaction no longer recognizes.
+            answer = redact(str(result.final_message or result.stdout or ""))
+            return f"{provider} returned no usable edit", {
+                "reason": "free_tier_format_failure",
+                "free_tier_provider": provider,
+                "free_answer": answer[:300],
+            }
+        if is_provider_overload(error):
+            return f"{provider} is overloaded", {}
+        return None
+
+    def _claim_eligible_launch(
+        self, experiment_id: str, expected_status: str, worker: Any, provider: str | None,
+        experiment: Experiment, elog: Any, tried: set[str],
+    ) -> tuple[Any, str | None] | str:
+        """Claim the launch of *worker*; reroute it if the free-tier guard now blocks it.
+
+        Returns ``(worker, provider)`` to run, ``_LAUNCH_STOPPED`` when the run was
+        ended from outside, or ``_LAUNCH_NO_ELIGIBLE`` when the guard leaves no coder.
+        A replacement is never free-tier, so the second claim cannot reroute again.
+        """
+        for _ in range(2):
+            verdict = self._claim_worker_launch(
+                experiment_id, expected_status, provider, complexity=experiment.complexity,
+            )
+            if verdict == _LAUNCH_OK:
+                return worker, provider
+            if verdict == _LAUNCH_STOPPED:
+                return _LAUNCH_STOPPED
+            replacement = self._select_implementation_fallback(
+                provider, experiment, elog, set(tried) | set(FREE_TIER_CODERS),
+            )
+            if self._ended_from_outside(experiment_id):
+                return _LAUNCH_STOPPED
+            if replacement is None:
+                return _LAUNCH_NO_ELIGIBLE
+            elog.warning(
+                "implementation", "free_tier_guard_skipped",
+                f"Free-tier guard routes {experiment.complexity or 'unknown'} work to {replacement}",
+                provider=replacement, skipped_provider=provider or "",
+            )
+            worker = build_worker(replacement, db_path=self.db_path)
+            provider = replacement
+        return _LAUNCH_NO_ELIGIBLE
+
     def _claim_worker_launch(
         self, experiment_id: str, expected_status: str, provider: str | None,
-    ) -> bool:
-        """Authorize the launch after worker construction, preserving external stops."""
+        *, complexity: str | None = None,
+    ) -> str:
+        """Authorize the launch after worker construction, preserving external stops.
+
+        The free-tier guard is read in the same transaction as the conditional
+        status update, so no outcome recorded during setup is missed (#763).
+        """
         with self._lock, self._conn:
             current = self._conn.execute(
                 "SELECT status, error FROM experiments WHERE id = ?", (experiment_id,),
             ).fetchone()
             if current is None or current["status"] != expected_status or _is_stalled(*current):
-                return False
+                return _LAUNCH_STOPPED
+            if provider in FREE_TIER_CODERS:
+                try:
+                    blocked = free_tier_guard.blocks_free_tier(self._conn, complexity)
+                except Exception:  # noqa: BLE001 - an unreadable guard never stops a run
+                    blocked = False
+                if blocked:
+                    return _LAUNCH_GUARDED
             free_provider = (
                 provider if expected_status == STATUS_IMPLEMENTING and provider in FREE_TIER_CODERS
                 else None
             )
             launch_status = STATUS_VERIFYING if expected_status == STATUS_FAILED else expected_status
-            return self._conn.execute(
+            claimed = self._conn.execute(
                 "UPDATE experiments SET status = ?, implementation_provider = ?, "
                 "free_tier_provider = COALESCE(free_tier_provider, ?) "
                 "WHERE id = ? AND status = ? AND error IS ?",
                 (launch_status, provider, free_provider, experiment_id, expected_status, current["error"]),
             ).rowcount == 1
+            return _LAUNCH_OK if claimed else _LAUNCH_STOPPED
 
     def _note_free_tier_outcome(
         self, experiment_id: str, provider: str | None, result: CodexResult, elog: Any,
@@ -727,30 +809,33 @@ class ImplementationMixin:
                 )
                 break
 
+            # Repairs stay on the coder that made the edits (the eligible handoff
+            # provider, not a fresh pick of the sticky worker factory).
             provider = result.implementation_provider
-            if worker is None and provider is None:
-                worker = self.worker_factory(worktree_path)
-                provider = provider_of(worker)
-            if provider in FREE_TIER_CODERS and self._free_tier_blocked(result, elog):
-                replacement = self._select_implementation_fallback(provider, result, elog, set())
-                if self._ended_from_outside(experiment_id):
-                    return self.get_experiment(experiment_id)
-                if replacement is None:
-                    elog.warning(
-                        "implementation", "free_tier_repair_deferred", NO_ELIGIBLE_CODER,
-                    )
-                    self._force_status(
-                        experiment_id, STATUS_FAILED,
-                        error=f"{NO_ELIGIBLE_CODER}. {result.error or 'Verification failed.'}",
-                    )
-                    return self.get_experiment(experiment_id)
-                worker = None
-                provider = replacement
             if worker is None:
-                worker = build_worker(provider, db_path=self.db_path)
-            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
-            if not self._claim_worker_launch(experiment_id, STATUS_FAILED, provider):
+                worker = (
+                    build_worker(provider, db_path=self.db_path) if provider
+                    else self.worker_factory(worktree_path)
+                )
+                provider = provider or provider_of(worker)
+            if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
+            live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
+            launch = self._claim_eligible_launch(
+                experiment_id, STATUS_FAILED, worker, provider, result, elog, set(),
+            )
+            if launch == _LAUNCH_NO_ELIGIBLE:
+                # The verification failure stands unchanged and stays a charged
+                # attempt: the guard only declines the repair, it is no overload.
+                elog.warning(
+                    "implementation", "free_tier_repair_deferred",
+                    "Free-tier guard leaves no coder for the repair; verification failure kept",
+                    provider=provider or "",
+                )
+                return self.get_experiment(experiment_id)
+            if isinstance(launch, str):
+                return self.get_experiment(experiment_id)
+            worker, provider = launch
             elog.warning(
                 "implementing", "repair_started",
                 f"Starting focused repair iteration {repair_iteration}/"

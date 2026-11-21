@@ -236,6 +236,16 @@ ARCHITECTURE.md section 13 and D-022):
   `free_tier_format_failures`). When more than the share of the last window of
   free-tier runs failed on format, `complexity != small` work skips the free
   tier. The "Nexus status" issue shows the setting and the current share.
+  The guard is decided inside the conditional launch claim, so a guard that
+  trips during provider selection or worker construction still reroutes the
+  launch (implementation, overload handoff and repair). A run gets at most one
+  same-run handoff (format failure or overload). Without an eligible coder the
+  initial launch fails with `free-tier guard deferred coding: ...`; that is a
+  normal charged attempt in the paid-start budget, not an overload. A repair
+  the guard declines keeps the verification failure. An issue whose last
+  attempt was planned non-small is deferred before the paid planner
+  (`free_tier_guard_deferred` tick decision) while only free-tier coders are
+  usable.
 
 An agent whose CLI is not installed is never drawn, so adding the variables
 before installing the CLI is harmless. To check what the VM would draw from:

@@ -27,6 +27,10 @@ baseline and follow-up cutoffs with the table.
    checkpoint or the retry window ends. Report those observed starts and how
    many retries had no follow-up. Keep planning and review calls separate if
    the logs identify them.
+4. Guard deferrals (`free-tier guard deferred coding` errors and
+   `free_tier_guard_deferred` tick decisions) are not format failures. Report
+   them separately: a deferral after planning is a charged attempt and a paid
+   start; a tick deferral starts nothing.
 
 ## After rollout
 
@@ -44,8 +48,9 @@ baseline and follow-up cutoffs with the table.
    runs ending on the original format rejection. The target is **0 attempts
    charged solely to the format rejection**.
 3. Count actual paid starts using `codex_call_start` and `claude_call_start`
-   in phase `implementation` after the format handoff event, including any
-   further implementation handoffs. Record paid repair starts separately.
+   in phase `implementation` after the format handoff event. A run gets at
+   most one same-run handoff, so at most one paid implementation start follows
+   a format failure; a later overload of that coder ends the run. Record paid repair starts separately.
    A handoff event with `paid_fallback_used=true` identifies the route. Use
    the worker events to confirm calls started.
 4. For the comparison, estimate one paid implementation start per clean format

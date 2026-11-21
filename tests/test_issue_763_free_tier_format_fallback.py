@@ -249,13 +249,15 @@ class FreeTierFormatFallbackTests(_ServiceFixture):
         self.paid_worker.run.side_effect = None
         self.paid_worker.run.return_value = _format_failure(error="429 overloaded")
 
+        selections = []
+
         def select(provider, *, db_path, exclude):
-            if provider == "mistral":
-                return "codex"
-            self.assertEqual(exclude, {"mistral", "codex"})
-            return "mistral"  # Even a stale selection is rejected.
+            selections.append(provider)
+            return "codex" if provider == "mistral" else "mistral"
 
         result, build = self._run(selection=select)
+        # One handoff per run: the overloaded paid fallback gets no further pick.
+        self.assertEqual(selections, ["mistral"])
         self.free_worker.run.assert_called_once()
         self.paid_worker.run.assert_called_once()
         build.assert_called_once()
@@ -336,7 +338,9 @@ class FreeTierFormatFallbackTests(_ServiceFixture):
         self.assertEqual(self.paid_worker.run.call_args.kwargs["phase"], "implementation_repair")
 
 
-def _seed(db_path: str, outcomes: list[int | None], provider: str = "mistral") -> None:
+def _seed(
+    db_path: str, outcomes: list[int | None], provider: str = "mistral", prefix: str = "seed",
+) -> None:
     conn = init_db(db_path)
     now = datetime.now(timezone.utc)
     try:
@@ -345,7 +349,7 @@ def _seed(db_path: str, outcomes: list[int | None], provider: str = "mistral") -
             conn.execute(
                 "INSERT INTO experiments (id, goal, status, created_at, implementation_started_at, "
                 "free_tier_provider, free_tier_format_failures) VALUES (?,?,?,?,?,?,?)",
-                (f"seed{i}", "g", ("implementing" if failed is None else "failed" if failed else "succeeded"),
+                (f"{prefix}{i}", "g", ("implementing" if failed is None else "failed" if failed else "succeeded"),
                  ts, ts, provider, failed),
             )
         conn.commit()
@@ -432,7 +436,8 @@ class FreeTierGuardInServiceTests(_ServiceFixture):
         self.free_worker.run.assert_not_called()
         build.assert_not_called()
         self.assertEqual(result.error, NO_ELIGIBLE_CODER)
-        self.assertTrue(_is_provider_overload(result.status, result.error))
+        # No overload: it stays in the paid-start budget and is a charged attempt.
+        self.assertFalse(_is_provider_overload(result.status, result.error))
 
     def test_overload_cannot_handoff_to_guarded_free_tier(self):
         _seed(self.db_path, [1] * 10)
@@ -465,7 +470,312 @@ class FreeTierGuardInServiceTests(_ServiceFixture):
         result, build = self._run(handover=None)
         self.free_worker.run.assert_called_once()
         build.assert_not_called()
-        self.assertTrue(result.error.startswith(NO_ELIGIBLE_CODER), result.error)
+        # The verification failure stands unchanged and keeps its attempt charge.
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertTrue(result.error.startswith("tests failed"), result.error)
+        self.assertNotIn(NO_ELIGIBLE_CODER, result.error)
+        self.assertFalse(_is_provider_overload(result.status, result.error))
+        self.assertIn("free_tier_repair_deferred", _events(self.service, result.id))
+
+    def test_guard_tripped_after_free_edits_moves_the_repair_to_an_eligible_coder(self):
+        self.service.test_python_executable = sys.executable
+
+        def write_test(kwargs, assertion):
+            worktree = Path(kwargs["working_dir"])
+            (worktree / "implementation.py").write_text("def helper(): return 1\n")
+            (worktree / "tests" / "test_added.py").write_text(
+                "import unittest\nclass TestHelper(unittest.TestCase):\n"
+                f"    def test_helper(self): {assertion}\n"
+            )
+            return _make_result(sandbox="workspace-write")
+
+        def free_call(**kwargs):
+            _seed(self.db_path, [1] * 10)
+            return write_test(kwargs, "self.assertTrue(False)")
+
+        self.free_worker.run.side_effect = free_call
+        self.paid_worker.run.side_effect = lambda **kwargs: write_test(kwargs, "self.assertTrue(True)")
+        result, build = self._run()
+        self.assertEqual(result.status, STATUS_SUCCEEDED, result.error)
+        self.free_worker.run.assert_called_once()
+        self.paid_worker.run.assert_called_once()
+        self.assertEqual(self.paid_worker.run.call_args.kwargs["phase"], "implementation_repair")
+        self.assertEqual(build.call_args.args[0], "codex")
+
+    # -- review 5dff726e (1): the guard is decided at the launch boundary -----
+
+    def test_tenth_outcome_during_worker_construction_reroutes_the_launch(self):
+        _seed(self.db_path, [1] * 9)
+
+        def construct(_path):
+            _seed(self.db_path, [1], prefix="late")  # the tenth completed outcome
+            return self.free_worker
+
+        self.service.worker_factory = construct
+        result, build = self._run()
+        self.free_worker.run.assert_not_called()
+        self.assertEqual(build.call_args.args[0], "codex")
+        self.paid_worker.run.assert_called_once()
+        self.assertNotEqual(result.status, STATUS_FAILED, result.error)
+        self.assertEqual(result.implementation_provider, "codex")
+        self.assertIsNone(result.free_tier_provider)
+        self.assertIn("free_tier_guard_skipped", _events(self.service, result.id))
+
+    def test_tenth_outcome_during_construction_without_coder_defers(self):
+        _seed(self.db_path, [1] * 9)
+
+        def construct(_path):
+            _seed(self.db_path, [1], prefix="late")
+            return self.free_worker
+
+        self.service.worker_factory = construct
+        result, build = self._run(handover=None)
+        self.free_worker.run.assert_not_called()
+        build.assert_not_called()
+        self.assertEqual((result.status, result.error), (STATUS_FAILED, NO_ELIGIBLE_CODER))
+        self.assertIsNone(result.free_tier_provider)
+
+    def test_guard_tripping_during_prompt_setup_reroutes_the_launch(self):
+        _seed(self.db_path, [1] * 9)
+
+        def facts(prompt, *_args, **_kwargs):
+            _seed(self.db_path, [1], prefix="late")
+            return prompt
+
+        with patch(
+            "modules.experiment_service.service_parts.implementation._with_repo_facts",
+            side_effect=facts,
+        ):
+            result, build = self._run()
+        self.free_worker.run.assert_not_called()
+        self.paid_worker.run.assert_called_once()
+        self.assertEqual(result.implementation_provider, "codex")
+
+    def test_small_work_still_launches_on_the_free_tier(self):
+        _seed(self.db_path, [1] * 10)
+        with patch.object(self.service, "_must_use_external_provider", return_value=True):
+            result, build = self._run(complexity="small")
+        self.free_worker.run.assert_called_once()
+        self.assertEqual(result.free_tier_provider, "mistral")
+
+    def test_overload_handoff_to_free_tier_guarded_during_construction(self):
+        self.free_worker.provider = "claude"
+        self.free_worker.run.return_value = _format_failure(error="429 overloaded")
+        mistral = MagicMock()
+        mistral.provider = "mistral"
+        selections = []
+
+        def select(provider, *, db_path, exclude):
+            selections.append(set(exclude))
+            return "mistral" if provider == "claude" and "mistral" not in exclude else None
+
+        def construct(provider, **_kwargs):
+            _seed(self.db_path, [1] * 10)  # the guard trips while Mistral is built
+            return mistral
+
+        result, _ = self._run(selection=select, construction=construct)
+        mistral.run.assert_not_called()
+        self.free_worker.run.assert_called_once()
+        self.assertEqual((result.status, result.error), (STATUS_FAILED, "429 overloaded"))
+        self.assertEqual(result.implementation_provider, "claude")
+        self.assertIn("mistral", selections[-1])
+
+    def test_cancellation_during_reroute_construction_prevents_launch(self):
+        _seed(self.db_path, [1] * 9)
+
+        def construct_free(_path):
+            _seed(self.db_path, [1], prefix="late")
+            return self.free_worker
+
+        def construct_paid(*_args, **_kwargs):
+            self._cancel()
+            return self.paid_worker
+
+        self.service.worker_factory = construct_free
+        result, _ = self._run(construction=construct_paid)
+        self.free_worker.run.assert_not_called()
+        self.paid_worker.run.assert_not_called()
+        self.assertEqual(result.status, STATUS_CANCELLED)
+
+    def test_crash_during_reroute_construction_fails_once_and_never_runs_a_coder(self):
+        _seed(self.db_path, [1] * 10)
+        result, _ = self._run(construction=RuntimeError("cannot build codex"))
+        self.free_worker.run.assert_not_called()
+        self.paid_worker.run.assert_not_called()
+        self.assertEqual(result.status, STATUS_FAILED)
+        self.assertIn("cannot build codex", result.error)
+        self.assertIsNone(result.free_tier_provider)
+        self.assertIsNone(result.free_tier_format_failures)
+        with self.assertRaises(ExperimentNotRunnableError):
+            self.service.run_experiment(result.id)
+
+    def test_unreadable_guard_at_launch_never_stops_the_run(self):
+        with patch.object(free_tier_guard, "blocks_free_tier", side_effect=RuntimeError("db gone")):
+            result, build = self._run()
+        self.free_worker.run.assert_called_once()
+        self.paid_worker.run.assert_called_once()
+        self.assertNotEqual(result.status, STATUS_FAILED, result.error)
+
+    def test_a_repeated_launch_claim_is_refused_after_the_run_ended(self):
+        _, _ = self._run()
+        elog = self.service.get_experiment_logger(self.experiment_id)
+        experiment = self.service.get_experiment(self.experiment_id)
+        outcome = self.service._claim_eligible_launch(
+            self.experiment_id, "implementing", self.paid_worker, "codex", experiment, elog, set(),
+        )
+        self.assertIsInstance(outcome, str)
+        self.assertEqual(self.service.get_experiment(self.experiment_id).status, experiment.status)
+
+
+class OneHandoffPerRunTests(_ServiceFixture):
+    """Review 5dff726e (3): the overload handoff limit of main stays one."""
+
+    def test_two_consecutive_overloads_cannot_launch_a_third_coder(self):
+        self.free_worker.provider = "claude"
+        self.free_worker.run.return_value = _format_failure(error="API Error: 529 Overloaded")
+        self.paid_worker.run.side_effect = None
+        self.paid_worker.run.return_value = _format_failure(error="429 overloaded")
+        with _patch_service("other_provider", side_effect=["codex", "mistral"]) as select, _patch_service(
+            "build_worker", return_value=self.paid_worker,
+        ) as build:
+            experiment = self.service.create_experiment(goal="Fix the helper.")
+            result = self.service.run_experiment(experiment.id)
+        self.assertEqual(select.call_count, 1)
+        build.assert_called_once()
+        self.free_worker.run.assert_called_once()
+        self.paid_worker.run.assert_called_once()
+        self.assertEqual((result.status, result.error), (STATUS_FAILED, "429 overloaded"))
+        self.assertTrue(_is_provider_overload(result.status, result.error))
+
+
+class FreeAnswerRedactionTests(_ServiceFixture):
+    """Review 5dff726e (4): redact the whole free answer before the 300-char cut."""
+
+    def test_a_credential_crossing_the_cutoff_leaves_no_prefix_in_the_log(self):
+        token = "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2"
+        answer = "x" * 289 + " " + token + " trailing prose"
+        self.free_worker.run.return_value = _format_failure(stdout=answer, final_message=answer)
+        result, _ = self._run()
+        logs = self._fallback_logs(result.id)
+        self.assertEqual(len(logs), 1, logs)
+        logged = logs[0]["free_answer"]
+        self.assertLessEqual(len(logged), 300)
+        self.assertNotIn("ghp_", logged)
+        self.assertNotIn("A1b2", logged)
+        raw = Path(self.service.get_experiment_logger(result.id).path).read_text()
+        self.assertNotIn("ghp_A1b2", raw)
+        self.assertNotIn(token, self.paid_worker.run.call_args.kwargs["task"])
+
+
+def _events(service, experiment_id):
+    return [e.get("event") for e in read_log_entries(service.get_experiment_logger(experiment_id).path)]
+
+
+class InitiativeGuardTests(unittest.TestCase):
+    """Review 5dff726e (2): budget and deferral before the paid planner."""
+
+    def setUp(self):
+        from tests.test_nexus_initiative import InitiativeFixture
+        from tests.test_provider_limit_cooldown import _add_settings_table
+
+        self.fx = InitiativeFixture()
+        _add_settings_table(self.fx.db_path)
+        with sqlite3.connect(self.fx.db_path) as conn:
+            for column in ("complexity", "free_tier_provider", "implementation_started_at"):
+                conn.execute(f"ALTER TABLE experiments ADD COLUMN {column} TEXT")
+            conn.execute("ALTER TABLE experiments ADD COLUMN free_tier_format_failures INTEGER")
+        env = patch.dict(os.environ, {
+            "AGENT_CODING_PROVIDERS": "codex,mistral", "NEXUS_GATE_PREFLIGHT": "0",
+            free_tier_guard.ENV_GUARD: "1", free_tier_guard.ENV_WINDOW: "10",
+            free_tier_guard.ENV_MAX_SHARE: "0.5",
+        })
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("AGENT_CODING_PROVIDER", None)
+        available = patch("modules.coding_provider.is_available", return_value=True)
+        available.start()
+        self.addCleanup(available.stop)
+
+    def _cool_codex(self):
+        until = (datetime.now(timezone.utc) + timedelta(hours=2)).isoformat()
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO service_settings VALUES (?, ?, ?)",
+                ("provider_cooldown_until.codex", until, until),
+            )
+
+    def _guard_tripped(self):
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(self.fx.db_path) as conn:
+            for i in range(10):
+                ts = (now - timedelta(minutes=i)).isoformat()
+                conn.execute(
+                    "INSERT INTO experiments (id, goal, status, created_at, implementation_started_at, "
+                    "free_tier_provider, free_tier_format_failures) VALUES (?,?,?,?,?,?,?)",
+                    (f"g{i}", "g", "failed", ts, ts, "mistral", 1),
+                )
+
+    def _planned(self, complexity):
+        ts = (datetime.now(timezone.utc) - timedelta(hours=8)).isoformat()
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                "INSERT INTO experiments (id, goal, status, created_at, ended_at, error, complexity) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("earlier", "g", "failed", ts, ts, "tests failed (exit code 1)", complexity),
+            )
+            conn.execute("INSERT INTO github_experiment_links VALUES (?, ?)", ("earlier", 763))
+
+    def _service(self):
+        svc = self.fx.service(issue_lister=lambda: [
+            {"number": 763, "author": {"login": "tire0011"}, "title": "Free tier", "body": ""},
+        ])
+        self.addCleanup(svc.close)
+        return svc
+
+    def test_known_non_small_issue_is_deferred_before_the_planner(self):
+        from modules.nexus_initiative import DECISION_FREE_TIER_GUARD_DEFERRED
+
+        self._guard_tripped()
+        self._cool_codex()
+        self._planned("large")
+        svc = self._service()
+        decision = svc.tick()
+        self.assertEqual(decision.decision, DECISION_FREE_TIER_GUARD_DEFERRED)
+        self.assertIn("#763", decision.detail)
+        self.assertEqual(self.fx.controller.issues, [])
+        self.assertEqual(svc._spent_today(), 0)
+        # Ticking again is idempotent: still deferred, still nothing dispatched.
+        self.assertEqual(svc.tick().decision, DECISION_FREE_TIER_GUARD_DEFERRED)
+        self.assertEqual(self.fx.controller.issues, [])
+
+    def test_small_or_unplanned_issues_and_a_paid_coder_still_dispatch(self):
+        self._guard_tripped()
+        self._cool_codex()
+        self._planned("small")
+        self.assertEqual(self._service().tick().decision, "dispatched")
+
+    def test_unplanned_issue_still_goes_to_the_planner(self):
+        self._guard_tripped()
+        self._cool_codex()
+        self.assertEqual(self._service().tick().decision, "dispatched")
+
+    def test_an_available_paid_coder_means_no_deferral(self):
+        self._guard_tripped()
+        self._planned("large")
+        self.assertEqual(self._service().tick().decision, "dispatched")
+
+    def test_deferral_after_planning_stays_in_budget_and_retry_accounting(self):
+        now = datetime.now(timezone.utc).isoformat()
+        with sqlite3.connect(self.fx.db_path) as conn:
+            conn.execute(
+                "INSERT INTO experiments (id, goal, status, created_at, ended_at, error) VALUES (?,?,?,?,?,?)",
+                ("deferred", "g", "failed", now, now, NO_ELIGIBLE_CODER),
+            )
+        svc = self._service()
+        self.assertEqual(svc._overloaded_since("2000-01-01"), 0)
+        self.assertFalse(_is_provider_overload("failed", NO_ELIGIBLE_CODER))
+        self.assertFalse(_is_provider_overload("failed", f"{FORMAT_ERROR} (429 overloaded)"))
+        self.assertTrue(_is_provider_overload("failed", "API Error: 529 Overloaded"))
 
 
 if __name__ == "__main__":

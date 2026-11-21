@@ -105,6 +105,8 @@ SAFEGUARD_WORDS = (
 # Every external coding provider is cooling down after a usage limit (#753):
 # nothing paid starts; detail holds the earliest reset time.
 DECISION_PROVIDERS_COOLING_DOWN = "providers_cooling_down"
+# The free-tier guard (#763) leaves no coder for an issue known to be non-small.
+DECISION_FREE_TIER_GUARD_DEFERRED = "free_tier_guard_deferred"
 # Loop guard (#753): more than this many experiments on one issue ending within
 # _LOOP_GUARD_WINDOW without publishable changes stop that issue for
 # _LOOP_GUARD_PAUSE, whatever the provider.
@@ -134,13 +136,20 @@ _GOAL_POLICY_REASON_PREFIXES = tuple(
 
 
 def _is_provider_overload(status: Any, error: Any) -> bool:
-    """A coding deferral due to provider availability, exempt from retry limits."""
+    """A run that failed because the coding agent's API was overloaded.
+
+    A crash that merely quotes "429" stays a crash: overloads are free of every
+    limit, a crash loop must not be. A free-tier guard deferral (#763) is no
+    overload either: it can follow a paid planner call, so it stays in the
+    budget and counts as an attempt; a format rejection quoting "429" too.
+    """
     from modules.coding_provider import NO_ELIGIBLE_CODER, is_provider_overload
     from modules.free_tier_guard import is_format_failure
 
     return (
         status == "failed"
-        and (str(error or "").startswith(NO_ELIGIBLE_CODER) or is_provider_overload(error))
+        and is_provider_overload(error)
+        and not str(error or "").startswith(NO_ELIGIBLE_CODER)
         and not is_format_failure(error)
         and not _is_pipeline_crash(status, error)
         and not str(error or "").startswith("tests failed")
@@ -1185,6 +1194,61 @@ class NexusInitiativeService:
             return None
         return {provider: cooled[provider].isoformat() for provider in usable}
 
+    def _only_free_tier_coders_under_guard(self) -> bool:
+        """The free-tier guard (#763) is tripped and every usable external coder
+        not cooling down is free-tier: non-small work has no coder at all."""
+        from modules import coding_provider, free_tier_guard
+
+        try:
+            if not free_tier_guard.guard_state(self._conn).tripped:
+                return False
+            cooled = coding_provider.provider_cooldowns(db_path=self.db_path)
+            pinned = coding_provider.pinned_provider()
+            usable = (
+                [pinned] if pinned is not None
+                else coding_provider.available_providers() or coding_provider.allowed_providers()
+            )
+        except Exception as exc:  # noqa: BLE001 - an unreadable guard must not stop the tick
+            logger.warning("initiative: cannot read the free-tier guard: %s", exc)
+            return False
+        ready = [provider for provider in usable if provider not in cooled]
+        return bool(ready) and all(free_tier_guard.is_free_tier(provider) for provider in ready)
+
+    def _planned_complexity(self, issue_ref: str) -> str | None:
+        """Complexity of the newest experiment for an issue; ``None`` if never planned."""
+        try:
+            row = self._conn.execute(
+                """
+                SELECT e.complexity FROM github_experiment_links l
+                JOIN experiments e ON e.id = l.experiment_id
+                WHERE l.issue_number = ? ORDER BY e.created_at DESC LIMIT 1
+                """,
+                (int(issue_ref),),
+            ).fetchone()
+        except (sqlite3.Error, ValueError, TypeError):
+            return None
+        return row[0] if row is not None else None
+
+    def _without_free_tier_guarded(self, found: list[Candidate]) -> tuple[list[Candidate], list[Candidate]]:
+        """Split off issues that the free-tier guard would defer after planning.
+
+        Only where eligibility is known before the paid planner runs: the guard
+        is tripped, only free-tier coders are usable, and the issue's last
+        attempt was planned as non-small. Unplanned issues still go to the
+        planner (it may plan them as small); later candidates are not starved.
+        """
+        if not any(c.kind == KIND_ISSUE for c in found) or not self._only_free_tier_coders_under_guard():
+            return found, []
+        kept: list[Candidate] = []
+        guarded: list[Candidate] = []
+        for candidate in found:
+            complexity = (
+                self._planned_complexity(candidate.ref)
+                if candidate.kind == KIND_ISSUE and candidate.reason != REVIEW_RETRY_REASON else None
+            )
+            (guarded if complexity is not None and complexity != "small" else kept).append(candidate)
+        return kept, guarded
+
     def _main_commit_time(self) -> datetime | None:
         """When origin/main last moved, from the local ref; ``None`` if unreadable."""
         if self._main_commit_date is None:
@@ -1752,6 +1816,17 @@ class NexusInitiativeService:
             if not found:
                 return self._record(InitiativeDecision(
                     "idle", detail="every candidate is preflight-blocked on this main", tick_id=tick_id,
+                ))
+        if found:
+            found, guarded = self._without_free_tier_guarded(found)
+            if not found:
+                # Deferred before the paid planner: nothing is dispatched or charged.
+                return self._record(InitiativeDecision(
+                    DECISION_FREE_TIER_GUARD_DEFERRED,
+                    considered=guarded[:10],
+                    detail="free-tier guard active and only free-tier coders available for "
+                           "issues already planned as non-small: " + ", ".join(f"#{c.ref}" for c in guarded[:10]),
+                    tick_id=tick_id,
                 ))
         if not found:
             return self._record(
