@@ -19,6 +19,8 @@ from modules.coding_provider import (
     provider_of,
 )
 from modules.coding_worker import agent_watchdog_limits
+from modules import free_tier_guard
+from modules.free_tier_guard import FORMAT_FALLBACK_NOTE, FREE_TIER_CODERS
 from modules.experiment_handover import model_written_tests_block, with_model_written_tests
 from modules import handover_fact_check
 from modules.local_coding_worker import _goal_text, local_not_called_reason
@@ -305,6 +307,21 @@ class ImplementationMixin:
         # Record which coding agent got this experiment before the call, so a timeout or
         # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
+        if implementation_provider in FREE_TIER_CODERS and self._free_tier_blocked(experiment, elog):
+            # #763: the free tier failed on format too often lately; work that is
+            # not small starts on the next provider instead.
+            guarded = other_provider(implementation_provider, db_path=self.db_path)
+            if guarded is not None:
+                elog.warning(
+                    "implementation", "free_tier_guard_skipped",
+                    f"free-tier format failures above the limit; complexity "
+                    f"{experiment.complexity or 'unknown'} runs on {guarded} instead of "
+                    f"{implementation_provider}",
+                    provider=guarded, skipped_provider=implementation_provider,
+                )
+                worker = build_worker(guarded, db_path=self.db_path)
+                implementation_provider = guarded
+        self._note_free_tier_start(experiment_id, implementation_provider)
         self._force_status(
             experiment_id, STATUS_IMPLEMENTING,
             implementation_provider=implementation_provider,
@@ -382,6 +399,7 @@ class ImplementationMixin:
                 implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
             worker = self.worker_factory(worktree_path)
             implementation_provider = provider_of(worker)
+            self._note_free_tier_start(experiment_id, implementation_provider)
             elog.warning(
                 "implementation", "implementation_provider_fallback",
                 f"local attempt requires paid fallback; implementation runs on "
@@ -415,6 +433,65 @@ class ImplementationMixin:
             )
             if self._ended_from_outside(experiment_id):
                 return self.get_experiment(experiment_id)
+
+        if (
+            implementation_provider in FREE_TIER_CODERS
+            and implementation_result.error
+            and not implementation_result.timed_out
+            and free_tier_guard.is_format_failure(implementation_result.error)
+        ):
+            # #763: counted even when partial edits keep the run on this coder.
+            self._force_status(
+                experiment_id, STATUS_IMPLEMENTING, free_tier_format_failures=1,
+            )
+            handover = (
+                other_provider(implementation_provider, db_path=self.db_path)
+                if self._worktree_untouched(worktree_path, elog)
+                and self.get_experiment(experiment_id).status != STATUS_CANCELLED
+                else None
+            )
+            if handover is not None:
+                # The free coder answered but no edit could be applied and the
+                # worktree is untouched: the next provider takes this same run
+                # instead of the attempt failing. It gets a one-line note, never
+                # the free answer (no tokens spent on it).
+                free_answer = str(
+                    implementation_result.final_message or implementation_result.stdout or ""
+                )[:300]
+                elog.warning(
+                    "implementation", "implementation_provider_fallback",
+                    f"{implementation_provider} returned no usable edit; implementation runs on "
+                    f"{handover}: {implementation_result.error[:300]}",
+                    provider=handover,
+                    reason="free_tier_format_failure",
+                    paid_fallback_used=free_tier_guard.is_paid(handover),
+                    free_tier_provider=implementation_provider,
+                    free_answer=free_answer,
+                )
+                implementation_prompt = f"{implementation_prompt.rstrip()}\n\n{FORMAT_FALLBACK_NOTE}\n"
+                worker = build_worker(handover, db_path=self.db_path)
+                implementation_provider = handover
+                self._force_status(
+                    experiment_id, STATUS_IMPLEMENTING,
+                    implementation_provider=implementation_provider,
+                )
+                live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
+                implementation_result = worker.run(
+                    task=implementation_prompt,
+                    working_dir=worktree_path,
+                    sandbox="workspace-write",
+                    timeout_seconds=max_seconds,
+                    stall_seconds=stall_seconds,
+                    experiment_logger=elog,
+                    phase="implementation",
+                    on_process=lambda process: self._track_process(experiment_id, process),
+                    on_live_usage=live_usage,
+                )
+                implementation_usage_json = self._usage_after_run(
+                    experiment_id, implementation_result, live_state, elog
+                )
+                if self._ended_from_outside(experiment_id):
+                    return self.get_experiment(experiment_id)
 
         if (
             implementation_result.error
@@ -529,6 +606,40 @@ class ImplementationMixin:
             github_work_tracking=github_work_tracking,
         )
 
+
+    def _free_tier_blocked(self, experiment: Experiment, elog: Any) -> bool:
+        """Whether the free-tier guard (#763) keeps *experiment* off the free tier."""
+        try:
+            with self._lock:
+                return free_tier_guard.blocks_free_tier(self._conn, experiment.complexity)
+        except Exception as exc:  # noqa: BLE001 - the guard must never stop a run
+            elog.warning(
+                "implementation", "free_tier_guard_failed",
+                f"could not read the free-tier stats: {type(exc).__name__}: {exc}",
+            )
+            return False
+
+    def _note_free_tier_start(self, experiment_id: str, provider: str | None) -> None:
+        """Count a run that starts on a free-tier coder (#763), once per experiment."""
+        if provider not in FREE_TIER_CODERS:
+            return
+        if self.get_experiment(experiment_id).free_tier_provider is not None:
+            return
+        self._force_status(
+            experiment_id, STATUS_IMPLEMENTING,
+            free_tier_provider=provider, free_tier_format_failures=0,
+        )
+
+    def _worktree_untouched(self, worktree_path: str, elog: Any) -> bool:
+        """``git status --porcelain`` is empty: no partial edit would be thrown away."""
+        try:
+            proc = _run_git(
+                ["status", "--porcelain"], cwd=worktree_path, timeout=30,
+                elog=elog, phase="implementation",
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False  # unknown state: keep whatever may be there
+        return proc.returncode == 0 and not proc.stdout.strip()
 
     def _note_provider_limit(self, provider: str | None, error: Any, elog: Any) -> None:
         """Persist the cooldown of a provider that hit its usage limit (#753).

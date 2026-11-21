@@ -43,6 +43,12 @@ def render(conn: sqlite3.Connection, *, now: datetime, budget: int, spent: int,
         state = "idle, waiting for the next tick (every 15 min)"
     lines.append(f"**State:** {state}")
     lines.append(f"**Budget:** {spent} of {budget or 'unlimited'} paid starts used in the last 24h")
+    try:
+        from modules.free_tier_guard import status_line
+
+        lines.append(status_line(conn))  # #763: the free-tier format guard setting
+    except Exception as exc:  # noqa: BLE001 - the status must never fail a tick
+        logger.info("status issue: free-tier guard unavailable: %s", exc)
     lines += ["", "**Recent experiments**", ""]
     try:
         rows = conn.execute(

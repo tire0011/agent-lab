@@ -436,6 +436,10 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
+    # Free-tier coder the implementation started on (#763) and whether it failed
+    # on output format (0/1); NULL for runs that never started on the free tier.
+    ("free_tier_provider", "TEXT"),
+    ("free_tier_format_failures", "INTEGER"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
