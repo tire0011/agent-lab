@@ -1097,6 +1097,9 @@ class NexusInitiativeService:
             if counted[number] >= limit[number] and number not in blocked
         }
         blocked.update(n for n, count in counted.items() if count >= limit[n])
+        # For the compact shadow prompt (#781): attempts left per issue with
+        # failed attempts; an issue missing here has all of them.
+        self._attempts_left = {n: max(0, limit[n] - counted[n]) for n in counted}
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():
@@ -1491,8 +1494,13 @@ class NexusInitiativeService:
         if not issues and not (act and self._exhausted_issues and self._issue_creator is not None):
             return []
         self._planner_called = True
+        attempts_left = getattr(self, "_attempts_left", {})
         choice = self._planner.choose(
-            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", "")} for c in issues],
+            # attempts_left / review_blocked feed only the compact shadow
+            # prompt (#781); the paid planning_prompt ignores them.
+            [{"number": int(c.ref), "title": c.title, "body": c.payload.get("body", ""),
+              "attempts_left": attempts_left.get(int(c.ref), _MAX_ISSUE_ATTEMPTS),
+              "review_blocked": c.reason == REVIEW_RETRY_REASON} for c in issues],
             recent=self._recent_experiments(),
             exhausted=self._exhausted_issues,
             proposals=self._open_proposal_titles,

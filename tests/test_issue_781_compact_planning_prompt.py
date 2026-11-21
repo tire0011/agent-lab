@@ -189,5 +189,40 @@ class CompactShadowCallTests(unittest.TestCase):
         self.assertEqual(row["error"], "skipped: prompt_over_budget")
 
 
+class InitiativePassesAttemptsTests(unittest.TestCase):
+    """The initiative hands attempts left and the review tag to the planner."""
+
+    def test_planner_issues_carry_attempts_left_and_review_tag(self):
+        import sqlite3
+
+        from tests.test_nexus_initiative import InitiativeFixture
+
+        fx = InitiativeFixture()
+        seen = []
+
+        class Planner:
+            def choose(self, issues, **_):
+                seen.extend(issues)
+                return None
+
+        fx.add_experiment("e1", "timed_out")
+        with sqlite3.connect(fx.db_path) as conn:
+            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) "
+                         "VALUES (?, ?)", ("e1", 235))
+        issues = [
+            {"number": 235, "author": {"login": "tire0011"}, "title": "Retry me", "body": ""},
+            {"number": 236, "author": {"login": "tire0011"}, "title": "Fresh", "body": ""},
+        ]
+        svc = fx.service(issue_lister=lambda: [dict(i) for i in issues], planner=Planner())
+        self.addCleanup(svc.close)
+        svc.tick()
+        by_number = {i["number"]: i for i in seen}
+        self.assertEqual(by_number[235]["attempts_left"], 1)
+        self.assertEqual(by_number[236]["attempts_left"], 2)
+        self.assertFalse(by_number[236]["review_blocked"])
+        prompt = compact_planning_prompt(seen, None, None, None)
+        self.assertIn("#235 Retry me | attempts left: 1", prompt)
+
+
 if __name__ == "__main__":
     unittest.main()
