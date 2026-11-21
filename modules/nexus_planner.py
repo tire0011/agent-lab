@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -320,6 +321,88 @@ def compact_planning_prompt(
     return prompt
 
 
+# Planner shadow part 2 (#782): the json_schema answer format, the rate-based
+# call timeout and the prompt variant recorded with every shadow row.
+SHADOW_PROMPT_VARIANT = "compact_v1"
+SHADOW_SCHEMA_NAME = "planner_shadow"
+SHADOW_REASON_MAX_LENGTH = 160
+# The answer is expected to stay short: a number and one sentence.
+SHADOW_GENERATION_TOKENS = 120
+SHADOW_TIMEOUT_SLACK_SECONDS = 10.0
+SHADOW_TIMEOUT_CAP_SECONDS = 240.0
+# Used when no local rate sample exists at all, so the timeout is never zero.
+SHADOW_TIMEOUT_FALLBACK_SECONDS = 120.0
+
+
+def shadow_response_format(allowed: set[int]) -> dict[str, Any]:
+    """The json_schema wire format the shadow call is sent with (#782).
+
+    ``issue`` is an enum of exactly the allowed issue numbers, so a conforming
+    server cannot answer with a number that is not allowed; ``reason`` is a
+    short string. Built through :func:`modules.llama_cpp_client.json_schema_response_format`,
+    the shape both llama-server and Azure actually apply (#218).
+    """
+    from modules.llama_cpp_client import json_schema_response_format
+    return json_schema_response_format(
+        SHADOW_SCHEMA_NAME,
+        {
+            "type": "object",
+            "properties": {
+                "issue": {"type": "integer", "enum": sorted(int(n) for n in allowed)},
+                "reason": {"type": "string", "maxLength": SHADOW_REASON_MAX_LENGTH},
+            },
+            "required": ["issue", "reason"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def _positive_rate(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def shadow_timeout_seconds(prompt_tokens: int, rates: Any) -> float:
+    """The shadow call timeout derived from the measured local rates (#782).
+
+    ``prompt_tokens / prompt_tps + 120 / gen_tps + 10 s`` - prompt ingestion at
+    the measured prompt rate, a 120-token answer at the measured generation
+    rate, plus slack - capped at 240 s. *rates* is a
+    :class:`modules.local_model_rates.LocalModelRates`-like object with
+    ``medians()``; with no rate sample at all the fallback of 120 s is used.
+    """
+    try:
+        prompt_tokens = max(1, int(prompt_tokens))
+    except (TypeError, ValueError):
+        prompt_tokens = 1
+    try:
+        prompt_tps, gen_tps = rates.medians()
+    except Exception:  # noqa: BLE001 - a broken rates store must not break the tick
+        prompt_tps = gen_tps = None
+    if not (_positive_rate(prompt_tps) and _positive_rate(gen_tps)):
+        return SHADOW_TIMEOUT_FALLBACK_SECONDS
+    try:
+        seconds = (prompt_tokens / float(prompt_tps)
+                   + SHADOW_GENERATION_TOKENS / float(gen_tps)
+                   + SHADOW_TIMEOUT_SLACK_SECONDS)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return SHADOW_TIMEOUT_FALLBACK_SECONDS
+    if not math.isfinite(seconds):
+        return SHADOW_TIMEOUT_FALLBACK_SECONDS
+    return min(SHADOW_TIMEOUT_CAP_SECONDS, max(0.0, seconds))
+
+
+def _default_shadow_rates() -> Any:
+    """The rates bucket of the local model the shadow call uses (#782).
+
+    Local calls record their rates under the client's model name
+    (modules/local_coding_worker.py), so the planner reads the same bucket.
+    """
+    from modules.llama_cpp_client import default_model_name
+    from modules.local_model_rates import LocalModelRates
+    return LocalModelRates(model=default_model_name())
+
+
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
     """Ideas from your own post-experiment reflections (#630), with their evidence."""
     if not reflections:
@@ -434,22 +517,32 @@ class IssuePlanner:
     *explore* (prompt -> raw answer) is an agent that can read the code and
     use read-only tools (#384); *complete* is a single model call, used alone
     or when exploring fails.
+
+    *shadow* is the non-blocking local comparison (#671, #782): it is called as
+    ``shadow(prompt, response_format)`` on a daemon thread and may return the
+    raw answer string or a dict ``{"content": ..., "cached_prompt_tokens": ...}``
+    when the server reported reused prompt tokens. *rates* is a
+    LocalModelRates-like object whose ``medians()`` size the shadow timeout;
+    by default the local model's own rates bucket is used. *shadow_timeout*
+    caps that rate-based timeout (default: the 240 s cap of #782).
     """
 
     def __init__(
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
-        shadow: Callable[[str], str] | None = None,
+        shadow: Callable[[str, dict[str, Any] | None], Any] | None = None,
         *,
         db_path: str | None = None,
-        shadow_timeout: float = 60.0,
+        shadow_timeout: float | None = SHADOW_TIMEOUT_CAP_SECONDS,
+        rates: Any = None,
     ) -> None:
         self._complete = complete
         self._explore = explore
         self._shadow = shadow
         self._db_path = db_path
         self._shadow_timeout = shadow_timeout
+        self._rates = rates
 
     def choose(
         self,
@@ -518,37 +611,59 @@ class IssuePlanner:
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=None, local_valid=0,
                        prompt_tokens=0, seconds=0.0,
-                       error="skipped: prompt_over_budget")
+                       error="skipped: prompt_over_budget",
+                       prompt_variant=SHADOW_PROMPT_VARIANT)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store skip: %s", exc)
             return
         prompt = compact + shadow_instructions
         prompt_tokens = max(1, estimate_tokens(prompt))
+        # The answer schema restricts issue to the allowed numbers (#782).
+        response_format = shadow_response_format(allowed)
+        # The call timeout comes from the measured local rates, capped at 240 s
+        # and falling back to 120 s without samples; the tick never waits on it
+        # because the call stays on the daemon thread below.
+        rates = self._rates if self._rates is not None else _default_shadow_rates()
+        timeout = shadow_timeout_seconds(prompt_tokens, rates)
+        if self._shadow_timeout is not None:
+            timeout = min(timeout, float(self._shadow_timeout))
 
         def monitor() -> None:
-            result: list[str] = []
+            result: list[Any] = []
             failure: list[BaseException] = []
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt))  # type: ignore[misc]
+                    result.append(self._shadow(prompt, response_format))  # type: ignore[misc]
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
             started = time.monotonic()
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(self._shadow_timeout)
+            worker.join(timeout)
             elapsed = time.monotonic() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
+            cached_prompt_tokens: int | None = None
             if worker.is_alive():
-                error = f"timeout after {self._shadow_timeout:g}s"
+                error = f"timeout after {timeout:g}s"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
-                data = _json_object(result[0] if result else "")
+                raw = result[0] if result else ""
+                content: Any = raw
+                if isinstance(raw, dict):
+                    # A shadow callable that knows the server timings returns
+                    # {"content": ..., "cached_prompt_tokens": ...} (#782).
+                    content = raw.get("content", "")
+                    cached = raw.get("cached_prompt_tokens")
+                    if (isinstance(cached, (int, float)) and not isinstance(cached, bool)
+                            and math.isfinite(cached) and cached >= 0):
+                        cached_prompt_tokens = int(cached)
+                text = content if isinstance(content, str) else ("" if content is None else str(content))
+                data = _json_object(text)
                 if data is None:
                     error = "invalid JSON"
                 else:
@@ -564,7 +679,9 @@ class IssuePlanner:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error)
+                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
+                       prompt_variant=SHADOW_PROMPT_VARIANT,
+                       cached_prompt_tokens=cached_prompt_tokens)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store result: %s", exc)
 

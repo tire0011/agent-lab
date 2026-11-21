@@ -92,7 +92,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         unreserved = compact_planning_prompt(issues, outcomes, [], 3)
         self.assertGreater(len(unreserved.encode("utf-8")) + suffix_bytes, cap)
 
-        def fake_shadow(prompt):
+        def fake_shadow(prompt, response_format):
             received.append(prompt)
             return '{"issue": 179, "reason": "local"}'
 
@@ -128,7 +128,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         received = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "250"}):
             choice = self.planner(
-                lambda p: received.append(p) or '{"issue": 139, "reason": "x"}',
+                lambda p, _rf: received.append(p) or '{"issue": 139, "reason": "x"}',
                 paid=PAID_MANY,
             ).choose(many_issues(), nine_outcomes(), budget_left=3)
         self.assertEqual(choice.issue, 139)
@@ -141,7 +141,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
     def test_tiny_env_budget_skips_the_call_and_writes_the_skip_row_synchronously(self):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
-            choice = self.planner(lambda p: called.append(p) or "{}").choose(
+            choice = self.planner(lambda p, _rf: called.append(p) or "{}").choose(
                 ISSUES, tick_id="tick-skip")
         # The paid choice is unaffected and no shadow model call was made.
         self.assertEqual(choice.issue, 2)
@@ -168,7 +168,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
                 BEGIN SELECT RAISE(ABORT, 'interrupted write'); END
             """)
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
-            planner = self.planner(lambda p: called.append(p) or "{}")
+            planner = self.planner(lambda p, _rf: called.append(p) or "{}")
             with self.assertLogs(nexus_planner.logger, level="WARNING") as logs:
                 self.assertEqual(planner.choose(ISSUES, tick_id="replay").issue, 2)
             self.assertIn("interrupted write", logs.output[0])
@@ -184,7 +184,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         self.assertEqual(called, [])
 
     def test_shadow_worker_exit_records_a_complete_failure_row(self):
-        def exiting_shadow(_):
+        def exiting_shadow(*_):
             raise SystemExit("worker interrupted")
 
         self.assertEqual(self.planner(exiting_shadow).choose(ISSUES, tick_id="exit").issue, 2)
@@ -198,7 +198,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
     def test_default_budget_never_writes_a_skip_row(self):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS", None)
-            self.planner(lambda _: '{"issue": 1, "reason": "local"}').choose(ISSUES)
+            self.planner(lambda *_: '{"issue": 1, "reason": "local"}').choose(ISSUES)
         row = self.wait_for_row()
         self.assertNotIn("skipped", row["error"] or "")
         self.assertGreater(row["prompt_tokens"], 0)
@@ -230,7 +230,7 @@ class PaidPromptUnchangedTests(unittest.TestCase):
         paid_prompts = []
         planner = IssuePlanner(
             lambda p: paid_prompts.append(p) or PAID_SNAP,
-            shadow=lambda _: self.fail("over-budget shadow should be skipped"),
+            shadow=lambda *_: self.fail("over-budget shadow should be skipped"),
             db_path=db,
         )
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "1",

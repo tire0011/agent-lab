@@ -92,6 +92,15 @@ def normalize_timings(timings: Any) -> dict[str, float | int] | None:
     return result
 
 
+def default_model_name() -> str:
+    """The model a default :class:`LlamaCppClient` would use: ``LOCAL_MODEL_NAME``,
+    else the legacy ``LLAMA_CPP_MODEL``, else the built-in default."""
+    return (
+        os.getenv("LOCAL_MODEL_NAME")
+        or os.getenv("LLAMA_CPP_MODEL", _DEFAULT_MODEL_NAME)
+    )
+
+
 def json_schema_response_format(name: str, schema: dict[str, Any]) -> dict[str, Any]:
     """The wire shape a JSON schema must be sent in to actually be applied: both
     llama-server and Azure OpenAI read ``response_format.json_schema.schema``.
@@ -167,11 +176,7 @@ class LlamaCppClient:
         ).rstrip("/")
         self.timeout = timeout
         # Prefer the generic LOCAL_MODEL_NAME; fall back to legacy LLAMA_CPP_MODEL.
-        self.model = (
-            model
-            or os.getenv("LOCAL_MODEL_NAME")
-            or os.getenv("LLAMA_CPP_MODEL", _DEFAULT_MODEL_NAME)
-        )
+        self.model = model or default_model_name()
         self.last_timings: dict[str, float | int] | None = None
         # Measurements of the last streamed call (#667), ``None`` otherwise.
         self.last_stream: dict[str, Any] | None = None

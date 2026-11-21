@@ -318,20 +318,30 @@ def _planner(repo_root: str, db_path: str | None = None):
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
+    from modules.llama_cpp_client import LlamaCppClient
 
-    def shadow(prompt: str) -> str:
-        client = LlamaCppClient(timeout=55, stream=False)
+    def shadow(prompt: str, response_format: dict | None = None):
+        # Default client timeout (300 s): the planner's daemon thread enforces
+        # the rate-based shadow timeout (<= 240 s, #782), so the HTTP call must
+        # not be cut shorter than that by a hard-coded client timeout.
+        client = LlamaCppClient(stream=False)
+        kwargs = {}
+        if response_format is not None:
+            kwargs["response_format"] = response_format
         response = asyncio.run(client.chat_completion(
-            [{"role": "user", "content": prompt}], max_tokens=120,
-            response_format=json_schema_response_format(
-                "planner_shadow",
-                {"type": "object", "properties": {
-                    "issue": {"type": "integer"}, "reason": {"type": "string"}},
-                 "required": ["issue", "reason"], "additionalProperties": False},
-            ),
+            [{"role": "user", "content": prompt}], max_tokens=120, **kwargs,
         ))
-        return str(response["choices"][0]["message"]["content"])
+        content = str(response["choices"][0]["message"]["content"])
+        # Report the prompt tokens llama-server reused from its cache (#685),
+        # so the planner_shadow row can store them as cached_prompt_tokens (#782).
+        timings = client.last_timings or {}
+        cached = timings.get("tokens_cached")
+        return {
+            "content": content,
+            "cached_prompt_tokens": (int(cached)
+                                     if isinstance(cached, (int, float))
+                                     and not isinstance(cached, bool) else None),
+        }
 
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
