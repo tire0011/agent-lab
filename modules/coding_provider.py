@@ -140,6 +140,55 @@ def pinned_provider() -> str | None:
     return provider
 
 
+#: One-shot pin for the next selection, set by the initiative tick when it
+#: spends a provider-specific extra budget (``extra_budget_<provider>``).
+NEXT_PIN_SETTING = "coding_provider.pinned_next"
+#: A pin nobody used within this time is dropped (the dispatch never reached
+#: a coding run, e.g. a local-only retry).
+NEXT_PIN_TTL = timedelta(hours=3)
+
+
+def pin_next_provider(provider: str, *, db_path: str = DEFAULT_DB_PATH) -> None:
+    """Make the next :func:`choose_provider` call return *provider* once."""
+    # Only the settings table is touched; no full schema migration needed here.
+    conn = sqlite3.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS service_settings "
+                "(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL)"
+            )
+            conn.execute(
+                """
+                INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (NEXT_PIN_SETTING, _normalize(provider), datetime.now(timezone.utc).isoformat()),
+            )
+    finally:
+        conn.close()
+
+
+def _take_next_pin(conn: Any, candidates: list[str]) -> str | None:
+    """Consume a fresh one-shot pin inside the caller's transaction."""
+    row = conn.execute(
+        "SELECT value, updated_at FROM service_settings WHERE key = ?", (NEXT_PIN_SETTING,)
+    ).fetchone()
+    if row is None:
+        return None
+    conn.execute("DELETE FROM service_settings WHERE key = ?", (NEXT_PIN_SETTING,))
+    try:
+        set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+        if set_at.tzinfo is None:
+            set_at = set_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    if datetime.now(timezone.utc) - set_at > NEXT_PIN_TTL:
+        return None
+    provider = str(row[0])
+    return provider if provider in candidates else None
+
+
 def choose_provider(
     rng: Any | None = None, *, db_path: str = DEFAULT_DB_PATH
 ) -> str:
@@ -169,6 +218,12 @@ def choose_provider(
     conn = init_db(db_path)
     try:
         conn.execute("BEGIN IMMEDIATE")
+        once = _take_next_pin(conn, candidates)
+        if once is not None:
+            # A provider-specific extra start: this run uses that provider and
+            # the rotation position stays where it was.
+            conn.commit()
+            return once
         row = conn.execute(
             "SELECT value FROM service_settings WHERE key = ?",
             (_ROUND_ROBIN_SETTING,),
