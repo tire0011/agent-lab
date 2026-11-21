@@ -39,13 +39,20 @@ FAKE_VIBE = textwrap.dedent('''\
     if "--auto-approve" in args:
         open(os.path.join(opt("--workdir"), "edited.txt"), "w").write("vibe was here\\n")
     open(os.path.join(out, "export.json"), "w").write(json.dumps(export))
-    # The real vibe 3.x journal format (2026-11-20, checked on the VM).
-    print(json.dumps([
+    # The real vibe 3.x journal entries (checked on the VM); --output streaming
+    # prints one per line while the run works.
+    entries = [
         {{"type": "message", "role": "user", "content": [{{"type": "text", "text": "Add edited.txt"}}]}},
         {{"type": "reasoning", "text": "simple"}},
+        {{"type": "effect"}},
         {{"type": "message", "role": "assistant", "content": [{{"type": "text", "text": "done: "}},
                                                              {{"type": "text", "text": "edited.txt"}}]}},
-    ]))
+    ]
+    if opt("--output") == "streaming":
+        for entry in entries:
+            print(json.dumps(entry), flush=True)
+    else:
+        print(json.dumps(entries))
 ''')
 
 
@@ -86,6 +93,7 @@ class VibeWorkerTests(unittest.TestCase):
         self.assertEqual(result.thread_id, "s-1")
         self.assertTrue((self.workdir / "edited.txt").exists())
         args = self.recorded()["args"]
+        self.assertEqual(args[args.index("--output") + 1], "streaming")
         for flag in ("--prompt-file", "--output", "--output-dir", "--trust", "--auto-approve", "--time-limit"):
             self.assertIn(flag, args)
         self.assertEqual(args[args.index("--workdir") + 1], str(self.workdir))
@@ -124,6 +132,18 @@ class VibeWorkerTests(unittest.TestCase):
         result = VibeWorker(vibe_bin=str(self.root / "nope")).run("x", str(self.workdir))
         self.assertFalse(result.success)
         self.assertIn("not found", result.error)
+
+
+class StreamingProgressTests(unittest.TestCase):
+    def test_a_watched_run_sees_output_lines_while_vibe_works(self):
+        """The stall watchdog counts output lines; streaming must produce them."""
+        from modules.vibe_worker import _final_message
+        lines = "\n".join(json.dumps(e) for e in [
+            {"type": "message", "role": "user", "content": [{"type": "text", "text": "q"}]},
+            {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "pong"}]},
+        ])
+        self.assertEqual(_final_message(lines), "pong")
+        self.assertEqual(_final_message("not json at all"), "not json at all")
 
 
 class BinaryLookupTests(unittest.TestCase):

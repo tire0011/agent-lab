@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -141,6 +142,10 @@ def _resolve_seconds(
     return default
 
 
+class HungTest(Exception):
+    """A maintenance test run stopped making progress."""
+
+
 # Abort reasons, in the order the watchdog checks them.
 ABORT_SAFETY_CAP = "safety_cap_exceeded"
 ABORT_STALLED = "stalled"
@@ -193,6 +198,8 @@ def run_verification_test_monitored(
     test_log_dir: str | Path | None = None,
     prune_logs: bool = True,
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
+    tests_only_progress: bool = False,
+    test_env: Mapping[str, str] | None = None,
 ) -> VerificationRunResult:
     """Run the verification tests under a progress-aware watchdog.
 
@@ -212,7 +219,7 @@ def run_verification_test_monitored(
     observed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
-    env = build_verification_test_env()
+    env = build_verification_test_env() if test_env is None else dict(test_env)
     # Without this the child's stderr can sit in a block buffer when it is a
     # pipe, and "no progress" would then mean "no flush" - the watchdog would
     # abort healthy runs.
@@ -291,12 +298,19 @@ def run_verification_test_monitored(
         if snapshot["elapsed_seconds"] >= config.safety_cap_seconds:
             abort_reason, stall_snapshot = ABORT_SAFETY_CAP, snapshot
             break
-        if tracker.seconds_since_progress() >= config.stall_timeout_seconds:
+        if tracker.seconds_since_progress(tests_only=tests_only_progress) >= config.stall_timeout_seconds:
             abort_reason, stall_snapshot = ABORT_STALLED, snapshot
             break
 
     if abort_reason is not None:
-        _terminate(process)
+        if tests_only_progress and sys.platform == "linux":
+            _kill_process_tree(process.pid)
+            try:
+                process.wait(timeout=_TERMINATE_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                logger.error("verification test process %s survived SIGKILL", process.pid)
+        else:
+            _terminate(process)
 
     for reader in readers:
         reader.join(timeout=_TERMINATE_GRACE_SECONDS)
@@ -421,6 +435,47 @@ def _process_state(process: subprocess.Popen) -> dict[str, Any]:
         # problem: liveness alone already answers the important question.
         pass
     return state
+
+
+def _signal(pid: int, sig: int, *, group: bool = False) -> None:
+    try:
+        (os.killpg if group else os.kill)(pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def _kill_process_tree(pid: int) -> None:
+    # Descendants can have their own sessions. Freeze each generation before
+    # walking the Linux process tree so it cannot spawn more children.
+    _signal(pid, signal.SIGSTOP, group=True)
+    groups = {pid}
+    descendants = {pid}
+    pending = [pid]
+    try:
+        while pending:
+            parent = pending.pop()
+            for task in Path(f"/proc/{parent}/task").glob("*"):
+                try:
+                    children = (task / "children").read_text().split()
+                except OSError:
+                    continue
+                for child in map(int, children):
+                    if child in descendants:
+                        continue
+                    try:
+                        own_group = os.getpgid(child) == child
+                    except ProcessLookupError:
+                        continue
+                    if own_group:
+                        groups.add(child)
+                    _signal(child, signal.SIGSTOP, group=own_group)
+                    descendants.add(child)
+                    pending.append(child)
+    finally:
+        for child in descendants - groups:
+            _signal(child, signal.SIGKILL)
+        for group in groups:
+            _signal(group, signal.SIGKILL, group=True)
 
 
 def _terminate(process: subprocess.Popen) -> None:

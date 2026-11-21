@@ -9,6 +9,7 @@ built as ``api.py`` builds them.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import logging
 import os
@@ -17,8 +18,10 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from modules import github_authorization
 from modules.logging_config import configure_logging
@@ -47,6 +50,34 @@ def _service_diagnostics() -> dict:
     )
     with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 - fixed/operator URL
         return json.loads(response.read().decode("utf-8"))
+
+
+_REVERIFY_URL_ENV = "NEXUS_REVERIFY_URL"
+_DEFAULT_REVERIFY_URL = "http://127.0.0.1:8000/internal/reverify-parked"
+
+
+def _launch_parked_reverification() -> None:
+    """Hand parked re-verification to the API service; never wait for it (#766).
+
+    The short timeout bounds only the hand-off itself. The API answers 202 at
+    once and runs the attempt in its own background thread.
+    """
+    key = os.environ.get("AGENT_API_KEY")
+    if not key:
+        return
+    # Configurable like NEXUS_DIAGNOSTICS_URL and NEXUS_MCP_URL; plain HTTP
+    # only, because the endpoint is the loopback uvicorn behind nginx.
+    url = urllib.parse.urlsplit(os.environ.get(_REVERIFY_URL_ENV) or _DEFAULT_REVERIFY_URL)
+    if url.scheme != "http" or not url.hostname:
+        raise RuntimeError(f"{_REVERIFY_URL_ENV} must be an http:// URL")
+    connection = http.client.HTTPConnection(url.hostname, url.port or 80, timeout=2)
+    try:
+        connection.request("POST", url.path or "/", headers={"x-api-key": key})
+        with connection.getresponse() as response:
+            if response.status != 202:
+                raise RuntimeError(f"re-verification hand-off returned HTTP {response.status}")
+    finally:
+        connection.close()
 
 
 def _restart_stale_service() -> None:
@@ -331,12 +362,20 @@ def _build_service(args) -> NexusInitiativeService:
                 experiment_service=experiment_service,
             )
         )
+    # The local API owns its configured repository and database. A tick run
+    # pointed at an alternate checkout or database must not trigger it.
+    use_api_reverification = (
+        controller is not None
+        and Path(args.db_path).resolve() == Path(DEFAULT_DB_PATH).resolve()
+        and Path(args.repo_root).resolve() == Path(__file__).resolve().parent
+    )
     return NexusInitiativeService(
         db_path=args.db_path,
         experiment_service=experiment_service,
         adoption_service=adoption_service,
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
+        reverification_launcher=_launch_parked_reverification if use_api_reverification else None,
         planner=_planner(args.repo_root, args.db_path) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
@@ -580,6 +619,46 @@ def _notify(repo_root: str, messages: list[str]) -> None:
         logger.warning("notify: comment failed: %s", exc)
 
 
+def _record_tick_start(db_path: str, started_at: datetime) -> None:
+    """Keep and log the maximum interval ending in the last three days."""
+    if db_path == ":memory:":
+        return
+    try:
+        conn = sqlite3.connect(db_path, timeout=1)
+        try:
+            with conn:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS initiative_tick_starts "
+                    "(started_at REAL PRIMARY KEY, gap_seconds REAL)"
+                )
+                current = started_at.timestamp()
+                previous = conn.execute(
+                    "SELECT MAX(started_at) FROM initiative_tick_starts WHERE started_at < ?",
+                    (current,),
+                ).fetchone()[0]
+                gap = current - previous if previous is not None else None
+                conn.execute("INSERT OR IGNORE INTO initiative_tick_starts VALUES (?, ?)",
+                             (current, gap))
+                conn.execute("DELETE FROM initiative_tick_starts WHERE started_at < ?",
+                             (current - timedelta(days=3).total_seconds(),))
+                maximum = conn.execute(
+                    "SELECT MAX(gap_seconds) FROM initiative_tick_starts"
+                ).fetchone()[0]
+        finally:
+            conn.close()
+    except sqlite3.Error as exc:
+        logger.warning("could not record initiative tick start: %s", exc)
+        return
+    if gap is None:
+        logger.info("initiative tick start recorded; waiting for the next start to measure cadence")
+    else:
+        logger.log(
+            logging.WARNING if gap >= 20 * 60 else logging.INFO,
+            "initiative tick start gap %.1fs; maximum over the last 72h %.1fs (target <1200s)",
+            gap, maximum,
+        )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH)
@@ -597,13 +676,16 @@ def main(argv: list[str] | None = None) -> int:
              "(no LLM controller is constructed)",
     )
     args = parser.parse_args(argv)
-    started_at = datetime.now(timezone.utc).isoformat()
+    tick_start = datetime.now(timezone.utc)
+    started_at = tick_start.isoformat()
     _events.clear()
     decision = None
 
     # --dry-run reports what would happen and changes nothing, reaping
     # included.
     if not args.dry_run:
+        if not args.integration_only:
+            _record_tick_start(args.db_path, tick_start)
         _reconcile_stale_claims(args.db_path)
         from modules.main_guard import guard_main
 

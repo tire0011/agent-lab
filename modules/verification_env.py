@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Mapping
 
 _SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization|openai|azure|codex|ssh|agent_mailbox)")
@@ -43,6 +45,10 @@ VERIFICATION_TEST_API_KEY = "test-key"
 # run under drift as well (#736).
 CLOCK_DRIFT_ENV = "NEXUS_TEST_CLOCK_DRIFT_MS"
 
+# Same value tests/conftest.py assigns: port 9 (discard) refuses at once.
+UNREACHABLE_LOCAL_MODEL_URL = "http://127.0.0.1:9"
+LOCAL_MODEL_URL_ENVS = ("LOCAL_MODEL_URL", "LLAMA_CPP_BASE_URL", "LLAMA_API_URL")
+
 
 def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the isolated environment for one verification test subprocess.
@@ -59,4 +65,27 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
     env.pop(CLOCK_DRIFT_ENV, None)
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
+    # The service environment exports ``AGENT_DB_PATH`` pointing at the
+    # production database (nexus-tick.service sets it), and the verification
+    # suite also runs via ``python -m unittest discover`` - where
+    # ``tests/conftest.py`` does not execute. Without this, ``DEFAULT_DB_PATH``
+    # binds to the production database at import time and any test using a
+    # default path opens and locks it while the API service is writing; a
+    # suite run inside the tick hung for hours on exactly this (#766).
+    # Under pytest, conftest.py assigns its own temporary path anyway.
+    if "AGENT_DB_PATH" in source:
+        env["AGENT_DB_PATH"] = str(
+            Path(tempfile.mkdtemp(prefix="nexus-verification-db-")) / "agent.db"
+        )
+    # Same reason, and the actual cause of the 2026-11-19 tick hang (#766):
+    # under unittest discovery conftest.py does not redirect the local model,
+    # so a default-constructed LlamaCppClient talks to the real llama-server
+    # (it falls back to 127.0.0.1:8080 even when no variable is set). A
+    # mailbox test's background failure analysis queued a real inference
+    # there, and LocalLlmJobService.close() finishes an in-flight job before
+    # returning - minutes at ~3 tok/s, behind Nexus's own controller jobs.
+    # Assigned unconditionally, like conftest.py: connection refused is
+    # immediate, and a test that needs a model server sets its own URL.
+    for name in LOCAL_MODEL_URL_ENVS:
+        env[name] = UNREACHABLE_LOCAL_MODEL_URL
     return env

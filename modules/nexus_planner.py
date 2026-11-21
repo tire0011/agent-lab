@@ -97,6 +97,10 @@ def _history_line(r: dict[str, Any]) -> str:
         reason = r.get("adoption_reason") or ""
         detail = reason or r.get("error") or ""
         head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
+    verdict = r.get("reverification_verdict")
+    if verdict in {"hung_test", "reverify_timeout"}:
+        reason = r.get("reverification_reason")
+        detail = f"{verdict} — {reason}" if reason else verdict
     drift = (
         f" [commits_behind={r.get('commits_behind', 'unknown')}, "
         f"overlap_files={r.get('overlap_files', 'unknown')}]"

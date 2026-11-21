@@ -310,14 +310,12 @@ class ProgressTracker:
             with self._lock:
                 self._total_tests = total
 
-    def seconds_since_progress(self) -> float:
+    def seconds_since_progress(self, *, tests_only: bool = False) -> float:
         """Seconds since the newest signal the stall rule trusts."""
         with self._lock:
-            reference = (
-                self._last_test_event_monotonic
-                if self._last_test_event_monotonic is not None
-                else self._last_activity_monotonic
-            )
+            reference = self._last_test_event_monotonic
+            if reference is None:
+                reference = self._started_monotonic if tests_only else self._last_activity_monotonic
         return max(0.0, time.monotonic() - reference)
 
     def elapsed_seconds(self) -> float:
