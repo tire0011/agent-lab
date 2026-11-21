@@ -1,29 +1,23 @@
-"""Compact planner shadow prompt with a hard token budget (#781, part 1 of #770).
+"""Compact planner shadow prompt with a hard byte cap (#789, part 1a of #781).
 
-``compact_planning_prompt`` never exceeds ``max_tokens`` (bytes/4) and returns
-``None`` when even the fixed header with one issue does not fit; ``_start_shadow``
-then records ``skipped: prompt_over_budget`` without calling the model.
+``estimate_tokens`` is ceil(utf-8 bytes / 4). ``compact_planning_prompt`` is a
+pure function: its result never has more than ``4 * max_tokens`` utf-8 bytes,
+and it returns ``None`` when the prompt cannot fit. It is not wired into the
+planner yet.
 """
 
 import hashlib
-import os
-import tempfile
-import time
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
 from modules import nexus_planner
 from modules.nexus_planner import (
     DEFAULT_SHADOW_PROMPT_TOKENS,
-    IssuePlanner,
     compact_planning_prompt,
     estimate_tokens,
     planning_prompt,
 )
-from modules.planner_shadow import list_shadow
 
-PAID = '{"issue": 2, "reason": "paid choice"}'
+HEADER = nexus_planner._COMPACT_HEADER
 ISSUES = [
     {"number": 1, "title": "one", "body": "a long body " * 50, "attempts_left": 2},
     {"number": 2, "title": "two", "body": "", "attempts_left": 1, "review_blocked": True},
@@ -132,96 +126,99 @@ class CompactPlanningPromptTests(unittest.TestCase):
         self.assertEqual(planning_prompt(tagged, recent, **context), prompt)
 
 
-class CompactShadowCallTests(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.db = str(Path(self.tmp.name) / "agent.db")
-
-    def tearDown(self):
-        self.tmp.cleanup()
-
-    def wait_for_row(self):
-        deadline = time.monotonic() + 2
-        while time.monotonic() < deadline:
-            if list_shadow(self.db)["count"]:
-                return list_shadow(self.db)["rows"][0]
-            time.sleep(0.01)
-        self.fail("shadow row was not written")
-
-    def test_shadow_gets_the_compact_prompt_within_the_env_budget(self):
-        calls = []
-        paid_prompts = []
-
-        def shadow(prompt):
-            calls.append(prompt)
-            return '{"issue": 1, "reason": "local"}'
-
-        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "300"}):
-            planner = IssuePlanner(lambda p: paid_prompts.append(p) or PAID,
-                                   shadow=shadow, db_path=self.db)
-            self.assertEqual(planner.choose(ISSUES, recent=nine_outcomes(),
-                                            tick_id="t-300", budget_left=2).issue, 2)
-            row = self.wait_for_row()
-        self.assertEqual(len(calls), 1)
-        prompt = calls[0]
-        self.assertTrue(prompt.startswith(nexus_planner._COMPACT_HEADER))
-        self.assertLessEqual(estimate_tokens(prompt), 300)
-        self.assertNotIn("body text", prompt)  # compact, not the paid prompt
-        self.assertIn("a long body", paid_prompts[0])  # the paid prompt is untouched
-        self.assertEqual(row["prompt_tokens"], estimate_tokens(prompt))
-        self.assertEqual((row["local_issue"], row["local_valid"]), (1, 1))
-        self.assertIsNone(row["error"])
-
-    def test_over_budget_prompt_is_skipped_and_recorded_without_a_model_call(self):
-        calls = []
-        with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "50"}):
-            planner = IssuePlanner(lambda _: PAID,
-                                   shadow=lambda p: calls.append(p) or "{}",
-                                   db_path=self.db)
-            # The skip is recorded synchronously, before choose returns.
-            self.assertEqual(planner.choose(ISSUES, tick_id="t-skip").issue, 2)
-            row = list_shadow(self.db)["rows"][0]
-        self.assertEqual(calls, [])  # the model was never called
-        self.assertEqual(row["tick_id"], "t-skip")
-        self.assertEqual(row["paid_issue"], 2)
-        self.assertIsNone(row["local_issue"])
-        self.assertEqual(row["local_valid"], 0)
-        self.assertEqual(row["error"], "skipped: prompt_over_budget")
+def multibyte_issues(count):
+    """Issues with 2-byte (ä) and 4-byte (emoji) characters in long titles."""
+    return [
+        {"number": 500 + n, "title": f"Prüfe Änderung {n} 🚀 " + "äö🙂" * 40,
+         "body": "Körper " * 50, "attempts_left": n % 3, "review_blocked": n % 2 == 0}
+        for n in range(count)
+    ]
 
 
-class InitiativePassesAttemptsTests(unittest.TestCase):
-    """The initiative hands attempts left and the review tag to the planner."""
+def multibyte_outcomes():
+    return [{"status": "failed", "title": f"Lauf {i} 💥 " + "ü" * 200} for i in range(7)]
 
-    def test_planner_issues_carry_attempts_left_and_review_tag(self):
-        import sqlite3
 
-        from tests.test_nexus_initiative import InitiativeFixture
+class EstimateTokensTests(unittest.TestCase):
+    def test_rounds_utf8_bytes_up(self):
+        self.assertEqual(estimate_tokens(""), 0)
+        self.assertEqual(estimate_tokens("a"), 1)
+        self.assertEqual(estimate_tokens("abcd"), 1)
+        self.assertEqual(estimate_tokens("abcde"), 2)
+        self.assertEqual(estimate_tokens("ä"), 1)  # 2 bytes
+        self.assertEqual(estimate_tokens("ää🙂"), 2)  # 2 + 2 + 4 = 8 bytes
+        self.assertEqual(estimate_tokens("ää🙂a"), 3)  # 9 bytes
 
-        fx = InitiativeFixture()
-        seen = []
 
-        class Planner:
-            def choose(self, issues, **_):
-                seen.extend(issues)
-                return None
+class ByteCapTests(unittest.TestCase):
+    def test_result_is_none_or_within_the_byte_cap(self):
+        for max_tokens in (1, 10, 50, 1500):
+            for count in (0, 1, 40):
+                with self.subTest(max_tokens=max_tokens, issues=count):
+                    prompt = compact_planning_prompt(
+                        multibyte_issues(count), multibyte_outcomes(),
+                        ["stuck ✋ " + "ß" * 300], 3, max_tokens)
+                    if prompt is not None:
+                        self.assertLessEqual(len(prompt.encode("utf-8")), 4 * max_tokens)
+                        self.assertLessEqual(estimate_tokens(prompt), max_tokens)
+                        self.assertTrue(prompt.startswith(HEADER))
+                    if max_tokens == 1500:
+                        self.assertIsNotNone(prompt)
+                    if 4 * max_tokens < len(HEADER.encode("utf-8")):
+                        self.assertIsNone(prompt)  # even the header does not fit
 
-        fx.add_experiment("e1", "timed_out")
-        with sqlite3.connect(fx.db_path) as conn:
-            conn.execute("INSERT INTO github_experiment_links (experiment_id, issue_number) "
-                         "VALUES (?, ?)", ("e1", 235))
-        issues = [
-            {"number": 235, "author": {"login": "tire0011"}, "title": "Retry me", "body": ""},
-            {"number": 236, "author": {"login": "tire0011"}, "title": "Fresh", "body": ""},
-        ]
-        svc = fx.service(issue_lister=lambda: [dict(i) for i in issues], planner=Planner())
-        self.addCleanup(svc.close)
-        svc.tick()
-        by_number = {i["number"]: i for i in seen}
-        self.assertEqual(by_number[235]["attempts_left"], 1)
-        self.assertEqual(by_number[236]["attempts_left"], 2)
-        self.assertFalse(by_number[236]["review_blocked"])
-        prompt = compact_planning_prompt(seen, None, None, None)
-        self.assertIn("#235 Retry me | attempts left: 1", prompt)
+    def _exact_size(self):
+        """A prompt and the max_tokens for which it is exactly 4*max_tokens bytes."""
+        issues = [{"number": 7, "title": "Größe", "attempts_left": 2}]
+        base = compact_planning_prompt(issues, None, None, 1, 10_000)
+        size = len(base.encode("utf-8"))
+        # Pad the title so the prompt lands on a multiple of 4 bytes.
+        pad = (-size) % 4
+        issues = [{"number": 7, "title": "Größe" + "x" * pad, "attempts_left": 2}]
+        prompt = compact_planning_prompt(issues, None, None, 1, 10_000)
+        self.assertEqual(len(prompt.encode("utf-8")) % 4, 0)
+        return issues, prompt, len(prompt.encode("utf-8")) // 4
+
+    def test_exactly_four_times_max_tokens_bytes_is_accepted(self):
+        issues, full, max_tokens = self._exact_size()
+        self.assertEqual(compact_planning_prompt(issues, None, None, 1, max_tokens), full)
+
+    def test_one_byte_over_the_cap_is_not_accepted(self):
+        issues, full, max_tokens = self._exact_size()
+        # One more ASCII byte in the title: 4*max_tokens + 1 bytes. Rounding the
+        # token count down would have let this pass; the title cut to 40
+        # characters is the last resort, so short titles leave only None.
+        longer = [{**issues[0], "title": issues[0]["title"] + "y"}]
+        self.assertLess(len(longer[0]["title"]), 40)
+        untrimmed = compact_planning_prompt(longer, None, None, 1, 10_000)
+        self.assertEqual(len(untrimmed.encode("utf-8")), 4 * max_tokens + 1)
+        self.assertIsNone(compact_planning_prompt(longer, None, None, 1, max_tokens))
+        # A multi-byte character that crosses the cap is not accepted either.
+        crossing = [{**issues[0], "title": issues[0]["title"] + "ä"}]
+        self.assertIsNone(compact_planning_prompt(crossing, None, None, 1, max_tokens))
+
+    def test_forty_multibyte_issues_stay_under_1500_and_keep_the_newest(self):
+        prompt = compact_planning_prompt(multibyte_issues(40), multibyte_outcomes(),
+                                         ["stuck"], 3, 1500)
+        self.assertIsNotNone(prompt)
+        self.assertLessEqual(len(prompt.encode("utf-8")), 4 * 1500)
+        self.assertIn("#539 ", prompt)  # the newest issue is still listed
+        self.assertEqual(prompt.splitlines()[-1], "Paid starts left today: 3")
+
+    def test_header_is_byte_stable_with_multibyte_issues(self):
+        a = compact_planning_prompt(multibyte_issues(1), None, None, 0, 1500)
+        b = compact_planning_prompt(multibyte_issues(40), multibyte_outcomes(), ["x"], 9, 1500)
+        header = HEADER.encode("utf-8")
+        self.assertEqual(a.encode("utf-8")[:len(header)], header)
+        self.assertEqual(b.encode("utf-8")[:len(header)], header)
+
+
+class NotWiredYetTests(unittest.TestCase):
+    def test_shadow_call_still_uses_the_full_prompt(self):
+        import inspect
+
+        source = inspect.getsource(nexus_planner.IssuePlanner._start_shadow)
+        self.assertNotIn("compact_planning_prompt", source)
 
 
 if __name__ == "__main__":

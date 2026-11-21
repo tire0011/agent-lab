@@ -201,8 +201,7 @@ def planning_prompt(
 
 # The compact local shadow prompt (#770, part 1 in #781): the full prompt
 # above is about 6-9k tokens, which the CPU llama-server cannot read within
-# any useful timeout.
-SHADOW_PROMPT_TOKENS_ENV = "NEXUS_PLANNER_SHADOW_PROMPT_TOKENS"
+# any useful timeout. Not wired into _start_shadow yet (#789 is part 1a).
 DEFAULT_SHADOW_PROMPT_TOKENS = 1500
 _COMPACT_TITLE_CHARS = 90
 _COMPACT_TITLE_CHARS_TRIMMED = 40
@@ -223,17 +222,16 @@ _COMPACT_HEADER = (
 
 
 def estimate_tokens(text: str) -> int:
-    """The bytes/4 estimate used for the shadow prompt budget."""
-    return max(1, len(text.encode("utf-8")) // 4)
+    """The bytes/4 token estimate, rounded up: ceil(utf-8 bytes / 4) (#789).
+
+    Rounding down let a prompt of up to 4 * max_tokens + 3 bytes pass as
+    within budget (the codex finding on #787).
+    """
+    return -(-len(text.encode("utf-8")) // 4)
 
 
-def _shadow_prompt_budget() -> int:
-    """The hard token budget for the compact shadow prompt, from the env."""
-    try:
-        value = int(os.environ.get(SHADOW_PROMPT_TOKENS_ENV, "") or DEFAULT_SHADOW_PROMPT_TOKENS)
-    except ValueError:
-        return DEFAULT_SHADOW_PROMPT_TOKENS
-    return value if value > 0 else DEFAULT_SHADOW_PROMPT_TOKENS
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
 
 
 def _one_line(value: Any, limit: int) -> str:
@@ -277,7 +275,8 @@ def compact_planning_prompt(
     and is byte-stable across calls, so the server's prompt cache can reuse
     the prefix.
 
-    The result never exceeds *max_tokens* (bytes/4 estimate). Trimming order:
+    The result never has more than ``4 * max_tokens`` utf-8 bytes, so
+    ``estimate_tokens(result) <= max_tokens``. Trimming order:
     the oldest outcomes first, then the oldest (lowest numbered) issues - the
     newest issue is always kept - then the titles cut to 40 characters. When
     even that does not fit (tiny budgets), ``None`` is returned instead of an
@@ -301,18 +300,22 @@ def compact_planning_prompt(
             + f"Paid starts left today: {budget}\n"
         )
 
+    # Compare bytes with the byte cap directly, never a rounded token count.
+    cap = 4 * max_tokens
+    if _utf8_len(_COMPACT_HEADER) > cap:
+        return None  # even the fixed header does not fit
     kept = list(ordered)
     outcomes = list(recent_lines)
     prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
-    while estimate_tokens(prompt) > max_tokens and outcomes:
+    while _utf8_len(prompt) > cap and outcomes:
         outcomes.pop()  # newest first: the oldest outcome goes first
         prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
-    while estimate_tokens(prompt) > max_tokens and len(kept) > 1:
+    while _utf8_len(prompt) > cap and len(kept) > 1:
         kept.pop(0)  # oldest issue first; the newest one stays
         prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
-    if estimate_tokens(prompt) > max_tokens:
+    if _utf8_len(prompt) > cap:
         prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS_TRIMMED)
-    if estimate_tokens(prompt) > max_tokens:
+    if _utf8_len(prompt) > cap:
         return None
     return prompt
 
@@ -493,22 +496,11 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = compact_planning_prompt(
-            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
-            _shadow_prompt_budget(),
+        prompt = planning_prompt(issues, recent, explore=False, **context) + (
+            '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
+            'object with only {"issue": <number>, "reason": "<short reason>"}.'
         )
-        if prompt is None:
-            # Not even the fixed header with one issue fits the budget: record
-            # the skip and never call the model with an over-budget prompt (#781).
-            try:
-                from modules.planner_shadow import record
-                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
-                       local_issue=None, local_valid=0, prompt_tokens=0, seconds=0.0,
-                       error="skipped: prompt_over_budget")
-            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
-                logger.warning("planner shadow: could not store result: %s", exc)
-            return
-        prompt_tokens = estimate_tokens(prompt)
+        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
 
         def monitor() -> None:
             result: list[str] = []
