@@ -199,6 +199,127 @@ def planning_prompt(
     )
 
 
+# The compact local shadow prompt (#770, part 1 in #781): the full prompt
+# above is about 6-9k tokens, which the CPU llama-server cannot read within
+# any useful timeout. Not wired into _start_shadow yet (#789 is part 1a).
+DEFAULT_SHADOW_PROMPT_TOKENS = 1500
+_COMPACT_TITLE_CHARS = 90
+_COMPACT_TITLE_CHARS_TRIMMED = 40
+_COMPACT_LINE_CHARS = 160
+_COMPACT_RECENT = 5
+
+# Fixed first, so llama-server's prompt cache (#685) reuses it on every tick.
+_COMPACT_HEADER = (
+    "You are Nexus, an agent that develops its own code. Pick the ONE open issue "
+    "that is the most useful to work on next. Prefer issues that unblock or "
+    "simplify later work. Skip issues that need a human decision, a purchase or "
+    "setup outside the repository. An issue tagged out-of-attempts cannot be "
+    "done now; blocked-by-review means the last attempt passed its tests but the "
+    "review stopped it.\n"
+    'Answer with exactly one JSON object: {"issue": <number from OPEN ISSUES>, '
+    '"reason": "<one short sentence>"}\n\n'
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """The bytes/4 token estimate, rounded up: ceil(utf-8 bytes / 4) (#789).
+
+    Rounding down let a prompt of up to 4 * max_tokens + 3 bytes pass as
+    within budget (the codex finding on #787).
+    """
+    return -(-len(text.encode("utf-8")) // 4)
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _one_line(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_issue_line(issue: dict[str, Any], title_chars: int = _COMPACT_TITLE_CHARS) -> str:
+    left = issue.get("attempts_left")
+    tags = []
+    if left is not None and int(left) <= 0:
+        tags.append("out-of-attempts")
+    if issue.get("review_blocked"):
+        tags.append("blocked-by-review")
+    line = f"#{issue['number']} {_one_line(issue.get('title'), title_chars)}"
+    if left is not None:
+        line += f" | attempts left: {max(0, int(left))}"
+    return line + "".join(f" [{tag}]" for tag in tags)
+
+
+def _compact_recent_line(r: dict[str, Any]) -> str:
+    if "adoption_status" in r:
+        reason = str(r.get("adoption_reason") or "")
+        outcome = f"{r.get('status', '')} / merge: {_merge_label(str(r['adoption_status']), reason)}"
+    else:
+        outcome = str(r.get("status", ""))
+    return _one_line(f"- {outcome}: {r.get('title', '')}", _COMPACT_LINE_CHARS)
+
+
+def compact_planning_prompt(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, Any]] | None,
+    stuck_measurements: list[str] | None,
+    budget_left: int | None,
+    max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+) -> str | None:
+    """A short planning prompt for the local model (#770, #781).
+
+    One line per open issue (number, title, attempts left, blocked/out-of-
+    attempts tag - no bodies), the last five experiment outcomes, the stuck
+    measurement pipelines and the budget last. The fixed header comes first
+    and is byte-stable across calls, so the server's prompt cache can reuse
+    the prefix.
+
+    The result never has more than ``4 * max_tokens`` utf-8 bytes, so
+    ``estimate_tokens(result) <= max_tokens``. Trimming order:
+    the oldest outcomes first, then the oldest (lowest numbered) issues - the
+    newest issue is always kept - then the titles cut to 40 characters. When
+    even that does not fit (tiny budgets), ``None`` is returned instead of an
+    over-budget prompt (#773's codex finding).
+    """
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = DEFAULT_SHADOW_PROMPT_TOKENS
+    ordered = sorted(issues, key=lambda i: int(i["number"]))
+    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
+    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
+    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
+
+    def build(kept: list[dict[str, Any]], outcomes: list[str], title_chars: int) -> str:
+        return (
+            _COMPACT_HEADER
+            + "OPEN ISSUES:\n" + "\n".join(_compact_issue_line(i, title_chars) for i in kept) + "\n\n"
+            + "RECENT EXPERIMENTS:\n" + ("\n".join(outcomes) or "(none yet)") + "\n\n"
+            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_lines) or "(none)") + "\n\n"
+            + f"Paid starts left today: {budget}\n"
+        )
+
+    # Compare bytes with the byte cap directly, never a rounded token count.
+    cap = 4 * max_tokens
+    if _utf8_len(_COMPACT_HEADER) > cap:
+        return None  # even the fixed header does not fit
+    kept = list(ordered)
+    outcomes = list(recent_lines)
+    prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while _utf8_len(prompt) > cap and outcomes:
+        outcomes.pop()  # newest first: the oldest outcome goes first
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while _utf8_len(prompt) > cap and len(kept) > 1:
+        kept.pop(0)  # oldest issue first; the newest one stays
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    if _utf8_len(prompt) > cap:
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS_TRIMMED)
+    if _utf8_len(prompt) > cap:
+        return None
+    return prompt
+
+
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
     """Ideas from your own post-experiment reflections (#630), with their evidence."""
     if not reflections:
