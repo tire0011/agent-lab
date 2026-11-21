@@ -153,6 +153,38 @@ def _min_useful_patch_tokens() -> int:
 
 # Import-time default for documentation and tests; the check reads the env.
 MIN_USEFUL_PATCH_TOKENS = _min_useful_patch_tokens()
+# #772: a refused call never measures anything, so a median below the line
+# would hold forever. Before refusing, a tiny probe call re-measures the rates
+# when admission keeps refusing or the newest sample is old - at most once per
+# cooldown.
+ENV_RATE_REPROBE_AFTER = "NEXUS_RATE_REPROBE_AFTER"
+DEFAULT_RATE_REPROBE_AFTER = 3
+ENV_RATE_MAX_AGE_H = "NEXUS_RATE_MAX_AGE_H"
+DEFAULT_RATE_MAX_AGE_H = 12.0
+ENV_RATE_REPROBE_COOLDOWN_MIN = "NEXUS_RATE_REPROBE_COOLDOWN_MIN"
+DEFAULT_RATE_REPROBE_COOLDOWN_MIN = 60.0
+PROBE_MAX_TOKENS = 48
+PROBE_SEED = 772
+# About 150 tokens; fixed so every probe measures the same work.
+PROBE_PROMPT = (
+    "This is a short throughput measurement for a local language model server. "
+    "Read the following list and then answer the question at the end in plain text.\n"
+    "1. The repository keeps its decisions in DECISIONS.md and its costs in COSTS.md.\n"
+    "2. Experiments run in isolated git worktrees and are verified by the test suite.\n"
+    "3. Each local model call reports prompt and generation timings in tokens per second.\n"
+    "4. A call that cannot afford a useful patch inside the time budget is not made.\n"
+    "5. Measurements are stored as a rolling window and summarized by their median.\n"
+    "Question: describe in two or three sentences why a rolling median of recent "
+    "measurements is more robust than the single most recent measurement."
+)
+
+
+def _env_number(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
+    return value if math.isfinite(value) else default
 FEEDBACK_ERROR_CHARS = 1500
 # #685: the first fit leaves this many tokens free behind the handover so a
 # correction round can append its feedback without shortening the handover.
@@ -617,11 +649,143 @@ async def _fit_part(text: str, budget: int, measure: Callable[[str], Awaitable[i
     return ""
 
 
+# Rate re-probe (#772)
+
+async def probe_rates(client: Any, rates: LocalModelRates,
+                      max_tokens: int = PROBE_MAX_TOKENS, *, replace: bool = True) -> dict[str, Any]:
+    """One tiny llama-server call whose ``timings`` go into *rates* (#772).
+
+    By default the probe's sample replaces the suspect rate window
+    (:meth:`LocalModelRates.record` with ``replace``); a probe that fails keeps
+    the window and only adds its partial timings.
+
+    Fixed ~150-token prompt, greedy with a fixed seed and ``cache_prompt`` off,
+    so it measures real prompt processing and is comparable between probes.
+    Returns ``{"stored", "timings", "wall_seconds"}``; a failed call still
+    stores its partial timings, then the error propagates.
+    """
+    had_cache = hasattr(client, "cache_prompt")
+    saved_cache = getattr(client, "cache_prompt", None)
+    if had_cache:
+        client.cache_prompt = False
+    if hasattr(client, "last_timings"):
+        client.last_timings = None
+    options: dict[str, Any] = {}
+    if _accepts_seed(client):
+        options["seed"] = PROBE_SEED
+    started = time.monotonic()
+    timings: Any = None
+    try:
+        await client.complete(PROBE_PROMPT, system=_SYSTEM_PROMPT, temperature=0.0,
+                              max_tokens=max_tokens, **options)
+        timings = getattr(client, "last_timings", None)
+        return {"stored": rates.record(timings, replace=replace), "timings": timings,
+                "wall_seconds": time.monotonic() - started}
+    except BaseException:
+        timings = getattr(client, "last_timings", None)
+        rates.record(timings)  # never raises; partial timings are real measurements
+        raise
+    finally:
+        if had_cache:
+            client.cache_prompt = saved_cache
+
+
+def _rate_text(value: Any) -> str:
+    return f"{value:.2f}" if isinstance(value, (int, float)) else "unknown"
+
+
+def _hours(seconds: Any) -> str:
+    if seconds is None:
+        return "no sample"
+    if seconds == math.inf:
+        return "unknown age"
+    return f"{seconds / 3600:.1f} h old"
+
+
+async def _maybe_reprobe(client: Any, store: LocalModelRates,
+                         rates: tuple[float | None, float | None], affordable_output: int,
+                         useful: int) -> dict[str, Any]:
+    """Run :func:`probe_rates` once if refusals repeat or the rates are old.
+
+    Triggers: this would be the ``NEXUS_RATE_REPROBE_AFTER``-th refusal in a
+    row (``<= 0`` disables), or the newest sample is older than
+    ``NEXUS_RATE_MAX_AGE_H`` hours (``<= 0`` disables). Not within
+    ``NEXUS_RATE_REPROBE_COOLDOWN_MIN`` minutes of the last probe. Never raises.
+    """
+    info: dict[str, Any] = {"probed": False}
+    try:
+        after = int(_env_number(ENV_RATE_REPROBE_AFTER, DEFAULT_RATE_REPROBE_AFTER))
+        max_age_h = _env_number(ENV_RATE_MAX_AGE_H, DEFAULT_RATE_MAX_AGE_H)
+        cooldown_min = _env_number(ENV_RATE_REPROBE_COOLDOWN_MIN, DEFAULT_RATE_REPROBE_COOLDOWN_MIN)
+        refusals = store.consecutive_refusals()
+        age = store.newest_sample_age()
+        since_probe = store.seconds_since_probe()
+        info.update(sample_age_seconds=age, consecutive_refusals=refusals,
+                    seconds_since_probe=since_probe)
+        reasons = []
+        if after > 0 and refusals + 1 >= after:
+            reasons.append("refusals")
+        if max_age_h > 0 and age is not None and age > max_age_h * 3600:
+            reasons.append("old_rates")
+        if not reasons:
+            info["skipped"] = "not_due"
+            return info
+        if since_probe is not None and since_probe < max(0.0, cooldown_min) * 60:
+            info["skipped"] = "cooldown"
+            return info
+        info.update(probed=True, trigger="+".join(reasons), old_prompt_tokens_per_second=rates[0],
+                    old_generation_tokens_per_second=rates[1],
+                    old_affordable_output_tokens=affordable_output, min_useful_patch_tokens=useful)
+        store.record_probe_attempt()
+        try:
+            result = await probe_rates(client, store)
+        except Exception as exc:
+            info.update(ok=False, error=(str(exc).strip() or type(exc).__name__)[:300])
+        else:
+            info.update(ok=bool(result.get("stored")), wall_seconds=result.get("wall_seconds"),
+                        probe_rates=rates_from_timings(result.get("timings")))
+            if not result.get("stored"):
+                info["error"] = "the probe returned no usable timings"
+        new_prompt, new_generation = store.medians()
+        info.update(new_prompt_tokens_per_second=new_prompt,
+                    new_generation_tokens_per_second=new_generation)
+    except Exception as exc:  # the probe must never break prompt building
+        logger.warning("rate re-probe failed", exc_info=True)
+        info.setdefault("error", type(exc).__name__)
+    return info
+
+
+def _reprobe_note(info: dict[str, Any]) -> str:
+    """The bounded ``[rates: ...]`` suffix of a refusal message (#772)."""
+    age = _hours(info.get("sample_age_seconds")) if "sample_age_seconds" in info else "unknown age"
+    if info.get("probed"):
+        if info.get("ok"):
+            measured = info.get("probe_rates") or {}
+            probe = (f"re-probe measured generation "
+                     f"{_rate_text(measured.get('generation_tokens_per_second'))} tok/s, "
+                     f"prompt {_rate_text(measured.get('prompt_tokens_per_second'))} tok/s; "
+                     f"medians now generation {_rate_text(info.get('new_generation_tokens_per_second'))}"
+                     f" tok/s, still too slow")
+        else:
+            probe = "re-probe failed"
+    elif info.get("skipped") == "cooldown":
+        since = info.get("seconds_since_probe")
+        probe = (f"last re-probe {since / 60:.0f} min ago (cooldown)"
+                 if isinstance(since, (int, float)) else "re-probe in cooldown")
+    elif info.get("skipped") == "not_due":
+        probe = f"no re-probe yet ({info.get('consecutive_refusals', 0)} refusals in a row)"
+    else:
+        probe = "re-probe unavailable"
+    return f" [rates: newest sample {age}; {probe}]"
+
+
 async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_tokens: int,
                        margin_tokens: int = CONTEXT_MARGIN_TOKENS,
                        rates: tuple[float | None, float | None] = (None, None),
                        admission: bool = True, cold: bool = True,
-                       likely_files: tuple[str, ...] = ()) -> PromptPlan:
+                       likely_files: tuple[str, ...] = (),
+                       rate_store: LocalModelRates | None = None,
+                       on_reprobe: Callable[[dict[str, Any]], None] | None = None) -> PromptPlan:
     """Fit the local prompt into the server's context, or raise :class:`ContextTooSmallError`
     (or :class:`LocalTooSlowError` when *admission* is on and the rates cannot afford a patch).
 
@@ -632,6 +796,7 @@ async def build_prompt(task: str, working_dir: str, client: Any, *, max_output_t
         essential, handover, working_dir, client, max_output_tokens=max_output_tokens,
         margin_tokens=margin_tokens, n_ctx=n_ctx, n_ctx_source=n_ctx_source, rates=rates,
         admission=admission, cold=cold, likely_files=likely_files,
+        rate_store=rate_store, on_reprobe=on_reprobe,
     )
 
 
@@ -642,11 +807,18 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
                              rates: tuple[float | None, float | None] = (None, None),
                              admission: bool = True, cold: bool = True,
                              cached_prefix_tokens: int = 0,
-                             likely_files: tuple[str, ...] = ()) -> PromptPlan:
+                             likely_files: tuple[str, ...] = (),
+                             rate_store: LocalModelRates | None = None,
+                             on_reprobe: Callable[[dict[str, Any]], None] | None = None,
+                             ) -> PromptPlan:
     """:func:`build_prompt` for an already split task and an already known ``n_ctx``.
 
     *cached_prefix_tokens* (#685) is the part of the prompt the server's slot
-    already holds; it is not charged against the time budget."""
+    already holds; it is not charged against the time budget.
+
+    *rate_store* (#772) is the store *rates* came from. With it, a refusal is
+    counted and may first trigger one :func:`probe_rates` call (see
+    :func:`_maybe_reprobe`); *on_reprobe* receives the ``rate_reprobe`` record."""
     count = counter or TokenCounter(client)
     # n_ctx is a hard limit; the time budget (#642) is a soft one. It cuts the
     # handover first, then the files, but never refuses the call: if even the
@@ -663,7 +835,30 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
     # prevents the next call from repeating the same hopeless cycle.
     useful = _min_useful_patch_tokens()
     affordable_output = allowance.output_tokens if allowance is not None else max_output_tokens
+    reprobe_note = ""
+    if admission and affordable_output < useful and rate_store is not None:
+        # #772: re-measure before refusing on possibly stale rates.
+        probe = await _maybe_reprobe(client, rate_store, rates, affordable_output, useful)
+        probe["admitted"] = False
+        if probe.get("probed") and probe.get("ok"):
+            rates = rate_store.medians()
+            allowance = time_budget(getattr(client, "timeout", None), max_output_tokens, rates,
+                                    cached_prefix_tokens)
+            affordable_output = (allowance.output_tokens if allowance is not None
+                                 else max_output_tokens)
+            probe["affordable_output_tokens"] = affordable_output
+            probe["admitted"] = affordable_output >= useful
+        if probe.get("probed"):
+            logger.info("rate_reprobe: %s", probe)
+            if on_reprobe is not None:
+                try:
+                    on_reprobe(probe)
+                except Exception:  # logging must never fail the run
+                    logger.debug("rate_reprobe hook failed", exc_info=True)
+        reprobe_note = _reprobe_note(probe)
     if admission and affordable_output < useful:
+        if rate_store is not None:
+            rate_store.record_refusal()  # never raises
         prompt_rate, generation_rate = rates
         rate_detail = (
             f"generation {generation_rate:.2f} tok/s, prompt {prompt_rate:.2f} tok/s, "
@@ -674,7 +869,7 @@ async def build_prompt_parts(essential: str, handover: str, working_dir: str, cl
         raise LocalTooSlowError(
             f"{LOCAL_TOO_SLOW}: the time budget allows only {affordable_output} output tokens "
             f"({rate_detail}); a useful patch needs {useful}; "
-            "the local model was not called"
+            f"the local model was not called{reprobe_note}"
         )
     time_budget_tokens = allowance.prompt_tokens if allowance else None
     output_tokens = allowance.output_tokens if allowance else max_output_tokens
@@ -1680,6 +1875,8 @@ class LocalCodingWorker:
         self._provided_likely_files = likely_files
         # #685: the last prompt sent on the client's slot and this run's reuse totals.
         self._last_sent: SentPrompt | None = None
+        # (experiment_logger, phase) of the running task for ``rate_reprobe`` (#772).
+        self._reprobe_context: tuple[Any | None, str] = (None, "")
         self._last_prefix_reuse = 0
         self._reuse_tokens = 0
         self._reuse_prompt_tokens = 0
@@ -1784,13 +1981,16 @@ class LocalCodingWorker:
             prompt_task, spent = self._localize(prompt_task, working_dir, timeout_seconds,
                                                 experiment_logger, phase)
             timeout_seconds = max(0.0, float(timeout_seconds) - spent)
+            self._reprobe_context = (experiment_logger, phase)
             try:
                 # n_ctx is read once here and holds for this whole run.
                 plan = asyncio.run(build_prompt(prompt_task, working_dir, self.client,
                                                 max_output_tokens=self.max_tokens,
                                                 rates=self.rates.medians(),
                                                 admission=True,
-                                                likely_files=self.likely_files))
+                                                likely_files=self.likely_files,
+                                                rate_store=self.rates,
+                                                on_reprobe=self._on_reprobe))
             except ContextTooSmallError as exc:
                 self._log(experiment_logger, phase, "local_context_too_small", str(exc), warning=True)
                 return self._result(task, working_dir, "", str(exc), started, success=False, exit_code=1)
@@ -1830,6 +2030,7 @@ class LocalCodingWorker:
                             rates=self.rates.medians(),
                             admission=True,
                             likely_files=self.likely_files,
+                            rate_store=self.rates, on_reprobe=self._on_reprobe,
                         ))
                         self.last_plan = plan
                         self._log(
@@ -2111,6 +2312,7 @@ class LocalCodingWorker:
                 essential, context, working_dir, self.client, max_output_tokens=self.max_tokens,
                 n_ctx=plan.n_ctx, n_ctx_source=plan.n_ctx_source, counter=plan.counter,
                 rates=rates, admission=True, cached_prefix_tokens=cached,
+                rate_store=self.rates, on_reprobe=self._on_reprobe,
             )
 
         return await self._warm_plan(build)
@@ -2428,6 +2630,20 @@ class LocalCodingWorker:
         self.last_run_metrics = fields
         self._log(experiment_logger, phase, "local_run_metrics",
                   summary_line(fields) + f", samples N={self.samples}", **fields)
+
+    def _on_reprobe(self, info: dict[str, Any]) -> None:
+        """Log one ``rate_reprobe`` (#772): old vs new medians and the probe result."""
+        # The probe ran in the slot without prompt caching; nothing reusable is left.
+        self._last_sent = None
+        experiment_logger, phase = self._reprobe_context
+        old, new = info.get("old_generation_tokens_per_second"), info.get(
+            "new_generation_tokens_per_second")
+        self._log(
+            experiment_logger, phase, "rate_reprobe",
+            f"Local rate re-probe ({info.get('trigger')}): generation {_rate_text(old)} -> "
+            f"{_rate_text(new)} tok/s, " + ("admitted" if info.get("admitted") else "still refused"),
+            warning=not info.get("admitted"), **info,
+        )
 
     def _log_too_slow(self, experiment_logger: Any | None, phase: str, exc: Exception) -> None:
         prompt_rate, generation_rate = self.rates.medians()
