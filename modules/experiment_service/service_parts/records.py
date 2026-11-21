@@ -850,9 +850,8 @@ class RecordsMixin:
             ).fetchone()
             if current is not None and current[0] == STATUS_CANCELLED and status != STATUS_CANCELLED:
                 return
-            # The pipeline thread of a stalled experiment may still wake up once its worker is
-            # stopped; the stall verdict stands (#400).
-            if current is not None and _is_stalled(current[0], current[1]):
+            # A worker can return after a stall or token-budget stop. Preserve that verdict.
+            if current is not None and (_is_stalled(*current) or _is_budget_stop(*current)):
                 return
             self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} WHERE id = ?",

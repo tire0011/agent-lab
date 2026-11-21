@@ -3,8 +3,8 @@
 A free coder (Mistral) that returns no usable SEARCH/REPLACE edit hands the
 same run to the next coding provider instead of spending one of the issue's
 attempts. Each run that starts on a free-tier coder is recorded on its
-experiment row (``free_tier_provider``, ``free_tier_format_failures`` 0/1), so
-the share of format failures is visible per day.
+experiment row. A NULL outcome is pending or interrupted and is excluded from
+the failure share.
 
 The guard: when more than ``NEXUS_FREE_TIER_GUARD_MAX_SHARE`` (default 0.5) of
 the last ``NEXUS_FREE_TIER_GUARD_WINDOW`` (default 10) free-tier runs failed on
@@ -72,9 +72,9 @@ def guard_setting() -> GuardSetting:
 
 def _recent_outcomes(conn: sqlite3.Connection, window: int) -> list[int]:
     rows = conn.execute(
-        "SELECT COALESCE(free_tier_format_failures, 0) FROM experiments "
-        "WHERE free_tier_provider IS NOT NULL "
-        "ORDER BY COALESCE(implementation_started_at, created_at) DESC LIMIT ?",
+        "SELECT free_tier_format_failures FROM experiments "
+        "WHERE free_tier_provider IS NOT NULL AND free_tier_format_failures IS NOT NULL "
+        "ORDER BY COALESCE(implementation_started_at, created_at) DESC, id DESC LIMIT ?",
         (window,),
     ).fetchall()
     return [1 if row[0] else 0 for row in rows]
@@ -84,14 +84,17 @@ def daily_stats(conn: sqlite3.Connection, *, days: int = 7) -> list[dict[str, An
     """Per day: free-tier runs, format failures and their share (newest first)."""
     rows = conn.execute(
         "SELECT substr(COALESCE(implementation_started_at, created_at), 1, 10) AS day, "
-        "COUNT(*), SUM(COALESCE(free_tier_format_failures, 0)) FROM experiments "
-        "WHERE free_tier_provider IS NOT NULL GROUP BY day ORDER BY day DESC LIMIT ?",
+        "free_tier_provider, COUNT(*), SUM(free_tier_format_failures) FROM experiments "
+        "WHERE free_tier_provider IS NOT NULL AND free_tier_format_failures IS NOT NULL "
+        "AND day IN (SELECT DISTINCT substr(COALESCE(implementation_started_at, created_at), 1, 10) "
+        "FROM experiments WHERE free_tier_provider IS NOT NULL AND free_tier_format_failures IS NOT NULL "
+        "ORDER BY 1 DESC LIMIT ?) GROUP BY day, free_tier_provider ORDER BY day DESC, free_tier_provider",
         (days,),
     ).fetchall()
     return [
-        {"day": day, "runs": int(runs), "free_tier_format_failures": int(failures or 0),
+        {"day": day, "provider": provider, "runs": int(runs), "free_tier_format_failures": int(failures or 0),
          "share": (int(failures or 0) / int(runs)) if runs else 0.0}
-        for day, runs, failures in rows
+        for day, provider, runs, failures in rows
     ]
 
 

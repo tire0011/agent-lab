@@ -134,16 +134,14 @@ _GOAL_POLICY_REASON_PREFIXES = tuple(
 
 
 def _is_provider_overload(status: Any, error: Any) -> bool:
-    """A run that failed because the coding agent's API was overloaded.
-
-    A crash that merely quotes "429" stays a crash: overloads are free of every
-    limit, a crash loop must not be.
-    """
-    from modules.coding_provider import is_provider_overload
+    """A coding deferral due to provider availability, exempt from retry limits."""
+    from modules.coding_provider import NO_ELIGIBLE_CODER, is_provider_overload
+    from modules.free_tier_guard import is_format_failure
 
     return (
         status == "failed"
-        and is_provider_overload(error)
+        and (str(error or "").startswith(NO_ELIGIBLE_CODER) or is_provider_overload(error))
+        and not is_format_failure(error)
         and not _is_pipeline_crash(status, error)
         and not str(error or "").startswith("tests failed")
     )

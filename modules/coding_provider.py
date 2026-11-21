@@ -39,6 +39,7 @@ logger = logging.getLogger("modules.coding_provider")
 
 KNOWN_PROVIDERS: tuple[str, ...] = (PROVIDER_CODEX, PROVIDER_CLAUDE, PROVIDER_MISTRAL)
 EXTERNAL_PROVIDERS: tuple[str, ...] = KNOWN_PROVIDERS
+NO_ELIGIBLE_CODER = "free-tier guard deferred coding: no eligible provider available"
 
 ENV_PROVIDER_PIN = "AGENT_CODING_PROVIDER"
 ENV_PROVIDER_ALLOW_LIST = "AGENT_CODING_PROVIDERS"
@@ -407,12 +408,17 @@ def cooling_down(provider: str, *, db_path: str = DEFAULT_DB_PATH, now: datetime
     return provider in provider_cooldowns(db_path=db_path, now=now)
 
 
-def other_provider(provider: str | None, *, db_path: str | None = None) -> str | None:
-    """Another allowed provider with an installed CLI, for when *provider* is
-    overloaded; with *db_path*, providers cooling down after a limit are skipped."""
+def other_provider(
+    provider: str | None, *, db_path: str | None = None,
+    exclude: set[str] | frozenset[str] = frozenset(),
+) -> str | None:
+    """Pick an available alternate, skipping exclusions and active cooldowns."""
     cooled = provider_cooldowns(db_path=db_path) if db_path else {}
     for candidate in allowed_providers():
-        if candidate != provider and candidate not in cooled and is_available(candidate):
+        if (
+            candidate != provider and candidate not in exclude
+            and candidate not in cooled and is_available(candidate)
+        ):
             return candidate
     return None
 

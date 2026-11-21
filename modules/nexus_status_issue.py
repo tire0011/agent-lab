@@ -44,9 +44,14 @@ def render(conn: sqlite3.Connection, *, now: datetime, budget: int, spent: int,
     lines.append(f"**State:** {state}")
     lines.append(f"**Budget:** {spent} of {budget or 'unlimited'} paid starts used in the last 24h")
     try:
-        from modules.free_tier_guard import status_line
+        from modules.free_tier_guard import daily_stats, status_line
 
-        lines.append(status_line(conn))  # #763: the free-tier format guard setting
+        lines.append(status_line(conn))
+        for day in daily_stats(conn):
+            lines.append(
+                f"- {day['day']} UTC {day['provider']} format failures "
+                f"{day['free_tier_format_failures']}/{day['runs']} ({day['share']:.0%})"
+            )
     except Exception as exc:  # noqa: BLE001 - the status must never fail a tick
         logger.info("status issue: free-tier guard unavailable: %s", exc)
     lines += ["", "**Recent experiments**", ""]
