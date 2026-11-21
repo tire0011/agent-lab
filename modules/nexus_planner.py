@@ -201,7 +201,7 @@ def planning_prompt(
 
 # The compact local shadow prompt (#770, part 1 in #781): the full prompt
 # above is about 6-9k tokens, which the CPU llama-server cannot read within
-# any useful timeout. Not wired into _start_shadow yet (#789 is part 1a).
+# any useful timeout. _start_shadow sends only this compact prompt (#790).
 DEFAULT_SHADOW_PROMPT_TOKENS = 1500
 _COMPACT_TITLE_CHARS = 90
 _COMPACT_TITLE_CHARS_TRIMMED = 40
@@ -496,11 +496,34 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = planning_prompt(issues, recent, explore=False, **context) + (
+        shadow_instructions = (
             '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
             'object with only {"issue": <number>, "reason": "<short reason>"}.'
         )
-        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+        # #790 (part 1b of #781): the shadow gets the compact prompt, capped by
+        # NEXUS_PLANNER_SHADOW_PROMPT_TOKENS. The paid prompt above is untouched.
+        try:
+            shadow_max_tokens = int(os.environ.get("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS") or 1500)
+        except (TypeError, ValueError):
+            shadow_max_tokens = 1500
+        compact = compact_planning_prompt(
+            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
+            max_tokens=shadow_max_tokens,
+        )
+        if compact is None:
+            # Over budget even after trimming: record the skip synchronously and
+            # never call the model (#790).
+            try:
+                from modules.planner_shadow import record
+                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
+                       local_issue=None, local_valid=0,
+                       prompt_tokens=0, seconds=0.0,
+                       error="skipped: prompt_over_budget")
+            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+                logger.warning("planner shadow: could not store skip: %s", exc)
+            return
+        prompt = compact + shadow_instructions
+        prompt_tokens = max(1, estimate_tokens(prompt))
 
         def monitor() -> None:
             result: list[str] = []
