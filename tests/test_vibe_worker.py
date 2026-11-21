@@ -126,6 +126,22 @@ class VibeWorkerTests(unittest.TestCase):
         self.assertIn("not found", result.error)
 
 
+class BinaryLookupTests(unittest.TestCase):
+    def test_falls_back_to_the_service_users_local_bin_when_not_on_path(self):
+        from modules import vibe_worker
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "vibe"
+            fake.write_text("#!/bin/sh\n", encoding="utf-8")
+            fake.chmod(0o755)
+            env = {k: v for k, v in os.environ.items() if k != "AGENT_VIBE_BIN"}
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.object(vibe_worker, "_SERVICE_USER_VIBE", str(fake)), \
+                    mock.patch("modules.vibe_worker.shutil.which",
+                               side_effect=lambda name: str(fake) if name == str(fake) else None):
+                self.assertEqual(vibe_worker.default_vibe_bin(), str(fake))
+                self.assertTrue(vibe_worker.vibe_available())
+
+
 class ProviderSelectionTests(unittest.TestCase):
     def test_mistral_uses_vibe_when_the_cli_is_installed(self):
         with mock.patch("modules.coding_provider.vibe_available", return_value=True):
