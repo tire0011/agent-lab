@@ -24,6 +24,8 @@ from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from modules.central_logging import ExperimentLogger, read_log_entries
 from modules.nexus_diagnostics import (
     LIFECYCLE_RUNNING,
@@ -328,6 +330,10 @@ class MonitoredRunTests(unittest.TestCase):
         )
         return result, beats
 
+    # The child suite sleeps in real time while the watchdog measures with the
+    # process clocks: under the timing check's drift only the watchdog's clock
+    # would move and it would report a stall, so opt out (as in #667).
+    @pytest.mark.usefixtures("real_clock")
     def test_progressing_suite_runs_far_past_the_stall_timeout(self):
         """Six tests, each shorter than the stall timeout, total longer than
         it: progress - not total runtime - must decide."""
