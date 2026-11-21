@@ -71,6 +71,27 @@ class ReverifyWatchdogTests(unittest.TestCase):
         self.assertEqual(self.service.get_experiment("exp").status, "needs_review")
         self.assertIn("2700s", list_reverifications(self.service)[0]["reason"])
 
+    def test_crashed_worker_is_recorded_once_and_stays_parked(self):
+        from modules.experiment_service.reverify import parked_candidates
+
+        process = subprocess.Popen([sys.executable, "-c", "raise SystemExit(3)"])
+        attempt_root = self.root / "attempt"
+        attempt_root.mkdir()
+        with (
+            patch.object(reverify_worker.subprocess, "Popen", return_value=process),
+            patch.object(reverify_worker.tempfile, "mkdtemp", return_value=str(attempt_root)),
+            patch.object(reverify_worker, "_run_git"),
+        ):
+            verdict = reverify_worker._supervise_attempt(
+                self.service, self.db, "exp", "main-sha", timeout=30,
+            )
+        self.assertEqual(verdict, "still_blocked:reverification worker exited with code 3")
+        self.assertEqual(list_reverifications(self.service)[0]["verdict"], verdict)
+        self.assertEqual(self.service.get_experiment("exp").status, "needs_review")
+        self.assertFalse(attempt_root.exists())
+        # The next hand-off at the same main commit does not retry the branch.
+        self.assertEqual(parked_candidates(self.service, "main-sha"), [])
+
     def test_supervisor_starts_a_real_attempt_process(self):
         with self.service._conn:
             self.service._conn.execute("UPDATE experiments SET goal='No linked issue' WHERE id='exp'")

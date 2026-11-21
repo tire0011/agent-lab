@@ -65,7 +65,14 @@ def _supervise_attempt(service: ExperimentService, db_path: str, experiment_id: 
                 logger.warning("re-verification process %s has not exited after SIGKILL", process.pid)
         else:
             if process.returncode != 0:
+                # A crashed or externally killed worker (e.g. OOM) still gets a
+                # durable verdict for this main commit. Without it the same
+                # branch would be retried - for up to the full deadline - on
+                # every tick, and the planner would never see why (#766).
                 logger.warning("re-verification of %s exited %s", experiment_id, process.returncode)
+                verdict = f"still_blocked:reverification worker exited with code {process.returncode}"
+                _record(service, experiment_id, issue, main_sha, experiment.branch_name,
+                        None, None, verdict, None, started)
             else:
                 verdict = _publish_outcome(service, root)
         return verdict
