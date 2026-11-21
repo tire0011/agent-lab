@@ -60,8 +60,19 @@ _READ_ONLY_TOOLS = ("read_file", "grep")
 _SUCCESS_OUTCOMES = frozenset({"finished", "success", "succeeded", "completed", "complete", "done", "ok"})
 
 
+#: Where `uv tool install mistral-vibe` puts the CLI for the service user. The
+#: services run with the default PATH, which does not include it (2026-11-21:
+#: Mistral silently fell back to the API worker).
+_SERVICE_USER_VIBE = "/home/agent/.local/bin/vibe"
+
+
 def default_vibe_bin() -> str:
-    return os.environ.get(ENV_VIBE_BIN) or "vibe"
+    """``AGENT_VIBE_BIN`` wins; then ``vibe`` on PATH; then the service user's
+    local bin directory (like ``claude_worker._default_claude_bin``)."""
+    configured = os.environ.get(ENV_VIBE_BIN)
+    if configured:
+        return configured
+    return shutil.which("vibe") or _SERVICE_USER_VIBE
 
 
 def vibe_available() -> bool:
