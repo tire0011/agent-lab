@@ -285,7 +285,12 @@ the preceding 72 hours. Search the `nexus-tick.service` journal for
 The verification test environment (`build_verification_test_env`) also replaces
 `AGENT_DB_PATH` with a temporary database when the parent sets it, so a suite run
 inside the tick (`python -m unittest discover`, where `tests/conftest.py` does not
-run) can never open or lock the production database. `MailboxTaskService.close()`
+run) can never open or lock the production database. It also points
+`LOCAL_MODEL_URL`, `LLAMA_CPP_BASE_URL` and `LLAMA_API_URL` at the unreachable
+`http://127.0.0.1:9`, as `tests/conftest.py` does. This was the cause of the
+2026-11-19 hang: under unittest discovery a mailbox test's background failure
+analysis sent a real request to llama-server, and `LocalLlmJobService.close()`
+waits for an in-flight job to finish. `MailboxTaskService.close()`
 waits at most `NEXUS_FAILURE_ANALYSIS_CLOSE_GRACE_SECONDS` (default 5) for a running
 failure analysis before abandoning it - a diagnosis stuck on the local LLM or a
 locked database can never wedge the poll process again (#766).

@@ -45,6 +45,10 @@ VERIFICATION_TEST_API_KEY = "test-key"
 # run under drift as well (#736).
 CLOCK_DRIFT_ENV = "NEXUS_TEST_CLOCK_DRIFT_MS"
 
+# Same value tests/conftest.py assigns: port 9 (discard) refuses at once.
+UNREACHABLE_LOCAL_MODEL_URL = "http://127.0.0.1:9"
+LOCAL_MODEL_URL_ENVS = ("LOCAL_MODEL_URL", "LLAMA_CPP_BASE_URL", "LLAMA_API_URL")
+
 
 def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Build the isolated environment for one verification test subprocess.
@@ -73,4 +77,15 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
         env["AGENT_DB_PATH"] = str(
             Path(tempfile.mkdtemp(prefix="nexus-verification-db-")) / "agent.db"
         )
+    # Same reason, and the actual cause of the 2026-11-19 tick hang (#766):
+    # under unittest discovery conftest.py does not redirect the local model,
+    # so a default-constructed LlamaCppClient talks to the real llama-server
+    # (it falls back to 127.0.0.1:8080 even when no variable is set). A
+    # mailbox test's background failure analysis queued a real inference
+    # there, and LocalLlmJobService.close() finishes an in-flight job before
+    # returning - minutes at ~3 tok/s, behind Nexus's own controller jobs.
+    # Assigned unconditionally, like conftest.py: connection refused is
+    # immediate, and a test that needs a model server sets its own URL.
+    for name in LOCAL_MODEL_URL_ENVS:
+        env[name] = UNREACHABLE_LOCAL_MODEL_URL
     return env
