@@ -213,6 +213,65 @@ class ByteCapTests(unittest.TestCase):
         self.assertEqual(b.encode("utf-8")[:len(header)], header)
 
 
+class RepeatAndFailureTests(unittest.TestCase):
+    """The function is pure: running it twice, a crash halfway or an
+    interrupted call leave no state behind and never change the inputs."""
+
+    def _inputs(self):
+        return multibyte_issues(40), multibyte_outcomes(), ["stuck ✋"]
+
+    def test_running_twice_gives_the_same_bytes_and_keeps_the_inputs(self):
+        import copy
+
+        issues, recent, stuck = self._inputs()
+        before = copy.deepcopy((issues, recent, stuck))
+        first = compact_planning_prompt(issues, recent, stuck, 3, 200)
+        second = compact_planning_prompt(issues, recent, stuck, 3, 200)
+        self.assertIsNotNone(first)
+        self.assertEqual(first.encode("utf-8"), second.encode("utf-8"))
+        self.assertEqual((issues, recent, stuck), before)  # trimming worked on copies
+
+    def test_a_crash_halfway_leaves_later_calls_unchanged(self):
+        issues, recent, stuck = self._inputs()
+        good = compact_planning_prompt(issues, recent, stuck, 3, 200)
+        broken = issues + [{"title": "no number"}]
+        with self.assertRaises(KeyError):
+            compact_planning_prompt(broken, recent, stuck, 3, 200)
+        self.assertEqual(compact_planning_prompt(issues, recent, stuck, 3, 200), good)
+
+    def test_an_interrupted_call_leaves_later_calls_unchanged(self):
+        from unittest.mock import patch
+
+        issues, recent, stuck = self._inputs()
+        good = compact_planning_prompt(issues, recent, stuck, 3, 200)
+        calls = {"n": 0}
+        real = nexus_planner._compact_issue_line
+
+        def interrupt_on_fifth(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 5:
+                raise KeyboardInterrupt
+            return real(*args, **kwargs)
+
+        with patch.object(nexus_planner, "_compact_issue_line", interrupt_on_fifth):
+            with self.assertRaises(KeyboardInterrupt):
+                compact_planning_prompt(issues, recent, stuck, 3, 200)
+        self.assertEqual(compact_planning_prompt(issues, recent, stuck, 3, 200), good)
+
+    def test_bad_max_tokens_falls_back_to_the_default_cap(self):
+        issues, recent, stuck = self._inputs()
+        expected = compact_planning_prompt(issues, recent, stuck, 3)
+        for bad in (None, "many"):
+            with self.subTest(max_tokens=bad):
+                self.assertEqual(compact_planning_prompt(issues, recent, stuck, 3, bad), expected)
+
+    def test_zero_or_negative_max_tokens_returns_none(self):
+        issues, recent, stuck = self._inputs()
+        for max_tokens in (0, -5):
+            with self.subTest(max_tokens=max_tokens):
+                self.assertIsNone(compact_planning_prompt(issues, recent, stuck, 3, max_tokens))
+
+
 class NotWiredYetTests(unittest.TestCase):
     def test_shadow_call_still_uses_the_full_prompt(self):
         import inspect
