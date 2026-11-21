@@ -66,6 +66,16 @@ class NextPinTests(unittest.TestCase):
         # The rotation continues after the provider chosen before the pin.
         self.assertEqual(choose_provider(db_path=self.db), PROVIDERS[(PROVIDERS.index(first) + 1) % 3])
 
+    def test_the_experiment_services_selection_worker_leaves_the_pin_for_the_implementation(self):
+        """2026-11-21: ExperimentService built its selection worker eagerly and
+        used up the Mistral pin; the implementation then ran on Claude."""
+        from modules.experiment_service import ExperimentService
+        pin_next_provider("mistral", db_path=self.db)
+        with mock.patch("modules.coding_provider.build_worker", return_value=mock.Mock()):
+            service = ExperimentService(db_path=self.db)
+            self.assertIsNotNone(service.selection_worker)
+        self.assertEqual(choose_provider(db_path=self.db), "mistral")
+
     def test_stale_or_unavailable_pins_are_dropped(self):
         pin_next_provider("mistral", db_path=self.db)
         with sqlite3.connect(self.db) as conn:
