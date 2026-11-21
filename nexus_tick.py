@@ -295,7 +295,8 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
     return result.final_message or ""
 
 
-def _local_shadow(prompt: str, response_format: dict | None, deadline: float) -> dict:
+def _local_shadow(prompt: str, response_format: dict | None, deadline: float,
+                  *, clock=None) -> dict:
     """The production planner shadow call to the local llama-server (#671, #782).
 
     *deadline* is the absolute ``time.monotonic()`` value the planner's
@@ -305,7 +306,8 @@ def _local_shadow(prompt: str, response_format: dict | None, deadline: float) ->
     ``asyncio.wait_for`` with that remainder, so at the deadline the request
     is cancelled, the httpx client is closed and the connection is released
     before :class:`TimeoutError` is raised. A non-finite or missing deadline
-    falls back to 120 s from now.
+    falls back to 120 s from now. *clock* (default ``time.monotonic``, the
+    planner's default clock) is the clock *deadline* is measured on.
     """
     import asyncio
     import math
@@ -314,15 +316,17 @@ def _local_shadow(prompt: str, response_format: dict | None, deadline: float) ->
     from modules.llama_cpp_client import LlamaCppClient
     from modules.nexus_planner import SHADOW_TIMEOUT_FALLBACK_SECONDS, ShadowDeadlineExpired
 
+    if clock is None:
+        clock = time.monotonic
     try:
         deadline = float(deadline)
     except (TypeError, ValueError):
         deadline = math.nan
     if not math.isfinite(deadline):
-        deadline = time.monotonic() + SHADOW_TIMEOUT_FALLBACK_SECONDS
+        deadline = clock() + SHADOW_TIMEOUT_FALLBACK_SECONDS
 
     def remaining() -> float:
-        left = deadline - time.monotonic()
+        left = deadline - clock()
         if left <= 0:
             raise ShadowDeadlineExpired("planner shadow deadline passed before the request was sent")
         return left

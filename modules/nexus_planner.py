@@ -641,6 +641,12 @@ class IssuePlanner:
     LocalModelRates-like object whose ``medians()`` size the shadow timeout;
     by default the local model's own rates bucket is used. *shadow_timeout*
     caps that rate-based timeout (default: the 240 s cap of #782).
+
+    *clock* (default :func:`time.monotonic`) is the one clock the shadow
+    deadline is measured on, and *join* (default ``thread.join(seconds)``)
+    waits for the shadow worker; tests inject a virtual clock and its join so
+    the deadline logic does not depend on wall time. A production shadow
+    callable must measure *deadline* on the same clock.
     """
 
     def __init__(
@@ -652,6 +658,8 @@ class IssuePlanner:
         db_path: str | None = None,
         shadow_timeout: float | None = SHADOW_TIMEOUT_CAP_SECONDS,
         rates: Any = None,
+        clock: Callable[[], float] | None = None,
+        join: Callable[[threading.Thread, float], None] | None = None,
     ) -> None:
         self._complete = complete
         self._explore = explore
@@ -659,6 +667,8 @@ class IssuePlanner:
         self._db_path = db_path
         self._shadow_timeout = shadow_timeout
         self._rates = rates
+        self._clock = clock
+        self._join = join
 
     def choose(
         self,
@@ -737,6 +747,8 @@ class IssuePlanner:
         # The answer schema restricts issue to the allowed numbers (#782).
         response_format = shadow_response_format(allowed)
         rates, cap = self._rates, self._shadow_timeout
+        clock = self._clock or time.monotonic
+        join = self._join or (lambda thread, seconds: thread.join(seconds))
 
         def monitor() -> None:
             result: list[Any] = []
@@ -749,13 +761,13 @@ class IssuePlanner:
             # One absolute monotonic deadline shared by the monitor, the
             # worker and the production HTTP request (#782): a worker that
             # starts late gets only what is left and never sends after it.
-            started = time.monotonic()
+            started = clock()
             deadline = started + timeout
             finished_at: list[float] = []
 
             def call() -> None:
                 try:
-                    if time.monotonic() >= deadline:
+                    if clock() >= deadline:
                         raise ShadowDeadlineExpired(
                             f"deadline of {timeout:g}s passed before the request was sent")
                     # The callable must enforce *deadline* (a time.monotonic()
@@ -765,25 +777,25 @@ class IssuePlanner:
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
                 finally:
-                    finished_at.append(time.monotonic())
+                    finished_at.append(clock())
 
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(max(0.0, deadline - time.monotonic()))
+            join(worker, max(0.0, deadline - clock()))
             timed_out = worker.is_alive()
             still_running = False
             if timed_out:
                 # Record the timeout only after the call honoured the deadline
                 # and released its connection; a callable that ignores it is
                 # waited for at most the grace period.
-                worker.join(SHADOW_CANCEL_GRACE_SECONDS)
+                join(worker, SHADOW_CANCEL_GRACE_SECONDS)
                 still_running = worker.is_alive()
             elif finished_at and finished_at[0] >= deadline:
                 # Finished, but only at or after the shared deadline.
                 timed_out = True
             if failure and isinstance(failure[0], ShadowDeadlineExpired):
                 timed_out = True
-            elapsed = time.monotonic() - started
+            elapsed = clock() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
