@@ -27,6 +27,7 @@ def ensure_table(conn: sqlite3.Connection) -> None:
 
 
 def record(db_path: str, **values: Any) -> None:
+    """Keep the first completed observation for each tick, including retries."""
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
@@ -36,8 +37,9 @@ def record(db_path: str, **values: Any) -> None:
         conn.execute(
             """INSERT INTO planner_shadow
                (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, created_at)
-               VALUES (:tick_id, :paid_issue, :local_issue, :local_valid,
-                       :prompt_tokens, :seconds, :error, :created_at)""",
+               SELECT :tick_id, :paid_issue, :local_issue, :local_valid,
+                      :prompt_tokens, :seconds, :error, :created_at
+               WHERE NOT EXISTS (SELECT 1 FROM planner_shadow WHERE tick_id = :tick_id)""",
             values,
         )
 

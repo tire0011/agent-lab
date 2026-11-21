@@ -2,8 +2,8 @@
 
 ``estimate_tokens`` is ceil(utf-8 bytes / 4). ``compact_planning_prompt`` is a
 pure function: its result never has more than ``4 * max_tokens`` utf-8 bytes,
-and it returns ``None`` when the prompt cannot fit. It is not wired into the
-planner yet.
+and it returns ``None`` when the prompt cannot fit. It is wired into
+``_start_shadow`` since #790.
 """
 
 import hashlib
@@ -272,12 +272,12 @@ class RepeatAndFailureTests(unittest.TestCase):
                 self.assertIsNone(compact_planning_prompt(issues, recent, stuck, 3, max_tokens))
 
 
-class NotWiredYetTests(unittest.TestCase):
-    def test_shadow_call_still_uses_the_full_prompt(self):
+class WiredShadowTests(unittest.TestCase):
+    def test_shadow_call_uses_the_compact_prompt(self):
         import inspect
 
         source = inspect.getsource(nexus_planner.IssuePlanner._start_shadow)
-        self.assertNotIn("compact_planning_prompt", source)
+        self.assertIn("compact_planning_prompt", source)
 
 
 if __name__ == "__main__":
