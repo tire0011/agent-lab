@@ -10,7 +10,7 @@ it is interchangeable with the Codex and Claude workers.
 The CLI is started in headless mode:
 
   --prompt-file <tmp>   the task, read from a temporary file (no argv size limit)
-  --output json         machine-readable answer on stdout
+  --output streaming    one JSON journal entry per line (progress for the watchdog)
   --output-dir <tmp>    export.json with outcome, error, usage and cost
   --workdir <dir>       the experiment worktree
   --trust               trust that directory for this invocation only
@@ -87,7 +87,16 @@ def _final_message(stdout: str) -> str | None:
     try:
         data = json.loads(text)
     except ValueError:
-        return text
+        # --output streaming: one JSON entry per line.
+        entries = []
+        for line in text.splitlines():
+            try:
+                entries.append(json.loads(line))
+            except ValueError:
+                continue
+        if not entries:
+            return text
+        data = entries
     if isinstance(data, dict):
         for key in ("result", "response", "content", "message", "output", "text"):
             value = data.get(key)
@@ -216,7 +225,10 @@ class VibeWorker:
         cmd = [
             self.vibe_bin,
             "--prompt-file", prompt_file,
-            "--output", "json",
+            # One journal entry per line while the run works: the stall watchdog
+            # counts lines as progress (with "json" Vibe printed only at the end,
+            # and a long run was killed as stalled after 30 min, 2026-11-21).
+            "--output", "streaming",
             "--output-dir", output_dir,
             "--workdir", working_dir,
             "--trust",
