@@ -50,6 +50,31 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             conn.execute(f"ALTER TABLE planner_shadow ADD COLUMN {name} {declaration}")
 
 
+def _schema_is_current(conn: sqlite3.Connection) -> bool:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+    return bool(columns) and all(name in columns for name, _ in _MIGRATED_COLUMNS)
+
+
+def _ensure_schema_serialized(conn: sqlite3.Connection) -> None:
+    """Create or migrate the table for a reader without racing writers (#782).
+
+    A current schema needs no lock. Otherwise the inspection and every
+    ``ALTER TABLE`` happen inside one ``BEGIN IMMEDIATE`` write transaction -
+    the same lock :func:`record` takes - so a concurrent ``record`` or
+    ``list_shadow`` that migrated first is seen by the re-inspection under the
+    lock, and no connection adds a column twice.
+    """
+    if _schema_is_current(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        ensure_table(conn)
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
 def record(db_path: str, **values: Any) -> None:
     """Keep the first completed observation for each tick, including retries."""
     with sqlite3.connect(db_path, timeout=30) as conn:
@@ -73,7 +98,7 @@ def record(db_path: str, **values: Any) -> None:
 def list_shadow(db_path: str, limit: int = 20) -> dict[str, Any]:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
-        ensure_table(conn)
+        _ensure_schema_serialized(conn)
         rows = [dict(row) for row in conn.execute(
             "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, "
             "prompt_variant, cached_prompt_tokens "

@@ -392,6 +392,79 @@ def shadow_timeout_seconds(prompt_tokens: int, rates: Any) -> float:
     return min(SHADOW_TIMEOUT_CAP_SECONDS, max(0.0, seconds))
 
 
+# SQLite INTEGER is a signed 64-bit value; a bigger int cannot be stored.
+_SQLITE_INT_MIN, _SQLITE_INT_MAX = -(2 ** 63), 2 ** 63 - 1
+
+
+def _strict_int(value: Any) -> bool:
+    """True for a real JSON integer: no bool, no float (3.0, 3.9, NaN, inf)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _storable_int(value: Any) -> int | None:
+    """*value* when it fits a SQLite INTEGER column, else ``None``."""
+    if _strict_int(value) and _SQLITE_INT_MIN <= value <= _SQLITE_INT_MAX:
+        return int(value)
+    return None
+
+
+def validate_shadow_answer(text: str, allowed: set[int]) -> tuple[int | None, bool, str | None]:
+    """Check a shadow answer against the requested schema (#782).
+
+    Returns ``(local_issue, valid, error)``. The answer is valid only when it
+    is a JSON object with exactly ``issue`` (an integer from *allowed*) and
+    ``reason`` (a string of at most 160 characters). Nothing is coerced: a
+    float such as ``3.9`` or ``3.0``, a bool, ``NaN`` or ``Infinity`` is an
+    ``invalid issue``. An integer outside the allowed set keeps the historic
+    ``issue is not allowed`` error and is reported as ``local_issue`` when it
+    fits a SQLite INTEGER. Never raises.
+    """
+    try:
+        data = _json_object(text)
+    except Exception:  # noqa: BLE001 - e.g. RecursionError on absurd nesting
+        data = None
+    if data is None:
+        return None, False, "invalid JSON"
+    issue = data.get("issue")
+    if not _strict_int(issue):
+        return None, False, "invalid issue"
+    local_issue = _storable_int(issue)
+    if issue not in allowed:
+        return local_issue, False, "issue is not allowed"
+    reason = data.get("reason")
+    if not isinstance(reason, str):
+        return local_issue, False, "invalid reason"
+    if len(reason) > SHADOW_REASON_MAX_LENGTH:
+        return local_issue, False, "reason too long"
+    extra = sorted(str(key) for key in data if key not in ("issue", "reason"))
+    if extra:
+        return local_issue, False, ("unexpected keys: " + ", ".join(extra))[:200]
+    return local_issue, True, None
+
+
+def _resolve_shadow_timeout(prompt_tokens: int, rates: Any, cap: float | None) -> float:
+    """The shadow budget, computed on the daemon thread (#782).
+
+    *rates* ``None`` means the local model's default rates bucket. Building
+    that store or reading its medians may be slow or fail; any failure gives
+    the 120 s fallback. *cap* (the constructor's ``shadow_timeout``) further
+    limits the result.
+    """
+    try:
+        if rates is None:
+            rates = _default_shadow_rates()
+        timeout = shadow_timeout_seconds(prompt_tokens, rates)
+        if not (isinstance(timeout, (int, float)) and math.isfinite(timeout) and timeout > 0):
+            timeout = SHADOW_TIMEOUT_FALLBACK_SECONDS
+    except Exception as exc:  # noqa: BLE001 - never lose the measurement row
+        logger.warning("planner shadow: rates unavailable, using fallback: %s", exc)
+        timeout = SHADOW_TIMEOUT_FALLBACK_SECONDS
+    timeout = min(float(timeout), SHADOW_TIMEOUT_CAP_SECONDS)
+    if cap is not None:
+        timeout = min(timeout, float(cap))
+    return timeout
+
+
 def _default_shadow_rates() -> Any:
     """The rates bucket of the local model the shadow call uses (#782).
 
@@ -519,9 +592,11 @@ class IssuePlanner:
     or when exploring fails.
 
     *shadow* is the non-blocking local comparison (#671, #782): it is called as
-    ``shadow(prompt, response_format)`` on a daemon thread and may return the
-    raw answer string or a dict ``{"content": ..., "cached_prompt_tokens": ...}``
-    when the server reported reused prompt tokens. *rates* is a
+    ``shadow(prompt, response_format, timeout)`` on a daemon thread, where
+    *timeout* is the end-to-end deadline in seconds the callable must enforce
+    itself, and may return the raw answer string or a dict
+    ``{"content": ..., "cached_prompt_tokens": ...}`` when the server reported
+    reused prompt tokens. *rates* is a
     LocalModelRates-like object whose ``medians()`` size the shadow timeout;
     by default the local model's own rates bucket is used. *shadow_timeout*
     caps that rate-based timeout (default: the 240 s cap of #782).
@@ -531,7 +606,7 @@ class IssuePlanner:
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
-        shadow: Callable[[str, dict[str, Any] | None], Any] | None = None,
+        shadow: Callable[[str, dict[str, Any] | None, float], Any] | None = None,
         *,
         db_path: str | None = None,
         shadow_timeout: float | None = SHADOW_TIMEOUT_CAP_SECONDS,
@@ -620,21 +695,23 @@ class IssuePlanner:
         prompt_tokens = max(1, estimate_tokens(prompt))
         # The answer schema restricts issue to the allowed numbers (#782).
         response_format = shadow_response_format(allowed)
-        # The call timeout comes from the measured local rates, capped at 240 s
-        # and falling back to 120 s without samples; the tick never waits on it
-        # because the call stays on the daemon thread below.
-        rates = self._rates if self._rates is not None else _default_shadow_rates()
-        timeout = shadow_timeout_seconds(prompt_tokens, rates)
-        if self._shadow_timeout is not None:
-            timeout = min(timeout, float(self._shadow_timeout))
+        rates, cap = self._rates, self._shadow_timeout
 
         def monitor() -> None:
             result: list[Any] = []
             failure: list[BaseException] = []
+            # The call timeout comes from the measured local rates, capped at
+            # 240 s and falling back to 120 s without samples. It is resolved
+            # here on the daemon thread: reading the rates file never stalls
+            # the tick, and a broken store cannot lose the paid choice (#782).
+            timeout = _resolve_shadow_timeout(prompt_tokens, rates, cap)
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt, response_format))  # type: ignore[misc]
+                    # The callable gets the budget as an end-to-end deadline, so
+                    # a call that outlives the monitor's join is cancelled and
+                    # releases its connection instead of running on (#782).
+                    result.append(self._shadow(prompt, response_format, timeout))  # type: ignore[misc]
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
@@ -652,29 +729,21 @@ class IssuePlanner:
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
-                raw = result[0] if result else ""
-                content: Any = raw
-                if isinstance(raw, dict):
-                    # A shadow callable that knows the server timings returns
-                    # {"content": ..., "cached_prompt_tokens": ...} (#782).
-                    content = raw.get("content", "")
-                    cached = raw.get("cached_prompt_tokens")
-                    if (isinstance(cached, (int, float)) and not isinstance(cached, bool)
-                            and math.isfinite(cached) and cached >= 0):
-                        cached_prompt_tokens = int(cached)
-                text = content if isinstance(content, str) else ("" if content is None else str(content))
-                data = _json_object(text)
-                if data is None:
-                    error = "invalid JSON"
-                else:
-                    try:
-                        local_issue = int(data.get("issue"))
-                    except (TypeError, ValueError):
-                        error = "invalid issue"
-                    else:
-                        valid = local_issue in allowed
-                        if not valid:
-                            error = "issue is not allowed"
+                try:
+                    raw = result[0] if result else ""
+                    content: Any = raw
+                    if isinstance(raw, dict):
+                        # A shadow callable that knows the server timings returns
+                        # {"content": ..., "cached_prompt_tokens": ...} (#782).
+                        content = raw.get("content", "")
+                        cached = _storable_int(raw.get("cached_prompt_tokens"))
+                        if cached is not None and cached >= 0:
+                            cached_prompt_tokens = cached
+                    text = content if isinstance(content, str) else ""
+                    local_issue, valid, error = validate_shadow_answer(text, allowed)
+                except Exception as exc:  # noqa: BLE001 - a malformed answer is a measurement
+                    local_issue, valid = None, False
+                    error = f"invalid answer: {type(exc).__name__}"[:500]
             try:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,

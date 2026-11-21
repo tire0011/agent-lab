@@ -107,7 +107,7 @@ class PlannerShadowTests(unittest.TestCase):
     def test_zero_disables_shadow_call(self):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "0"}):
-            choice = self.planner(lambda prompt, _rf: called.append(prompt) or "{}").choose(ISSUES)
+            choice = self.planner(lambda prompt, _rf, _t: called.append(prompt) or "{}").choose(ISSUES)
         self.assertEqual(choice.issue, 2)
         time.sleep(.03)
         self.assertEqual(called, [])

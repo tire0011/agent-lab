@@ -81,7 +81,7 @@ class ShadowPart2Tests(unittest.TestCase):
     def test_schema_enum_is_exactly_the_allowed_set(self):
         calls = []
 
-        def fake_shadow(prompt, response_format):
+        def fake_shadow(prompt, response_format, timeout):
             calls.append((prompt, response_format))
             return '{"issue": 3, "reason": "local pick"}'
 
@@ -120,7 +120,7 @@ class ShadowPart2Tests(unittest.TestCase):
         # The schema cannot be produced by a conforming server, but the fake
         # returns a disallowed number anyway: it must still be recorded as
         # invalid with the "issue is not allowed" error.
-        def fake_shadow(prompt, response_format):
+        def fake_shadow(prompt, response_format, timeout):
             return '{"issue": 99, "reason": "not on the list"}'
 
         self.planner(fake_shadow).choose(ISSUES, tick_id="tick-99")
@@ -132,7 +132,7 @@ class ShadowPart2Tests(unittest.TestCase):
         self.assertEqual(SHADOW_PROMPT_VARIANT, "compact_v1")
 
     def test_row_stores_prompt_variant_compact_v1(self):
-        self.planner(lambda _p, _rf: '{"issue": 7, "reason": "local"}').choose(
+        self.planner(lambda _p, _rf, _t: '{"issue": 7, "reason": "local"}').choose(
             ISSUES, tick_id="tick-variant")
         row = self.wait_for_row()
         self.assertEqual(row["prompt_variant"], "compact_v1")
@@ -144,7 +144,7 @@ class ShadowPart2Tests(unittest.TestCase):
         self.assertIsNone(row["cached_prompt_tokens"])
 
     def test_cached_prompt_tokens_from_the_shadow_answer_are_stored(self):
-        def fake_shadow(prompt, response_format):
+        def fake_shadow(prompt, response_format, timeout):
             return {"content": '{"issue": 3, "reason": "cached prefix reused"}',
                     "cached_prompt_tokens": 812}
 
@@ -158,7 +158,7 @@ class ShadowPart2Tests(unittest.TestCase):
     def test_over_budget_skip_row_also_stores_the_variant(self):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
-            choice = self.planner(lambda p, _rf: called.append(p) or "{}").choose(
+            choice = self.planner(lambda p, _rf, _t: called.append(p) or "{}").choose(
                 ISSUES, tick_id="tick-skip")
         self.assertEqual(choice.issue, 5)
         self.assertEqual(called, [])
@@ -172,7 +172,7 @@ class ShadowPart2Tests(unittest.TestCase):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "0"}):
             choice = self.planner(
-                lambda p, _rf: called.append((p, _rf)) or "{}").choose(ISSUES)
+                lambda p, _rf, _t: called.append((p, _rf)) or "{}").choose(ISSUES)
         self.assertEqual(choice.issue, 5)
         time.sleep(0.03)
         self.assertEqual(called, [])
@@ -237,7 +237,7 @@ class ShadowTimeoutTests(unittest.TestCase):
             seen.append((prompt_tokens, rates))
             return 0.05  # tiny, so the test does not wait
 
-        def slow_shadow(prompt, response_format):
+        def slow_shadow(prompt, response_format, timeout):
             time.sleep(1)
             return "{}"
 
@@ -260,7 +260,7 @@ class ShadowTimeoutTests(unittest.TestCase):
         self.assertEqual(row["prompt_variant"], "compact_v1")
 
     def test_constructor_cap_still_limits_the_computed_timeout(self):
-        def slow_shadow(prompt, response_format):
+        def slow_shadow(prompt, response_format, timeout):
             time.sleep(1)
             return "{}"
 
@@ -320,6 +320,432 @@ class PlannerShadowMigrationTests(unittest.TestCase):
         row = list_shadow(self.db)["rows"][0]
         self.assertIsNone(row["prompt_variant"])
         self.assertIsNone(row["cached_prompt_tokens"])
+
+
+LEGACY_TABLE = """CREATE TABLE planner_shadow (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tick_id TEXT NOT NULL,
+    paid_issue INTEGER NOT NULL,
+    local_issue INTEGER,
+    local_valid INTEGER NOT NULL CHECK (local_valid IN (0, 1)),
+    prompt_tokens INTEGER NOT NULL,
+    seconds REAL NOT NULL,
+    error TEXT)"""
+
+
+class _ShadowCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "agent.db")
+        env = patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "1"})
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS", None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def wait_for_row(self, seconds=3):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if list_shadow(self.db)["count"]:
+                return list_shadow(self.db)["rows"][0]
+            time.sleep(0.01)
+        self.fail("shadow row was not written")
+
+
+class ShadowDeadlineTests(_ShadowCase):
+    """Blocker 1: the computed budget reaches the callable as a deadline."""
+
+    def test_callable_receives_the_computed_budget(self):
+        seen = []
+
+        def fake_shadow(prompt, response_format, timeout):
+            seen.append(timeout)
+            return '{"issue": 3, "reason": "ok"}'
+
+        IssuePlanner(lambda _: PAID, shadow=fake_shadow, db_path=self.db,
+                     shadow_timeout=None, rates=FakeRates(1e9, 20.0)).choose(
+            ISSUES, tick_id="tick-budget")
+        self.wait_for_row()
+        # prompt part ~0, 120 / 20 = 6, slack 10.
+        self.assertEqual(len(seen), 1)
+        self.assertAlmostEqual(seen[0], 16.0, places=3)
+
+    def test_callable_budget_is_the_capped_value(self):
+        seen = []
+        IssuePlanner(lambda _: PAID,
+                     shadow=lambda p, rf, t: seen.append(t) or '{"issue": 3, "reason": "x"}',
+                     db_path=self.db, shadow_timeout=None,
+                     rates=FakeRates(0.001, 0.001)).choose(ISSUES, tick_id="tick-capped")
+        self.wait_for_row()
+        self.assertEqual(seen, [240.0])
+
+    def _patched_client(self, handler):
+        import httpx
+        from modules import llama_cpp_client
+
+        created = []
+
+        class Client(llama_cpp_client.LlamaCppClient):
+            def __init__(self, *args, **kwargs):
+                kwargs["transport"] = httpx.MockTransport(handler)
+                super().__init__(*args, **kwargs)
+                created.append(self)
+
+        return patch.object(llama_cpp_client, "LlamaCppClient", Client), created
+
+    def test_production_shadow_cancels_the_request_at_the_deadline(self):
+        import asyncio
+        import nexus_tick
+
+        state = {"cancelled": False, "finished": False}
+
+        async def handler(request):
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                state["cancelled"] = True
+                raise
+            state["finished"] = True
+            raise AssertionError("request outlived the deadline")
+
+        patcher, created = self._patched_client(handler)
+        started = time.monotonic()
+        with patcher, self.assertRaises(TimeoutError):
+            nexus_tick._local_shadow("prompt", shadow_response_format(ALLOWED), 0.2)
+        self.assertLess(time.monotonic() - started, 5)
+        # The request was cancelled (connection released), not left running.
+        self.assertTrue(state["cancelled"])
+        self.assertFalse(state["finished"])
+        self.assertEqual(created[0].timeout, 0.2)
+
+    def test_production_shadow_returns_content_and_cached_tokens(self):
+        import json as json_module
+        import httpx
+        import nexus_tick
+
+        bodies = []
+
+        def handler(request):
+            bodies.append(json_module.loads(request.content))
+            return httpx.Response(200, json={
+                "choices": [{"message": {"content": '{"issue": 3, "reason": "r"}'}}],
+                "timings": {"prompt_n": 10, "prompt_ms": 100.0, "predicted_n": 5,
+                            "predicted_ms": 50.0, "tokens_cached": 42},
+            })
+
+        patcher, created = self._patched_client(handler)
+        response_format = shadow_response_format(ALLOWED)
+        with patcher:
+            result = nexus_tick._local_shadow("prompt", response_format, 30.0)
+        self.assertEqual(result["content"], '{"issue": 3, "reason": "r"}')
+        self.assertEqual(bodies[0]["response_format"], response_format)
+        self.assertEqual(bodies[0]["max_tokens"], 120)
+        self.assertEqual(created[0].timeout, 30.0)
+        if result["cached_prompt_tokens"] is not None:
+            self.assertEqual(result["cached_prompt_tokens"], 42)
+
+    def test_production_shadow_with_a_broken_budget_uses_the_fallback(self):
+        import httpx
+        import nexus_tick
+
+        def handler(request):
+            return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}}]})
+
+        for broken in (float("nan"), float("inf"), 0, -5, None, "x"):
+            patcher, created = self._patched_client(handler)
+            with patcher:
+                nexus_tick._local_shadow("prompt", None, broken)
+            self.assertEqual(created[0].timeout, SHADOW_TIMEOUT_FALLBACK_SECONDS, broken)
+
+    def test_planner_wiring_uses_the_deadline_shadow(self):
+        import nexus_tick
+
+        planner = nexus_tick._planner(self.tmp.name, self.db)
+        self.assertIs(planner._shadow, nexus_tick._local_shadow)
+
+
+class ShadowRatesOffTickTests(_ShadowCase):
+    """Blocker 2: rates are resolved on the daemon thread with a fallback."""
+
+    def test_slow_rates_read_never_stalls_the_paid_choice(self):
+        class SlowRates:
+            def medians(self):
+                time.sleep(1)
+                return 10.0, 20.0
+
+        started = time.monotonic()
+        choice = IssuePlanner(
+            lambda _: PAID, shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
+            db_path=self.db, rates=SlowRates()).choose(ISSUES, tick_id="tick-slow-rates")
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(choice.issue, 5)
+        row = self.wait_for_row()
+        self.assertEqual(row["local_valid"], 1)
+
+    def test_rates_store_construction_failure_uses_the_fallback(self):
+        seen = []
+        with patch.object(nexus_planner, "_default_shadow_rates",
+                          side_effect=RuntimeError("store broken")) as store:
+            choice = IssuePlanner(
+                lambda _: PAID,
+                shadow=lambda p, rf, t: seen.append(t) or '{"issue": 7, "reason": "x"}',
+                db_path=self.db, shadow_timeout=None).choose(ISSUES, tick_id="tick-store")
+            self.assertEqual(choice.issue, 5)
+            row = self.wait_for_row()
+        self.assertTrue(store.called)
+        self.assertEqual(seen, [SHADOW_TIMEOUT_FALLBACK_SECONDS])
+        self.assertEqual((row["local_issue"], row["local_valid"]), (7, 1))
+
+    def test_default_store_is_built_on_the_daemon_thread(self):
+        import threading
+
+        threads = []
+
+        def build():
+            threads.append(threading.current_thread().name)
+            return FakeRates(None, None)
+
+        with patch.object(nexus_planner, "_default_shadow_rates", side_effect=build):
+            IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: "{}",
+                         db_path=self.db).choose(ISSUES, tick_id="tick-thread")
+            self.wait_for_row()
+        self.assertEqual(threads, ["planner-shadow"])
+
+    def test_rates_returning_garbage_use_the_fallback(self):
+        class Garbage:
+            def medians(self):
+                return "fast"
+
+        seen = []
+        IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: seen.append(t) or "{}",
+                     db_path=self.db, shadow_timeout=None, rates=Garbage()).choose(
+            ISSUES, tick_id="tick-garbage")
+        self.wait_for_row()
+        self.assertEqual(seen, [SHADOW_TIMEOUT_FALLBACK_SECONDS])
+
+
+class ShadowMigrationRaceTests(unittest.TestCase):
+    """Blocker 3: list_shadow migrates under the writer lock."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "agent.db")
+        with sqlite3.connect(self.db) as conn:
+            conn.execute(LEGACY_TABLE)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_list_waits_for_a_migrating_writer_instead_of_adding_columns_twice(self):
+        import threading
+
+        writer = sqlite3.connect(self.db, timeout=30, isolation_level=None)
+        writer.execute("BEGIN IMMEDIATE")
+        outcome = {}
+
+        def reader():
+            try:
+                outcome["result"] = list_shadow(self.db)
+            except BaseException as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        thread = threading.Thread(target=reader)
+        thread.start()
+        time.sleep(0.2)
+        # The reader saw the old schema but must wait for the lock ...
+        self.assertTrue(thread.is_alive())
+        # ... while the other connection migrates and commits.
+        for name, declaration in (("created_at", "TEXT"), ("prompt_variant", "TEXT"),
+                                  ("cached_prompt_tokens", "INTEGER")):
+            writer.execute(f"ALTER TABLE planner_shadow ADD COLUMN {name} {declaration}")
+        writer.execute("COMMIT")
+        writer.close()
+        thread.join(10)
+        self.assertNotIn("error", outcome)
+        self.assertEqual(outcome["result"]["count"], 0)
+
+    def test_concurrent_lists_and_records_on_a_legacy_table(self):
+        import threading
+
+        barrier = threading.Barrier(8)
+        errors = []
+
+        def worker(index):
+            try:
+                barrier.wait()
+                if index % 2:
+                    list_shadow(self.db)
+                else:
+                    record(self.db, tick_id=f"t{index}", paid_issue=1, local_issue=1,
+                           local_valid=1, prompt_tokens=1, seconds=0.1, error=None,
+                           prompt_variant="compact_v1")
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(list_shadow(self.db)["summary"]["total"], 4)
+
+    def test_current_schema_list_takes_no_write_lock(self):
+        list_shadow(self.db)  # migrates once
+        holder = sqlite3.connect(self.db, isolation_level=None)
+        holder.execute("BEGIN IMMEDIATE")
+        try:
+            started = time.monotonic()
+            self.assertEqual(list_shadow(self.db)["count"], 0)
+            self.assertLess(time.monotonic() - started, 1)
+        finally:
+            holder.execute("ROLLBACK")
+            holder.close()
+
+    def test_failed_migration_rolls_back_and_a_retry_succeeds(self):
+        from modules import planner_shadow
+
+        def broken(conn):
+            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
+            raise RuntimeError("crash mid-migration")
+
+        with patch.object(planner_shadow, "ensure_table", side_effect=broken):
+            with self.assertRaises(RuntimeError):
+                list_shadow(self.db)
+        with sqlite3.connect(self.db) as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+        self.assertNotIn("created_at", columns)  # rolled back, lock released
+        self.assertEqual(list_shadow(self.db)["count"], 0)
+        list_shadow(self.db)  # running it twice is harmless
+
+
+class ShadowAnswerValidationTests(_ShadowCase):
+    """Blocker 4: answers are validated against the schema, nothing coerced."""
+
+    def test_validate_shadow_answer(self):
+        validate = nexus_planner.validate_shadow_answer
+        long_reason = "x" * (SHADOW_REASON_MAX_LENGTH + 1)
+        cases = [
+            ('{"issue": 3, "reason": "ok"}', (3, True, None)),
+            ('{"issue": 3, "reason": "%s"}' % ("y" * SHADOW_REASON_MAX_LENGTH), (3, True, None)),
+            ('{"issue": 3.9, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": 3.0, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": true, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": "3", "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": NaN, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": Infinity, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": -Infinity, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": 1e400, "reason": "ok"}', (None, False, "invalid issue")),
+            ('{"reason": "ok"}', (None, False, "invalid issue")),
+            ('{"issue": 99, "reason": "ok"}', (99, False, "issue is not allowed")),
+            ('{"issue": -1}', (-1, False, "issue is not allowed")),
+            ('{"issue": %d, "reason": "ok"}' % 10 ** 30, (None, False, "issue is not allowed")),
+            ('{"issue": 3}', (3, False, "invalid reason")),
+            ('{"issue": 3, "reason": 7}', (3, False, "invalid reason")),
+            ('{"issue": 3, "reason": "%s"}' % long_reason, (3, False, "reason too long")),
+            ('{"issue": 3, "reason": "ok", "split": {}}', (3, False, "unexpected keys: split")),
+            ("not json", (None, False, "invalid JSON")),
+            ("[3]", (None, False, "invalid JSON")),
+            ("", (None, False, "invalid JSON")),
+            ("{" * 100000 + "}" * 100000, (None, False, "invalid JSON")),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text[:60]):
+                self.assertEqual(validate(text, ALLOWED), expected)
+
+    def _row_for(self, answer, tick):
+        IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: answer,
+                     db_path=self.db, shadow_timeout=1).choose(ISSUES, tick_id=tick)
+        return self.wait_for_row()
+
+    def test_float_issue_is_recorded_as_invalid(self):
+        row = self._row_for('{"issue": 3.9, "reason": "ok"}', "tick-float")
+        self.assertEqual((row["local_issue"], row["local_valid"], row["error"]),
+                         (None, 0, "invalid issue"))
+
+    def test_non_finite_issue_still_writes_the_row(self):
+        row = self._row_for('{"issue": Infinity, "reason": "ok"}', "tick-inf")
+        self.assertEqual((row["local_valid"], row["error"]), (0, "invalid issue"))
+
+    def test_huge_integer_is_not_allowed_and_still_writes_the_row(self):
+        row = self._row_for('{"issue": %d, "reason": "ok"}' % 10 ** 30, "tick-huge")
+        self.assertEqual((row["local_issue"], row["local_valid"], row["error"]),
+                         (None, 0, "issue is not allowed"))
+
+    def test_missing_reason_is_invalid(self):
+        row = self._row_for('{"issue": 3}', "tick-noreason")
+        self.assertEqual((row["local_issue"], row["local_valid"], row["error"]),
+                         (3, 0, "invalid reason"))
+
+    def test_malformed_cached_tokens_are_dropped_not_fatal(self):
+        for index, cached in enumerate((10 ** 30, True, float("inf"), -3, "12", 1.5)):
+            db = str(Path(self.tmp.name) / f"c{index}.db")
+            IssuePlanner(lambda _: PAID,
+                         shadow=lambda p, rf, t: {"content": '{"issue": 3, "reason": "x"}',
+                                                  "cached_prompt_tokens": cached},
+                         db_path=db, shadow_timeout=1).choose(ISSUES, tick_id="c")
+            deadline = time.monotonic() + 3
+            while not list_shadow(db)["count"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            row = list_shadow(db)["rows"][0]
+            self.assertIsNone(row["cached_prompt_tokens"], cached)
+            self.assertEqual(row["local_valid"], 1)
+
+    def test_non_string_answers_are_invalid_json(self):
+        for index, answer in enumerate((None, 42, ["x"], {"content": None}, {"content": 7})):
+            db = str(Path(self.tmp.name) / f"n{index}.db")
+            IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: answer,
+                         db_path=db, shadow_timeout=1).choose(ISSUES, tick_id="n")
+            deadline = time.monotonic() + 3
+            while not list_shadow(db)["count"] and time.monotonic() < deadline:
+                time.sleep(0.01)
+            row = list_shadow(db)["rows"][0]
+            self.assertEqual((row["local_valid"], row["error"]), (0, "invalid JSON"), answer)
+
+
+class ShadowFailureModeTests(_ShadowCase):
+    """Interrupted, crashing, half-failing and repeated shadow runs."""
+
+    def test_running_the_same_tick_twice_keeps_one_row(self):
+        planner = IssuePlanner(lambda _: PAID,
+                               shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
+                               db_path=self.db, shadow_timeout=1)
+        planner.choose(ISSUES, tick_id="tick-twice")
+        self.wait_for_row()
+        planner.choose(ISSUES, tick_id="tick-twice")
+        time.sleep(0.2)
+        self.assertEqual(list_shadow(self.db)["summary"]["total"], 1)
+
+    def test_interrupted_shadow_call_records_the_failure(self):
+        def interrupted(prompt, response_format, timeout):
+            raise KeyboardInterrupt("stopped")
+
+        choice = IssuePlanner(lambda _: PAID, shadow=interrupted, db_path=self.db,
+                              shadow_timeout=1).choose(ISSUES, tick_id="tick-int")
+        self.assertEqual(choice.issue, 5)
+        row = self.wait_for_row()
+        self.assertEqual(row["local_valid"], 0)
+        self.assertTrue(row["error"].startswith("KeyboardInterrupt"))
+
+    def test_deadline_error_from_the_callable_is_recorded(self):
+        def deadline(prompt, response_format, timeout):
+            raise TimeoutError(f"planner shadow deadline of {timeout:g}s exceeded")
+
+        IssuePlanner(lambda _: PAID, shadow=deadline, db_path=self.db,
+                     shadow_timeout=None, rates=FakeRates(None, None)).choose(
+            ISSUES, tick_id="tick-deadline")
+        row = self.wait_for_row()
+        self.assertEqual(row["error"], "TimeoutError: planner shadow deadline of 120s exceeded")
+
+    def test_unwritable_database_never_breaks_the_paid_choice(self):
+        bad_db = self.tmp.name  # a directory, sqlite cannot open it
+        choice = IssuePlanner(lambda _: PAID,
+                              shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
+                              db_path=bad_db, shadow_timeout=1).choose(ISSUES, tick_id="tick-bad")
+        self.assertEqual(choice.issue, 5)
+        time.sleep(0.2)  # the daemon logs and drops the row; nothing propagates
 
 
 if __name__ == "__main__":

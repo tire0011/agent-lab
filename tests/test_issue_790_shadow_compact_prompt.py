@@ -92,7 +92,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         unreserved = compact_planning_prompt(issues, outcomes, [], 3)
         self.assertGreater(len(unreserved.encode("utf-8")) + suffix_bytes, cap)
 
-        def fake_shadow(prompt, response_format):
+        def fake_shadow(prompt, response_format, timeout):
             received.append(prompt)
             return '{"issue": 179, "reason": "local"}'
 
@@ -128,7 +128,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
         received = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "250"}):
             choice = self.planner(
-                lambda p, _rf: received.append(p) or '{"issue": 139, "reason": "x"}',
+                lambda p, _rf, _t: received.append(p) or '{"issue": 139, "reason": "x"}',
                 paid=PAID_MANY,
             ).choose(many_issues(), nine_outcomes(), budget_left=3)
         self.assertEqual(choice.issue, 139)
@@ -141,7 +141,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
     def test_tiny_env_budget_skips_the_call_and_writes_the_skip_row_synchronously(self):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
-            choice = self.planner(lambda p, _rf: called.append(p) or "{}").choose(
+            choice = self.planner(lambda p, _rf, _t: called.append(p) or "{}").choose(
                 ISSUES, tick_id="tick-skip")
         # The paid choice is unaffected and no shadow model call was made.
         self.assertEqual(choice.issue, 2)
@@ -168,7 +168,7 @@ class ShadowCompactPromptTests(unittest.TestCase):
                 BEGIN SELECT RAISE(ABORT, 'interrupted write'); END
             """)
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW_PROMPT_TOKENS": "1"}):
-            planner = self.planner(lambda p, _rf: called.append(p) or "{}")
+            planner = self.planner(lambda p, _rf, _t: called.append(p) or "{}")
             with self.assertLogs(nexus_planner.logger, level="WARNING") as logs:
                 self.assertEqual(planner.choose(ISSUES, tick_id="replay").issue, 2)
             self.assertIn("interrupted write", logs.output[0])

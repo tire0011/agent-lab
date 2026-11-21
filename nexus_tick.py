@@ -295,6 +295,55 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
     return result.final_message or ""
 
 
+def _local_shadow(prompt: str, response_format: dict | None, timeout: float) -> dict:
+    """The production planner shadow call to the local llama-server (#671, #782).
+
+    *timeout* is an end-to-end deadline: the HTTP client gets it as its own
+    timeout and the whole request is wrapped in ``asyncio.wait_for``, so when
+    the budget is used up the request is cancelled, the httpx client is closed
+    and the connection is released - the call never runs on after the planner
+    recorded the timeout row. Raises :class:`TimeoutError` on the deadline.
+    """
+    import asyncio
+    import math
+
+    from modules.llama_cpp_client import LlamaCppClient
+
+    try:
+        budget = float(timeout)
+    except (TypeError, ValueError):
+        budget = 0.0
+    if not math.isfinite(budget) or budget <= 0:
+        from modules.nexus_planner import SHADOW_TIMEOUT_FALLBACK_SECONDS
+        budget = SHADOW_TIMEOUT_FALLBACK_SECONDS
+    client = LlamaCppClient(timeout=budget, stream=False)
+    kwargs = {}
+    if response_format is not None:
+        kwargs["response_format"] = response_format
+
+    async def request():
+        try:
+            return await asyncio.wait_for(client.chat_completion(
+                [{"role": "user", "content": prompt}], max_tokens=120, **kwargs,
+            ), budget)
+        except asyncio.TimeoutError as exc:
+            raise TimeoutError(f"planner shadow deadline of {budget:g}s exceeded") from exc
+
+    response = asyncio.run(request())
+    content = str(response["choices"][0]["message"]["content"])
+    # Report the prompt tokens llama-server reused from its cache (#685),
+    # so the planner_shadow row can store them as cached_prompt_tokens (#782).
+    timings = client.last_timings or {}
+    cached = timings.get("tokens_cached")
+    return {
+        "content": content,
+        "cached_prompt_tokens": (int(cached)
+                                 if isinstance(cached, (int, float))
+                                 and not isinstance(cached, bool)
+                                 and math.isfinite(cached) else None),
+    }
+
+
 def _planner(repo_root: str, db_path: str | None = None):
     """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
     import asyncio
@@ -318,34 +367,9 @@ def _planner(repo_root: str, db_path: str | None = None):
             raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
         return str(result.get("content") or "")
 
-    from modules.llama_cpp_client import LlamaCppClient
-
-    def shadow(prompt: str, response_format: dict | None = None):
-        # Default client timeout (300 s): the planner's daemon thread enforces
-        # the rate-based shadow timeout (<= 240 s, #782), so the HTTP call must
-        # not be cut shorter than that by a hard-coded client timeout.
-        client = LlamaCppClient(stream=False)
-        kwargs = {}
-        if response_format is not None:
-            kwargs["response_format"] = response_format
-        response = asyncio.run(client.chat_completion(
-            [{"role": "user", "content": prompt}], max_tokens=120, **kwargs,
-        ))
-        content = str(response["choices"][0]["message"]["content"])
-        # Report the prompt tokens llama-server reused from its cache (#685),
-        # so the planner_shadow row can store them as cached_prompt_tokens (#782).
-        timings = client.last_timings or {}
-        cached = timings.get("tokens_cached")
-        return {
-            "content": content,
-            "cached_prompt_tokens": (int(cached)
-                                     if isinstance(cached, (int, float))
-                                     and not isinstance(cached, bool) else None),
-        }
-
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
-        shadow=shadow,
+        shadow=_local_shadow,
         db_path=db_path or os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db"),
     )
 
