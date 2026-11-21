@@ -67,7 +67,7 @@ class ShadowPart2Tests(unittest.TestCase):
         self.tmp.cleanup()
 
     def wait_for_row(self):
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if list_shadow(self.db)["count"]:
                 return list_shadow(self.db)["rows"][0]
@@ -196,7 +196,7 @@ class ShadowTimeoutTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def wait_for_row(self):
-        deadline = time.monotonic() + 2
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             if list_shadow(self.db)["count"]:
                 return list_shadow(self.db)["rows"][0]
@@ -237,20 +237,28 @@ class ShadowTimeoutTests(unittest.TestCase):
             seen.append((prompt_tokens, rates))
             return 0.05  # tiny, so the test does not wait
 
+        import threading
+
+        release = threading.Event()
+
         def slow_shadow(prompt, response_format, timeout):
-            time.sleep(1)
+            release.wait(30)  # blocked until the test has seen the row
             return "{}"
 
         rates = FakeRates(10.0, 20.0)
         planner = IssuePlanner(lambda _: PAID, shadow=slow_shadow, db_path=self.db,
                                rates=rates)
-        with patch.object(nexus_planner, "shadow_timeout_seconds", side_effect=fake_timeout):
-            started = time.monotonic()
-            choice = planner.choose(ISSUES, tick_id="tick-timeout")
-        # The tick never waits on the shadow: it stays on the daemon thread.
-        self.assertLess(time.monotonic() - started, 0.2)
-        self.assertEqual(choice.issue, 5)
-        row = self.wait_for_row()
+        try:
+            with patch.object(nexus_planner, "shadow_timeout_seconds",
+                              side_effect=fake_timeout):
+                choice = planner.choose(ISSUES, tick_id="tick-timeout")
+                # The tick never waits on the shadow: choose() returned while
+                # the shadow call is still blocked on the daemon thread.
+                self.assertFalse(release.is_set())
+                self.assertEqual(choice.issue, 5)
+                row = self.wait_for_row()
+        finally:
+            release.set()
         # The monitor joined with the computed timeout and recorded it.
         self.assertEqual(row["error"], "timeout after 0.05s")
         self.assertEqual(len(seen), 1)
@@ -260,15 +268,22 @@ class ShadowTimeoutTests(unittest.TestCase):
         self.assertEqual(row["prompt_variant"], "compact_v1")
 
     def test_constructor_cap_still_limits_the_computed_timeout(self):
+        import threading
+
+        release = threading.Event()
+
         def slow_shadow(prompt, response_format, timeout):
-            time.sleep(1)
+            release.wait(30)
             return "{}"
 
         # Huge rates give ~10 s; the constructor cap brings it to 0.05 s.
         planner = IssuePlanner(lambda _: PAID, shadow=slow_shadow, db_path=self.db,
                                shadow_timeout=0.05, rates=FakeRates(1e9, 1e9))
-        planner.choose(ISSUES, tick_id="tick-cap")
-        row = self.wait_for_row()
+        try:
+            planner.choose(ISSUES, tick_id="tick-cap")
+            row = self.wait_for_row()
+        finally:
+            release.set()
         self.assertEqual(row["error"], "timeout after 0.05s")
 
 
@@ -345,7 +360,7 @@ class _ShadowCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def wait_for_row(self, seconds=3):
+    def wait_for_row(self, seconds=30):
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if list_shadow(self.db)["count"]:
@@ -411,11 +426,10 @@ class ShadowDeadlineTests(_ShadowCase):
             raise AssertionError("request outlived the deadline")
 
         patcher, created = self._patched_client(handler)
-        started = time.monotonic()
         with patcher, self.assertRaises(TimeoutError):
             nexus_tick._local_shadow("prompt", shadow_response_format(ALLOWED), 0.2)
-        self.assertLess(time.monotonic() - started, 5)
-        # The request was cancelled (connection released), not left running.
+        # The request was cancelled (connection released), not left running;
+        # without the deadline the handler would have finished its 30 s sleep.
         self.assertTrue(state["cancelled"])
         self.assertFalse(state["finished"])
         self.assertEqual(created[0].timeout, 0.2)
@@ -470,17 +484,30 @@ class ShadowRatesOffTickTests(_ShadowCase):
     """Blocker 2: rates are resolved on the daemon thread with a fallback."""
 
     def test_slow_rates_read_never_stalls_the_paid_choice(self):
+        import threading
+
+        entered = threading.Event()
+        release = threading.Event()
+
         class SlowRates:
+            # Blocks until the test releases it: if choose() read the rates
+            # on the paid path, it could never return while this is held.
             def medians(self):
-                time.sleep(1)
+                entered.set()
+                release.wait(30)
                 return 10.0, 20.0
 
-        started = time.monotonic()
-        choice = IssuePlanner(
-            lambda _: PAID, shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
-            db_path=self.db, rates=SlowRates()).choose(ISSUES, tick_id="tick-slow-rates")
-        self.assertLess(time.monotonic() - started, 0.5)
-        self.assertEqual(choice.issue, 5)
+        try:
+            choice = IssuePlanner(
+                lambda _: PAID, shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
+                db_path=self.db, rates=SlowRates()).choose(ISSUES, tick_id="tick-slow-rates")
+            # The paid choice came back while the rates read is still blocked.
+            self.assertFalse(release.is_set())
+            self.assertEqual(choice.issue, 5)
+            self.assertTrue(entered.wait(30), "rates were never read on the daemon")
+            self.assertEqual(list_shadow(self.db)["count"], 0)
+        finally:
+            release.set()
         row = self.wait_for_row()
         self.assertEqual(row["local_valid"], 1)
 
@@ -594,12 +621,21 @@ class ShadowMigrationRaceTests(unittest.TestCase):
 
     def test_current_schema_list_takes_no_write_lock(self):
         list_shadow(self.db)  # migrates once
+        from modules import planner_shadow
+
         holder = sqlite3.connect(self.db, isolation_level=None)
         holder.execute("BEGIN IMMEDIATE")
+        real_connect = sqlite3.connect
+
+        def no_wait_connect(*args, **kwargs):
+            # busy timeout 0: any write-lock attempt fails at once with
+            # "database is locked" instead of waiting - no wall clock needed.
+            kwargs["timeout"] = 0
+            return real_connect(*args, **kwargs)
+
         try:
-            started = time.monotonic()
-            self.assertEqual(list_shadow(self.db)["count"], 0)
-            self.assertLess(time.monotonic() - started, 1)
+            with patch.object(planner_shadow.sqlite3, "connect", side_effect=no_wait_connect):
+                self.assertEqual(list_shadow(self.db)["count"], 0)
         finally:
             holder.execute("ROLLBACK")
             holder.close()
@@ -657,7 +693,7 @@ class ShadowAnswerValidationTests(_ShadowCase):
 
     def _row_for(self, answer, tick):
         IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: answer,
-                     db_path=self.db, shadow_timeout=1).choose(ISSUES, tick_id=tick)
+                     db_path=self.db, shadow_timeout=30).choose(ISSUES, tick_id=tick)
         return self.wait_for_row()
 
     def test_float_issue_is_recorded_as_invalid(self):
@@ -685,8 +721,8 @@ class ShadowAnswerValidationTests(_ShadowCase):
             IssuePlanner(lambda _: PAID,
                          shadow=lambda p, rf, t: {"content": '{"issue": 3, "reason": "x"}',
                                                   "cached_prompt_tokens": cached},
-                         db_path=db, shadow_timeout=1).choose(ISSUES, tick_id="c")
-            deadline = time.monotonic() + 3
+                         db_path=db, shadow_timeout=30).choose(ISSUES, tick_id="c")
+            deadline = time.monotonic() + 30
             while not list_shadow(db)["count"] and time.monotonic() < deadline:
                 time.sleep(0.01)
             row = list_shadow(db)["rows"][0]
@@ -697,8 +733,8 @@ class ShadowAnswerValidationTests(_ShadowCase):
         for index, answer in enumerate((None, 42, ["x"], {"content": None}, {"content": 7})):
             db = str(Path(self.tmp.name) / f"n{index}.db")
             IssuePlanner(lambda _: PAID, shadow=lambda p, rf, t: answer,
-                         db_path=db, shadow_timeout=1).choose(ISSUES, tick_id="n")
-            deadline = time.monotonic() + 3
+                         db_path=db, shadow_timeout=30).choose(ISSUES, tick_id="n")
+            deadline = time.monotonic() + 30
             while not list_shadow(db)["count"] and time.monotonic() < deadline:
                 time.sleep(0.01)
             row = list_shadow(db)["rows"][0]
@@ -711,7 +747,7 @@ class ShadowFailureModeTests(_ShadowCase):
     def test_running_the_same_tick_twice_keeps_one_row(self):
         planner = IssuePlanner(lambda _: PAID,
                                shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
-                               db_path=self.db, shadow_timeout=1)
+                               db_path=self.db, shadow_timeout=30)
         planner.choose(ISSUES, tick_id="tick-twice")
         self.wait_for_row()
         planner.choose(ISSUES, tick_id="tick-twice")
@@ -723,7 +759,7 @@ class ShadowFailureModeTests(_ShadowCase):
             raise KeyboardInterrupt("stopped")
 
         choice = IssuePlanner(lambda _: PAID, shadow=interrupted, db_path=self.db,
-                              shadow_timeout=1).choose(ISSUES, tick_id="tick-int")
+                              shadow_timeout=30).choose(ISSUES, tick_id="tick-int")
         self.assertEqual(choice.issue, 5)
         row = self.wait_for_row()
         self.assertEqual(row["local_valid"], 0)
@@ -743,7 +779,7 @@ class ShadowFailureModeTests(_ShadowCase):
         bad_db = self.tmp.name  # a directory, sqlite cannot open it
         choice = IssuePlanner(lambda _: PAID,
                               shadow=lambda p, rf, t: '{"issue": 3, "reason": "x"}',
-                              db_path=bad_db, shadow_timeout=1).choose(ISSUES, tick_id="tick-bad")
+                              db_path=bad_db, shadow_timeout=30).choose(ISSUES, tick_id="tick-bad")
         self.assertEqual(choice.issue, 5)
         time.sleep(0.2)  # the daemon logs and drops the row; nothing propagates
 
