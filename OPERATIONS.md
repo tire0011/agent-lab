@@ -227,6 +227,25 @@ ARCHITECTURE.md section 13 and D-022):
 - `AGENT_CODING_PROVIDER` - pin every task to one agent. Use this to stand an
   agent down during an incident (quota exhausted, CLI broken); remove it to
   return to the random draw.
+- `NEXUS_FREE_TIER_GUARD` (default on; `0` turns it off),
+  `NEXUS_FREE_TIER_GUARD_WINDOW` (default `10`) and
+  `NEXUS_FREE_TIER_GUARD_MAX_SHARE` (default `0.5`) - #763. A free-tier coder
+  (Mistral) whose answer has no usable edit, with an untouched worktree, hands
+  the same run to the next provider instead of spending an attempt. Each
+  free-tier start is stored on the experiment (`free_tier_provider`,
+  `free_tier_format_failures`). When more than the share of the last window of
+  free-tier runs failed on format, `complexity != small` work skips the free
+  tier. The "Nexus status" issue shows the setting and the current share.
+  The guard is decided inside the conditional launch claim, so a guard that
+  trips during provider selection or worker construction still reroutes the
+  launch (implementation, overload handoff and repair). A run gets at most one
+  same-run handoff (format failure or overload). Without an eligible coder the
+  initial launch fails with `free-tier guard deferred coding: ...`; that is a
+  normal charged attempt in the paid-start budget, not an overload. A repair
+  the guard declines keeps the verification failure. An issue whose last
+  attempt was planned non-small is deferred before the paid planner
+  (`free_tier_guard_deferred` tick decision) while only free-tier coders are
+  usable.
 
 An agent whose CLI is not installed is never drawn, so adding the variables
 before installing the CLI is harmless. To check what the VM would draw from:

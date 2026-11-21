@@ -121,6 +121,9 @@ class Experiment:
     failure_type: str | None = None
     # MODEL-WRITTEN TESTS block handed to the paid coder and the reviewer (#636).
     model_written_tests: str | None = None
+    # Free-tier coder the run started on and whether it failed on format (#763).
+    free_tier_provider: str | None = None
+    free_tier_format_failures: int | None = None
     source_type: str | None = None
     source_id: str | None = None
     implementation_started_at: str | None = None
@@ -181,6 +184,8 @@ class Experiment:
             "failure_phase": self.failure_phase,
             "failure_type": self.failure_type,
             "model_written_tests": self.model_written_tests,
+            "free_tier_provider": self.free_tier_provider,
+            "free_tier_format_failures": self.free_tier_format_failures,
             "source_type": self.source_type,
             "source_id": self.source_id,
             "implementation_started_at": self.implementation_started_at,
@@ -251,6 +256,12 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         failure_type=row["failure_type"] if "failure_type" in row.keys() else None,
         model_written_tests=(
             row["model_written_tests"] if "model_written_tests" in row.keys() else None
+        ),
+        free_tier_provider=(
+            row["free_tier_provider"] if "free_tier_provider" in row.keys() else None
+        ),
+        free_tier_format_failures=(
+            row["free_tier_format_failures"] if "free_tier_format_failures" in row.keys() else None
         ),
         source_type=row["source_type"] if "source_type" in row.keys() else None,
         source_id=row["source_id"] if "source_id" in row.keys() else None,
