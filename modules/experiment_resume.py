@@ -58,6 +58,14 @@ def resume_experiment(
             f"experiment {experiment.id!r} has no existing worktree to resume"
         )
 
+    if _has_no_changes(experiment):
+        # 2026-11-22: a run that produced nothing was resumed twice, each time
+        # failing the same way and using up an extra start. Nothing to verify.
+        raise ExperimentNotRunnableError(
+            f"experiment {experiment.id!r} produced no changes, so there is nothing "
+            "to verify; start a new experiment for its goal instead"
+        )
+
     elog = experiment_service.get_experiment_logger(experiment.id)
     elog.info(
         experiment.status,
@@ -79,6 +87,17 @@ def resume_experiment(
         elog,
         github_work_tracking=github_work_tracking,
     )
+
+
+def _has_no_changes(experiment) -> bool:
+    """True when the worktree is still at its base commit with nothing changed."""
+    base = getattr(experiment, "base_commit_sha", None)
+    if not base:
+        return False
+    head = _run_git(["rev-parse", "HEAD"], cwd=experiment.worktree_path, timeout=30)
+    status = _run_git(["status", "--porcelain"], cwd=experiment.worktree_path, timeout=30)
+    return (head.returncode == 0 and status.returncode == 0
+            and head.stdout.strip() == base and not status.stdout.strip())
 
 
 def _merge_current_main_for_resume(
