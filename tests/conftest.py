@@ -195,3 +195,5 @@ os.environ["NEXUS_TIMING_CHECK"] = "0"
 # The tick's host check (modules/host_health) would look at - and on low disk
 # clean - this machine's own temp dir. Tests of the check call it directly.
 os.environ["NEXUS_HEALTH_CHECK"] = "0"
+# Nor would any test run the real weekly CLI updates (modules/cli_updates).
+os.environ["NEXUS_CLI_UPDATE"] = "0"

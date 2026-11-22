@@ -442,6 +442,20 @@ def _cleanup_expired_worktrees(service) -> None:
         logger.warning("could not clean up expired experiment worktrees: %s", exc)
 
 
+def _update_clis(db_path: str) -> None:
+    """Weekly coding-agent CLI update (owner rule). Never fails the tick."""
+    try:
+        from modules.cli_updates import update_all
+
+        summary = update_all(db_path)
+    except Exception as exc:  # noqa: BLE001 - maintenance must not break a tick
+        logger.warning("CLI update failed: %s", exc)
+        return
+    if summary:
+        logger.info("%s", summary)
+        _events.append(summary)
+
+
 def _prune_test_tmp() -> None:
     """Remove old per-run TMPDIRs of verification test runs. Never fails the tick."""
     try:
@@ -798,6 +812,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
             _prune_test_tmp()
+            _update_clis(args.db_path)
             if not args.integration_only:
                 _shadow_replay(args.repo_root, args.db_path)
         service.close()

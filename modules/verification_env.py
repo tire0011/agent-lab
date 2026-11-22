@@ -110,6 +110,8 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
     # A tick started by a test must not check or clean the host (host_health).
     env["NEXUS_HEALTH_CHECK"] = "0"
+    # Nor update the machine's coding-agent CLIs (cli_updates).
+    env["NEXUS_CLI_UPDATE"] = "0"
     run_tmp = new_test_tmp_dir()
     for name in ("TMPDIR", "TEMP", "TMP"):
         env[name] = str(run_tmp)

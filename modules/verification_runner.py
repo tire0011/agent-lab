@@ -187,6 +187,22 @@ class VerificationRunResult:
         return (self.stdout or "") + (self.stderr or "")
 
 
+SLOW_TEST_SECONDS = 10.0
+_SLOW_TEST_SITE = str(Path(__file__).resolve().parent / "slow_test_site")
+
+
+def slow_test_stacks_path(test_log_path: str | Path) -> Path:
+    """Where a run's slow-test stacks go: next to its test log."""
+    return Path(test_log_path).with_suffix(".slow-stacks.txt")
+
+
+def _enable_slow_test_stacks(env: dict[str, str], test_log_path: str | Path) -> None:
+    """A test running longer than ``SLOW_TEST_SECONDS`` dumps its stacks once (#794)."""
+    env["NEXUS_SLOW_TEST_STACKS"] = str(slow_test_stacks_path(test_log_path))
+    env.setdefault("NEXUS_SLOW_TEST_SECONDS", str(SLOW_TEST_SECONDS))
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (_SLOW_TEST_SITE, env.get("PYTHONPATH", "")) if p)
+
+
 def run_verification_test_monitored(
     command: Sequence[str],
     *,
@@ -224,6 +240,7 @@ def run_verification_test_monitored(
     # pipe, and "no progress" would then mean "no flush" - the watchdog would
     # abort healthy runs.
     env["PYTHONUNBUFFERED"] = "1"
+    _enable_slow_test_stacks(env, test_log.path)
 
     test_log.log_run_event(
         "test_run_started", "Verification test run started",
