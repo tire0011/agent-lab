@@ -17,7 +17,7 @@ import logging
 import os
 import sqlite3
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable
 
@@ -36,11 +36,22 @@ _AGENT_TIMEOUT_SECONDS = 900
 _AGENT_STALL_SECONDS = 300
 
 
+# Kinds of a blocking problem. From the second block on the same issue only
+# BLOCKING_KINDS still block; the others go to a follow-up issue (edge_case)
+# or to the owner (elsewhere) - 2026-11-22: 66 blocked vs 56 adopted, and
+# issues like #782 and #763 took 3-4 rounds, each finding a new edge case.
+PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere")
+BLOCKING_KINDS = ("task", "bug", "regression")
+CONVERGE_AFTER_BLOCKS = 1
+
+
 @dataclass(slots=True)
 class ReviewResult:
     reviewer: str
     verdict: str
     summary: str
+    # (kind, problem) deferred instead of blocking; see CONVERGE_AFTER_BLOCKS.
+    deferred: list[tuple[str, str]] = field(default_factory=list)
 
     @property
     def blocks(self) -> bool:
@@ -67,9 +78,15 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
         "partial write, a retry).\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"verdict": "approve" or "block", "summary": "<two or three sentences: '
-        'what the change does>", "problems": ["<each blocking problem: what is '
-        'wrong, where, and what to change>", ...]}\n'
-        '"problems" is empty when you approve.\n\n'
+        'what the change does>", "problems": [{"kind": "<task|bug|regression|'
+        'edge_case|elsewhere>", "problem": "<what is wrong, where, and what to '
+        'change>"}, ...]}\n'
+        '"problems" is empty when you approve. Kinds: "task" = the change does '
+        'not do what the task asks; "bug" = the changed code is wrong in a case '
+        'the task covers; "regression" = it breaks existing behaviour or weakens '
+        'a security, safety or budget check; "edge_case" = a rare case beyond '
+        'what the task asks; "elsewhere" = it needs a change outside this '
+        'repository or a decision by the owner.\n\n'
         + (
             "QUALITY GATE FINDINGS: a deterministic check that reads file paths "
             "out of the task text flagged this change: "
@@ -104,6 +121,42 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
     )
 
 
+def _problems(problems: list) -> list[tuple[str, str]]:
+    """``(kind, text)`` per problem; a plain string or unknown kind is a ``bug``."""
+    out = []
+    for item in problems:
+        if isinstance(item, dict):
+            kind = str(item.get("kind") or "").strip().lower()
+            text = " ".join(str(item.get("problem") or "").split())
+        else:
+            kind, text = "bug", " ".join(str(item).split())
+        if text:
+            out.append((kind if kind in PROBLEM_KINDS else "bug", text))
+    return out
+
+
+def parse_problems(raw: str) -> list[tuple[str, str]]:
+    data = _json_object(raw or "")
+    problems = data.get("problems") if data else None
+    return _problems(problems) if isinstance(problems, list) else []
+
+
+def converge(verdict: str, summary: str, problems: list[tuple[str, str]],
+             earlier_blocks: int) -> tuple[str, str, list[tuple[str, str]]]:
+    """From the second block on: only task, bug and regression problems block;
+    edge cases and outside work are deferred. Returns (verdict, summary, deferred)."""
+    if verdict != VERDICT_BLOCK or earlier_blocks < CONVERGE_AFTER_BLOCKS or not problems:
+        return verdict, summary, []
+    if any(kind in BLOCKING_KINDS for kind, _text in problems):
+        return verdict, summary, []
+    head = summary.split(" Blocking problems:")[0]
+    listed = " ".join(f"({i}) [{kind}] {text[:400]}" for i, (kind, text) in enumerate(problems, 1))
+    return (VERDICT_APPROVE,
+            f"{head} Approved after {earlier_blocks} earlier block(s): no remaining task, bug or "
+            f"regression problem; deferred to follow-up: {listed}"[:4000],
+            problems)
+
+
 def parse_review(raw: str) -> tuple[str, str] | None:
     data = _json_object(raw or "")
     if data is None:
@@ -114,7 +167,7 @@ def parse_review(raw: str) -> tuple[str, str] | None:
         return None
     problems = data.get("problems")
     if verdict == VERDICT_BLOCK and isinstance(problems, list):
-        items = [" ".join(str(p).split()) for p in problems if str(p).strip()]
+        items = [text for _kind, text in _problems(problems)]
         if items:
             # Every finding in one reason, so the retry can fix them all.
             listed = " ".join(f"({i}) {p[:600]}" for i, p in enumerate(items[:8], 1))
@@ -181,6 +234,23 @@ class NexusReviewer:
             return None
         return (str(row[0]), str(row[1])) if row and row[0] in REVIEWERS else None
 
+    def _earlier_block_count(self, experiment_id: str) -> int:
+        """Blocking reviews of other attempts at the same issue."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM nexus_pr_reviews r
+                    JOIN github_experiment_links other ON other.experiment_id = r.experiment_id
+                    JOIN github_experiment_links mine ON mine.issue_number = other.issue_number
+                    WHERE mine.experiment_id = ? AND r.experiment_id != ? AND r.verdict = ?
+                    """,
+                    (experiment_id, experiment_id, VERDICT_BLOCK),
+                ).fetchone()
+        except sqlite3.Error:
+            return 0
+        return int(row[0]) if row else 0
+
     def latest_blocking_review(self, experiment_id: str) -> tuple[str, str] | None:
         """Return the persisted findings before the adoption reason's clipping."""
         with self._connect() as conn:
@@ -217,14 +287,17 @@ class NexusReviewer:
                 model_written_tests=model_written_tests,
             )
             try:
-                parsed = parse_review(runner(prompt, worktree_path))
+                raw = runner(prompt, worktree_path)
+                parsed = parse_review(raw)
             except Exception as exc:  # noqa: BLE001 - try the next reviewer
                 logger.warning("review: %s could not review: %s", name, exc)
                 continue
             if parsed is None:
                 logger.warning("review: %s gave no usable verdict", name)
                 continue
-            result = ReviewResult(name, *parsed)
+            verdict, summary, deferred = converge(
+                *parsed, parse_problems(raw), self._earlier_block_count(experiment_id))
+            result = ReviewResult(name, verdict, summary, deferred)
             break
         if result is None:
             summary = (
