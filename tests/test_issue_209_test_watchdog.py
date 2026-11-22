@@ -24,6 +24,8 @@ from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from modules.central_logging import ExperimentLogger, read_log_entries
 from modules.nexus_diagnostics import (
     LIFECYCLE_RUNNING,
@@ -328,9 +330,13 @@ class MonitoredRunTests(unittest.TestCase):
         )
         return result, beats
 
+    @pytest.mark.usefixtures("real_clock")
     def test_progressing_suite_runs_far_past_the_stall_timeout(self):
         """Six tests, each shorter than the stall timeout, total longer than
         it: progress - not total runtime - must decide."""
+        # The child sleeps in real time, so the watchdog must measure progress
+        # on the same time scale even during the clock-drift verification pass.
+        stall_timeout = FAST.stall_timeout_seconds
         root = _write_suite(
             """
             import time, unittest
@@ -353,7 +359,7 @@ class MonitoredRunTests(unittest.TestCase):
         self.assertFalse(result.stalled)
         self.assertEqual(result.tests_total, 6)
         self.assertEqual(result.progress["tests_completed"], 6)
-        self.assertGreaterEqual(result.duration_ms, 2400)
+        self.assertGreater(result.duration_ms, stall_timeout * 1000)
         self.assertTrue(beats, "the watchdog must publish a heartbeat while running")
 
     def test_a_stuck_test_is_detected_and_diagnosed(self):

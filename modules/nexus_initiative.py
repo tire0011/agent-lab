@@ -352,6 +352,10 @@ class NexusInitiativeService:
     def close(self) -> None:
         self._conn.close()
 
+    @property
+    def planner(self) -> Any | None:
+        return self._planner
+
     def _ensure_schema(self) -> None:
         with self._conn:
             self._conn.execute(

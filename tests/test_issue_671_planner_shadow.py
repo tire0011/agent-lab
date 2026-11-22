@@ -5,7 +5,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import patch
 
 from modules import nexus_planner
@@ -60,25 +60,36 @@ class PlannerShadowTests(unittest.TestCase):
         def broken(prompt, timeout):
             raise RuntimeError("offline")
 
-        started = time.monotonic()
-        choice = self.planner(broken).choose(ISSUES)
-        self.assertLess(time.monotonic() - started, 0.2)
+        planner = self.planner(broken)
+        choice = planner.choose(ISSUES)
         self.assertEqual(choice.issue, 2)
-        self.assertIn("offline", self.wait_for_row()["error"])
+        planner.wait_for_shadow(2)
+        row, = list_shadow(self.db)["rows"]
+        self.assertIn("offline", row["error"])
 
         other_db = str(Path(self.tmp.name) / "timeout.db")
         t = 0.02
-        # #796: the monitor joins on the rate-based T plus the grace; a fake that
-        # sleeps past it records 'timeout after ...'.
+        release = Event()
+        finished = Event()
+
+        def blocked(prompt, timeout):
+            release.wait(2)
+            finished.set()
+            return "{}"
+
+        # The monitor times out while the model call is still blocked.
         with patch.object(nexus_planner, "shadow_timeout_seconds", lambda pt, r: t), \
                 patch.object(nexus_planner, "SHADOW_MONITOR_GRACE_SECONDS", 0.01):
-            slow = IssuePlanner(lambda _: PAID,
-                                shadow=lambda prompt, timeout: time.sleep(0.5) or "{}",
-                                db_path=other_db)
-            self.db = other_db
-            self.assertEqual(slow.choose(ISSUES).issue, 2)
-            row = self.wait_for_row()
-        self.assertIn("timeout after", row["error"])
+            slow = IssuePlanner(lambda _: PAID, shadow=blocked, db_path=other_db)
+            try:
+                self.assertEqual(slow.choose(ISSUES).issue, 2)
+                self.assertFalse(finished.is_set())
+                slow.wait_for_shadow(2)
+                row, = list_shadow(other_db)["rows"]
+                self.assertEqual(row["error"], f"timeout after {t + 0.01:g}s")
+                self.assertFalse(finished.is_set())
+            finally:
+                release.set()
 
     def test_summary_rates(self):
         for tick, values in enumerate(((1, 1, 1, .1), (2, 1, 1, .3), (1, 99, 0, .2))):
