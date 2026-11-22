@@ -112,6 +112,8 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env["NEXUS_HEALTH_CHECK"] = "0"
     # Nor update the machine's coding-agent CLIs (cli_updates).
     env["NEXUS_CLI_UPDATE"] = "0"
+    # Nor start the weekly review (weekly_review).
+    env["NEXUS_WEEKLY_REVIEW"] = "0"
     run_tmp = new_test_tmp_dir()
     for name in ("TMPDIR", "TEMP", "TMP"):
         env[name] = str(run_tmp)
