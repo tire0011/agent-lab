@@ -442,6 +442,18 @@ def _cleanup_expired_worktrees(service) -> None:
         logger.warning("could not clean up expired experiment worktrees: %s", exc)
 
 
+def _prune_test_tmp() -> None:
+    """Remove old per-run TMPDIRs of verification test runs. Never fails the tick."""
+    try:
+        from modules.verification_env import prune_test_tmp
+
+        removed = prune_test_tmp()
+        if removed:
+            logger.info("removed %d old test temp director(ies)", removed)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break a tick
+        logger.warning("could not prune test temp directories: %s", exc)
+
+
 def _sweep_stalled_experiments(service) -> None:
     """Fail experiments that logged nothing past their phase limit (#400).
 
@@ -756,6 +768,7 @@ def main(argv: list[str] | None = None) -> int:
         _wait_for_experiments(None if args.dry_run else service)
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
+            _prune_test_tmp()
             if not args.integration_only:
                 _shadow_replay(args.repo_root, args.db_path)
         service.close()
