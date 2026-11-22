@@ -480,6 +480,13 @@ def parse_choice(raw: str, allowed: set[int], splittable: set[int] | None = None
     return choice
 
 
+@dataclass
+class _ShadowRun:
+    monitor: threading.Thread
+    timeout: float
+    record_tick_exit: Callable[[], None]
+
+
 class IssuePlanner:
     """Ask a model which open issue comes next.
 
@@ -504,6 +511,21 @@ class IssuePlanner:
         # #796: the rate store the shadow timeout is computed from; a
         # LocalModelRates (or anything with medians()), None reads the default.
         self._rates = rates
+        self._shadow_run: _ShadowRun | None = None
+
+    @property
+    def shadow_timeout(self) -> float | None:
+        run = self._shadow_run
+        return run.timeout if run is not None else None
+
+    def wait_for_shadow(self, max_seconds: float) -> None:
+        """Wait for the monitor to persist its result, up to the shutdown budget."""
+        run = self._shadow_run
+        if run is None:
+            return
+        run.monitor.join(max_seconds)
+        if run.monitor.is_alive():
+            run.record_tick_exit()
 
     def choose(
         self,
@@ -627,7 +649,20 @@ class IssuePlanner:
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store result: %s", exc)
 
-        threading.Thread(target=monitor, name="planner-shadow", daemon=True).start()
+        shadow_started = time.monotonic()
+
+        def record_tick_exit() -> None:
+            try:
+                from modules.planner_shadow import record
+                record(self._db_path, lock_timeout=0, tick_id=tick_id, paid_issue=paid_issue,
+                       local_issue=None, local_valid=0, prompt_tokens=prompt_tokens,
+                       seconds=time.monotonic() - shadow_started, error="tick_exit_before_shadow")
+            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+                logger.warning("planner shadow: could not store tick exit: %s", exc)
+
+        thread = threading.Thread(target=monitor, name="planner-shadow", daemon=True)
+        thread.start()
+        self._shadow_run = _ShadowRun(thread, timeout, record_tick_exit)
 
     @staticmethod
     def _ask(model: Callable[[str], str], prompt: str, allowed: set[int],

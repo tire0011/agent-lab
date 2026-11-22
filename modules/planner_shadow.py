@@ -26,9 +26,9 @@ def ensure_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def record(db_path: str, **values: Any) -> None:
+def record(db_path: str, *, lock_timeout: float = 30, **values: Any) -> None:
     """Keep the first completed observation for each tick, including retries."""
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with sqlite3.connect(db_path, timeout=lock_timeout) as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
         if "created_at" not in {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}:

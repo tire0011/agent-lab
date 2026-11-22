@@ -832,6 +832,9 @@ def main(argv: list[str] | None = None) -> int:
                 _weekly_review(args.db_path, args.repo_root)
             if not args.integration_only:
                 _shadow_replay(args.repo_root, args.db_path)
+            planner = getattr(service, "planner", None)
+            if planner is not None and (timeout := planner.shadow_timeout) is not None:
+                planner.wait_for_shadow(timeout + 10)
         service.close()
         if not args.dry_run:
             if decision is not None and decision.decision == "error":
