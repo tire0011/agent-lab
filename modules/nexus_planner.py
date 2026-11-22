@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from modules.local_model_rates import LocalModelRates
 from modules.measurement_health import health_summary, read_health
 
 logger = logging.getLogger(__name__)
@@ -320,6 +322,56 @@ def compact_planning_prompt(
     return prompt
 
 
+# Part 2a of #782 (#796): ONE rate-based timeout drives both the shadow HTTP
+# client and the monitor that joins it. The hard-coded 55 s in nexus_tick.py
+# made all 48 planner_shadow rows end in 'local model call timed out after 55s'.
+SHADOW_GEN_TOKENS = 120  # max_tokens of the shadow call in nexus_tick.py
+SHADOW_TIMEOUT_OVERHEAD_SECONDS = 10.0
+SHADOW_TIMEOUT_CAP_SECONDS = 240.0
+SHADOW_TIMEOUT_FALLBACK_SECONDS = 120.0  # when no rate is known
+# The monitor joins the shadow worker on T + this grace, so a request the
+# client bounds by T can never outlive the monitor.
+SHADOW_MONITOR_GRACE_SECONDS = 5.0
+
+
+def _positive_rate(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def shadow_timeout_seconds(prompt_tokens: Any, rates: Any) -> float:
+    """The one shadow timeout, in seconds (#796): read the prompt, generate the
+    answer, plus overhead - ``prompt_tokens/prompt_tps + 120/gen_tps + 10``,
+    capped at 240 s.
+
+    *rates* is a :class:`~modules.local_model_rates.LocalModelRates` (anything
+    with a ``medians()`` method) or the ``(prompt_tps, gen_tps)`` pair itself.
+    When ``medians()`` returns ``None`` for either rate (no samples yet) or a
+    non-positive rate, the fallback of 120 s is returned.
+    """
+    if callable(getattr(rates, "medians", None)):
+        try:
+            rates = rates.medians()
+        except Exception:  # noqa: BLE001 - a broken rates store means "no samples"
+            rates = None
+    try:
+        prompt_tps, gen_tps = rates if rates is not None else (None, None)
+    except (TypeError, ValueError):
+        prompt_tps = gen_tps = None
+    if not _positive_rate(prompt_tps) or not _positive_rate(gen_tps):
+        return SHADOW_TIMEOUT_FALLBACK_SECONDS
+    try:
+        tokens = float(prompt_tokens)
+    except (TypeError, ValueError):
+        tokens = 0.0
+    if not math.isfinite(tokens) or tokens < 0:
+        tokens = 0.0
+    seconds = (tokens / float(prompt_tps)
+               + SHADOW_GEN_TOKENS / float(gen_tps)
+               + SHADOW_TIMEOUT_OVERHEAD_SECONDS)
+    return min(SHADOW_TIMEOUT_CAP_SECONDS, seconds)
+
+
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
     """Ideas from your own post-experiment reflections (#630), with their evidence."""
     if not reflections:
@@ -440,16 +492,18 @@ class IssuePlanner:
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
-        shadow: Callable[[str], str] | None = None,
+        shadow: Callable[[str, float], str] | None = None,
         *,
         db_path: str | None = None,
-        shadow_timeout: float = 60.0,
+        rates: Any = None,
     ) -> None:
         self._complete = complete
         self._explore = explore
         self._shadow = shadow
         self._db_path = db_path
-        self._shadow_timeout = shadow_timeout
+        # #796: the rate store the shadow timeout is computed from; a
+        # LocalModelRates (or anything with medians()), None reads the default.
+        self._rates = rates
 
     def choose(
         self,
@@ -524,6 +578,11 @@ class IssuePlanner:
             return
         prompt = compact + shadow_instructions
         prompt_tokens = max(1, estimate_tokens(prompt))
+        # #796: one rate-based timeout drives both the HTTP client (handed to
+        # the shadow callable) and this monitor's join below.
+        rates = self._rates if self._rates is not None else LocalModelRates()
+        timeout = shadow_timeout_seconds(prompt_tokens, rates)
+        join_timeout = timeout + SHADOW_MONITOR_GRACE_SECONDS
 
         def monitor() -> None:
             result: list[str] = []
@@ -531,20 +590,20 @@ class IssuePlanner:
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt))  # type: ignore[misc]
+                    result.append(self._shadow(prompt, timeout))
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
-            started = time.monotonic()
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(self._shadow_timeout)
+            started = time.monotonic()  # the clock starts after worker.start() (#796)
+            worker.join(join_timeout)
             elapsed = time.monotonic() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
             if worker.is_alive():
-                error = f"timeout after {self._shadow_timeout:g}s"
+                error = f"timeout after {join_timeout:g}s"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:

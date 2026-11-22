@@ -319,9 +319,12 @@ def _planner(repo_root: str, db_path: str | None = None):
         return str(result.get("content") or "")
 
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
+    from modules.local_model_rates import LocalModelRates
 
-    def shadow(prompt: str) -> str:
-        client = LlamaCppClient(timeout=55, stream=False)
+    def shadow(prompt: str, timeout: float) -> str:
+        # #796: the same rate-based timeout T that the monitor joins on bounds
+        # this request, so the request can never outlive the monitor.
+        client = LlamaCppClient(timeout=timeout, stream=False)
         response = asyncio.run(client.chat_completion(
             [{"role": "user", "content": prompt}], max_tokens=120,
             response_format=json_schema_response_format(
@@ -336,6 +339,9 @@ def _planner(repo_root: str, db_path: str | None = None):
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
         shadow=shadow,
+        # The shadow timeout is computed from the rates measured for the model
+        # the shadow client sends (#642, #796).
+        rates=LocalModelRates(model=LlamaCppClient().model),
         db_path=db_path or os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db"),
     )
 
