@@ -197,3 +197,5 @@ os.environ["NEXUS_TIMING_CHECK"] = "0"
 os.environ["NEXUS_HEALTH_CHECK"] = "0"
 # Nor would any test run the real weekly CLI updates (modules/cli_updates).
 os.environ["NEXUS_CLI_UPDATE"] = "0"
+# Nor the weekly open review, which would start a real coding agent (modules/weekly_review).
+os.environ["NEXUS_WEEKLY_REVIEW"] = "0"
