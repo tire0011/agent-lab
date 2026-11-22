@@ -94,6 +94,7 @@ class VerificationEnvSecretExclusionTests(unittest.TestCase):
 
     def test_empty_parent_env_yields_only_test_isolation_values(self):
         built = build_verification_test_env({})
+        self.assertEqual(built.pop("NEXUS_HEALTH_CHECK"), "0")
         run_tmp = {built.pop(name) for name in ("TMPDIR", "TEMP", "TMP")}
         self.assertEqual(len(run_tmp), 1)  # one own temp dir per run
         self.assertEqual(built, {

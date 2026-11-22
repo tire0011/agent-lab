@@ -454,6 +454,30 @@ def _prune_test_tmp() -> None:
         logger.warning("could not prune test temp directories: %s", exc)
 
 
+def _health_check(db_path: str) -> str | None:
+    """Host checks (disk, memory, /tmp); a blocking problem's text, else ``None``.
+    Owner messages go to ``_events``. Never fails the tick.
+    ``NEXUS_HEALTH_CHECK=0`` turns it off (test runs set it: the check would
+    look at, and clean, the test machine's own temp dir)."""
+    if os.environ.get("NEXUS_HEALTH_CHECK", "1").strip().lower() in {"0", "false", "off", "no"}:
+        return None
+    try:
+        from modules import host_health
+        from modules.verification_env import prune_test_tmp
+
+        result = host_health.run(
+            db_path, cleanups=[prune_test_tmp, host_health.clean_own_tmp],
+        )
+    except Exception as exc:  # noqa: BLE001 - a broken check must not stop Nexus
+        logger.warning("health check failed: %s", exc)
+        return None
+    for problem in result.problems:
+        logger.warning("health: %s", problem.detail)
+    _events.extend(result.messages)
+    blocking = result.blocking
+    return "; ".join(p.detail for p in blocking) if blocking else None
+
+
 def _sweep_stalled_experiments(service) -> None:
     """Fail experiments that logged nothing past their phase limit (#400).
 
@@ -711,6 +735,11 @@ def main(argv: list[str] | None = None) -> int:
         if reverted:
             logger.warning("main guard: %s", reverted)
             _events.append(reverted)
+        unhealthy = _health_check(args.db_path)
+        if unhealthy:
+            logger.warning("host unhealthy, no new work this tick: %s", unhealthy)
+            _notify(args.repo_root, list(_events))
+            return 0
 
     service = _build_service(args)
     if not args.dry_run:

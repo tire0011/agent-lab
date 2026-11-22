@@ -108,6 +108,8 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
     env.pop(CLOCK_DRIFT_ENV, None)
     env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
+    # A tick started by a test must not check or clean the host (host_health).
+    env["NEXUS_HEALTH_CHECK"] = "0"
     run_tmp = new_test_tmp_dir()
     for name in ("TMPDIR", "TEMP", "TMP"):
         env[name] = str(run_tmp)
