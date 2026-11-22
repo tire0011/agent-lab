@@ -1745,6 +1745,16 @@ class GitHubWorkTrackingService:
         )
         return {"number": issue.get("number"), "url": issue.get("html_url"), "reused": False}
 
+    def open_issue(self, title: str, body: str) -> dict[str, Any]:
+        """Open a plain issue Nexus may work on; an open one with the same title is reused."""
+        title = title[:240]
+        existing = self._find_exact_open_issue(title)
+        if existing:
+            return {"number": existing.get("number"), "url": existing.get("html_url"), "reused": True}
+        issue = self._request("POST", f"/repos/{self.repository}/issues",
+                              {"title": title, "body": body[:30000]})
+        return {"number": issue.get("number"), "url": issue.get("html_url"), "reused": False}
+
     def _create_issue(self, title: str, content: str) -> dict[str, Any]:
         body = (
             "Created automatically by Nexus before implementation so the work is durably traceable in GitHub.\n\n"
