@@ -8,6 +8,8 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
+
 import nexus_tick
 from modules.nexus_planner import IssuePlanner
 from modules.planner_shadow import list_shadow
@@ -47,6 +49,7 @@ class ShadowWaitTests(unittest.TestCase):
         self.assertEqual(row["local_valid"], 1)
         self.assertIsNone(row["error"])
 
+    @pytest.mark.usefixtures("real_clock")
     def test_hung_shadow_stores_one_exit_row_even_if_it_finishes_later(self):
         release = threading.Event()
         planner = self.planner(lambda prompt, timeout: release.wait(2) and ANSWER)
@@ -70,12 +73,13 @@ class ShadowWaitTests(unittest.TestCase):
 
     def test_wait_without_a_shadow_returns_immediately(self):
         planner = self.planner(None)
-        started = time.monotonic()
-        planner.wait_for_shadow(1)
-        self.assertLess(time.monotonic() - started, 0.1)
+        with patch.object(threading.Thread, "join") as join:
+            planner.wait_for_shadow(1)
+        join.assert_not_called()
         self.assertIsNone(planner.shadow_timeout)
         self.assertFalse(Path(self.db).exists())
 
+    @pytest.mark.usefixtures("real_clock")
     def test_exit_write_does_not_wait_for_a_database_lock(self):
         release = threading.Event()
         planner = self.planner(lambda prompt, timeout: release.wait(2) and ANSWER)
