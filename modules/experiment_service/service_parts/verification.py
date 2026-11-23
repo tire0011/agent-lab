@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from modules.central_logging import ExperimentLogger, sanitize_command
-from modules.experiment_evaluation import parse_git_status_short
+from modules.experiment_evaluation import ChangedFiles, is_ignored_support_path, parse_git_status_short
 from modules.github_work_tracking import failing_test_names
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
@@ -76,6 +76,9 @@ class VerificationMixin:
         worktree_path: str,
         test_run: VerificationRunResult,
         elog: ExperimentLogger,
+        *,
+        snapshot_sha: str | None = None,
+        verification_base_sha: str | None = None,
     ) -> dict[str, str] | None:
         """Tell pre-existing failures from regressions; None when not applicable.
 
@@ -92,7 +95,7 @@ class VerificationMixin:
         # however the failures before it turn out.
         if test_run.timed_out and not test_run.aborted_test_id:
             return None
-        base_commit = self.get_experiment(experiment_id).base_commit_sha
+        base_commit = verification_base_sha or self.get_experiment(experiment_id).base_commit_sha
         if not base_commit:
             elog.info(
                 "verifying", "baseline_recheck_skipped",
@@ -100,7 +103,15 @@ class VerificationMixin:
             )
             return None
         try:
-            changed_files = self._files_changed_since(base_commit, worktree_path, elog)
+            if snapshot_sha:
+                proc = _run_git(
+                    ["diff", "--name-only", "-z", base_commit, snapshot_sha, "--"],
+                    cwd=worktree_path, elog=elog, phase="verifying",
+                )
+                proc.check_returncode()
+                changed_files = set(proc.stdout.split("\0"))
+            else:
+                changed_files = self._files_changed_since(base_commit, worktree_path, elog)
             if {_test_file_for_id(test_id) for test_id in failed_ids} & changed_files:
                 elog.info(
                     "verifying", "baseline_recheck_skipped",
@@ -284,7 +295,7 @@ class VerificationMixin:
 
     def _run_timing_check(
         self, experiment_id: str, worktree_path: str, head_diff: str,
-        elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None,
+        elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None, complete_diff: bool = False,
     ) -> tuple[str, str] | None:
         """Slow-machine check (#689): rerun the affected tests with clock drift.
 
@@ -308,7 +319,7 @@ class VerificationMixin:
             base_commit = self.get_experiment(experiment_id).base_commit_sha
             paths = (
                 self._files_changed_since(base_commit, worktree_path, elog)
-                if base_commit else set()
+                if base_commit and not complete_diff else set()
             )
             diff = head_diff + "\n" + "".join(
                 f"diff --git a/{path} b/{path}\n" for path in sorted(paths)
@@ -423,13 +434,18 @@ class VerificationMixin:
         repair_iteration: int = 0,
         soft_findings_to_reviewer: bool | None = None,
         abort_on_test_stall: bool = False,
+        snapshot_sha: str | None = None,
+        verification_base_sha: str | None = None,
+        snapshot_test_path: str | None = None,
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
+        test_path = snapshot_test_path or worktree_path
         if github_work_tracking is not None:
             try:
                 ref = github_work_tracking.checkpoint_experiment(
-                    experiment_id, worktree_path
+                    experiment_id, worktree_path,
+                    **({"snapshot_sha": snapshot_sha} if snapshot_sha else {}),
                 )
                 elog.info(
                     "verifying", "github_checkpoint_published",
@@ -458,6 +474,9 @@ class VerificationMixin:
             )
             try:
                 ci_verification = github_work_tracking.wait_for_ci(experiment_id)
+                if snapshot_sha and ci_verification.commit_sha != ref.checkpoint_sha:
+                    ci_verification = None
+                    raise ValueError("CI result did not match the published checkpoint")
             except Exception as exc:  # noqa: BLE001 - local verification is the fallback
                 elog.warning(
                     "verifying", "github_ci_unavailable",
@@ -486,41 +505,71 @@ class VerificationMixin:
                     reason=ci_verification.reason,
                 )
         try:
-            status_proc = _run_git(
-                ["status", "--short", "--untracked-files=all"],
-                cwd=worktree_path, elog=elog, phase="verifying",
-            )
-            with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
-                index_env = dict(os.environ)
-                index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
-                read_tree_proc = _run_git(
-                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
-                )
-                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
-                if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
-                    failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
-                    raise subprocess.CalledProcessError(
-                        failed_proc.returncode,
-                        failed_proc.args,
-                        output=failed_proc.stdout,
-                        stderr=failed_proc.stderr,
+            changed = None
+            if snapshot_sha:
+                if not verification_base_sha:
+                    raise ValueError("snapshot verification requires a baseline")
+
+                def snapshot_diff(*options: str, check: bool = True):
+                    proc = _run_git(
+                        ["diff", "--no-renames", "--no-ext-diff", "--no-textconv", *options,
+                         verification_base_sha, snapshot_sha, "--"],
+                        cwd=worktree_path, elog=elog, phase="verifying",
                     )
-                stat_proc = _run_git(
-                    ["diff", "--cached", "--stat", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
+                    if check:
+                        proc.check_returncode()
+                    return proc
+
+                names = snapshot_diff("--name-status", "-z").stdout.strip("\0").split("\0")
+                tracked, added, status_lines = [], [], []
+                for code, path in zip(names[::2], names[1::2]):
+                    status_lines.append(f"{code}  {path}")
+                    if not is_ignored_support_path(path):
+                        (added if code == "A" else tracked).append(path)
+                changed = ChangedFiles(tracked_modified=tracked, untracked_new=added)
+                git_status = "\n".join(status_lines)
+                stat_proc = snapshot_diff("--stat")
+                diff_proc = snapshot_diff()
+                check_proc = snapshot_diff("--check", check=False)
+                if check_proc.returncode and not check_proc.stdout.strip():
+                    check_proc.check_returncode()
+            else:
+                status_proc = _run_git(
+                    ["status", "--short", "--untracked-files=all"],
+                    cwd=worktree_path, elog=elog, phase="verifying",
                 )
-                diff_proc = _run_git(
-                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
-                    elog=elog, phase="verifying",
-                )
-                check_proc = _run_git(
-                    ["diff", "--cached", "--check", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
-                )
+                with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
+                    index_env = dict(os.environ)
+                    index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
+                    read_tree_proc = _run_git(
+                        ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
+                    )
+                    add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
+                    if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
+                        failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
+                        raise subprocess.CalledProcessError(
+                            failed_proc.returncode,
+                            failed_proc.args,
+                            output=failed_proc.stdout,
+                            stderr=failed_proc.stderr,
+                        )
+                    stat_proc = _run_git(
+                        ["diff", "--cached", "--stat", "HEAD"],
+                        cwd=worktree_path,
+                        env=index_env,
+                        elog=elog, phase="verifying",
+                    )
+                    diff_proc = _run_git(
+                        ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
+                        elog=elog, phase="verifying",
+                    )
+                    check_proc = _run_git(
+                        ["diff", "--cached", "--check", "HEAD"],
+                        cwd=worktree_path,
+                        env=index_env,
+                        elog=elog, phase="verifying",
+                    )
+                git_status = status_proc.stdout
         except (OSError, subprocess.SubprocessError) as exc:
             elog.error(
                 "verifying", "verification_git_exception",
@@ -533,12 +582,11 @@ class VerificationMixin:
             )
             return self.get_experiment(experiment_id)
 
-        git_status = status_proc.stdout
         diff_stat = stat_proc.stdout
         diff_text = _truncate_text(diff_proc.stdout, self.max_diff_bytes, label="diff")
         diff_check_issue = check_proc.stdout.strip() or (check_proc.returncode != 0 and check_proc.stderr.strip())
         if git_status.strip():
-            elog.debug("verifying", "git_status_checked", "Worktree has uncommitted changes as expected")
+            elog.debug("verifying", "git_status_checked", "Git changes are available for verification")
         else:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
 
@@ -551,7 +599,7 @@ class VerificationMixin:
         )
 
         use_local_tests = ci_verification is None or ci_verification.status == "unavailable"
-        if use_local_tests and (test_command is None or not (Path(worktree_path) / "tests").is_dir()):
+        if use_local_tests and (test_command is None or not (Path(test_path) / "tests").is_dir()):
             elog.warning(
                 "verifying", "no_test_command",
                 "No safe test command could be determined for this worktree",
@@ -588,14 +636,14 @@ class VerificationMixin:
             elog.info(
                 "verifying", "local_tests_fallback_started",
                 "Running local verification because matching GitHub CI was unavailable",
-                command=test_command, cwd=worktree_path,
+                command=test_command, cwd=test_path,
                 stall_timeout_seconds=watchdog.stall_timeout_seconds,
                 safety_cap_seconds=watchdog.safety_cap_seconds,
             )
             elog.info(
                 "verifying", "tests_started",
                 "Running verification test command under the progress watchdog",
-                command=test_command, cwd=worktree_path,
+                command=test_command, cwd=test_path,
                 stall_timeout_seconds=watchdog.stall_timeout_seconds,
                 watchdog_interval_seconds=watchdog.check_interval_seconds,
                 safety_cap_seconds=watchdog.safety_cap_seconds,
@@ -603,7 +651,7 @@ class VerificationMixin:
             )
             test_run = run_verification_test_monitored(
                 test_command,
-                cwd=worktree_path,
+                cwd=test_path,
                 run_id=experiment_id,
                 config=watchdog,
                 expected_total=expected_total,
@@ -630,8 +678,12 @@ class VerificationMixin:
             test_timed_out = test_run.timed_out
             self._remember_test_total(test_run.tests_total)
 
+            baseline_options = (
+                {"snapshot_sha": snapshot_sha, "verification_base_sha": verification_base_sha}
+                if snapshot_sha else {}
+            )
             baseline_classifications = self._classify_failures_against_base(
-                experiment_id, worktree_path, test_run, elog,
+                experiment_id, worktree_path, test_run, elog, **baseline_options,
             )
             if self.get_experiment(experiment_id).status == STATUS_CANCELLED:
                 return self.get_experiment(experiment_id)
@@ -741,7 +793,8 @@ class VerificationMixin:
             try:
                 options = {"watchdog": self._get_test_watchdog_config()} if abort_on_test_stall else {}
                 timing_failure = self._run_timing_check(
-                    experiment_id, worktree_path, diff_proc.stdout, elog, **options,
+                    experiment_id, test_path, diff_proc.stdout, elog,
+                    **({"complete_diff": True} if snapshot_sha else {}), **options,
                 )
             except HungTest as exc:
                 self._record_verification_run(
@@ -762,14 +815,14 @@ class VerificationMixin:
             # block downgrades to needs_review with the worktree preserved, never a silent "succeeded".
             try:
                 experiment_for_eval = self.get_experiment(experiment_id)
-                changed = parse_git_status_short(git_status)
+                changed = changed if changed is not None else parse_git_status_short(git_status)
                 import modules.experiment_service as experiment_service_module
 
                 eval_result = experiment_service_module.evaluate_implementation(
                     experiment_for_eval.plan,
                     experiment_for_eval.goal,
                     changed,
-                    worktree_path,
+                    test_path,
                 )
                 quality_evaluation = eval_result.to_dict()
                 # Only artifact-evidence checks failed and tests are green: the reviewer decides at
@@ -810,6 +863,34 @@ class VerificationMixin:
                     "Exception while running deterministic quality evaluation", exc=exc,
                 )
 
+        def publish_diagnostics() -> str | None:
+            if github_work_tracking is None:
+                return None
+            try:
+                github_work_tracking.record_verification(
+                    experiment_id,
+                    status=final_status,
+                    command=test_command,
+                    exit_code=test_exit_code,
+                    error=error,
+                    output=test_output_capped,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep work and require review
+                elog.error(
+                    "verifying", "github_verification_update_failed",
+                    "Verification completed but the Draft PR diagnostics could not be updated",
+                    exc=exc,
+                )
+                return (f"{error}; " if error else "") + f"GitHub verification update failed: {str(exc)[:1000]}"
+            return None
+
+        # Recovery treats the durable verdict of a resume as final.
+        if snapshot_sha and (diagnostic_error := publish_diagnostics()):
+            final_status, error = STATUS_NEEDS_REVIEW, diagnostic_error
+        evidence_sha = ci_verification.commit_sha if ci_verification is not None else None
+        if snapshot_sha:
+            evidence_sha = ref.checkpoint_sha if github_work_tracking is not None else snapshot_sha
+
         self._record_verification_run(
             experiment_id,
             self._next_verification_iteration(experiment_id),
@@ -818,7 +899,7 @@ class VerificationMixin:
             test_exit_code,
             test_output_capped,
             error,
-            (ci_verification.commit_sha if ci_verification is not None else None),
+            evidence_sha,
         )
         self._force_status(
             experiment_id, final_status,
@@ -836,31 +917,10 @@ class VerificationMixin:
                 if baseline_classifications is not None else None
             ),
         )
-        if github_work_tracking is not None:
-            try:
-                github_work_tracking.record_verification(
-                    experiment_id,
-                    status=final_status,
-                    command=test_command,
-                    exit_code=test_exit_code,
-                    error=error,
-                    output=test_output_capped,
-                )
-            except Exception as exc:  # noqa: BLE001 - keep work and require review
-                elog.error(
-                    "verifying", "github_verification_update_failed",
-                    "Verification completed but the Draft PR diagnostics could not be updated",
-                    exc=exc,
-                )
-                current = self.get_experiment(experiment_id)
-                combined_error = (
-                    f"{current.error}; " if current.error else ""
-                ) + f"GitHub verification update failed: {str(exc)[:1000]}"
-                self._force_status(
-                    experiment_id,
-                    STATUS_NEEDS_REVIEW,
-                    ended_at=_utcnow_iso(),
-                    error=combined_error,
-                )
+        if not snapshot_sha and (diagnostic_error := publish_diagnostics()):
+            self._force_status(
+                experiment_id, STATUS_NEEDS_REVIEW,
+                ended_at=_utcnow_iso(), error=diagnostic_error,
+            )
         return self.get_experiment(experiment_id)
 

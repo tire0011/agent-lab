@@ -144,7 +144,7 @@ class PipelineMixin:
                 _run_git(["reset", "HEAD", "--"], cwd=worktree_path, timeout=60, elog=elog, phase="adoption")
                 for rel_path in actual_files:
                     add_proc = _run_git(
-                        ["add", "--", rel_path],
+                        ["--literal-pathspecs", "add", "--", rel_path],
                         cwd=worktree_path,
                         timeout=_DEFAULT_GIT_TIMEOUT_SECONDS,
                         elog=elog,

@@ -60,7 +60,8 @@ class CleanupMixin:
         the record stays complete and committed work stays recoverable.
 
         Never removed while the experiment is non-terminal, has no ``ended_at``, ended
-        within the window, has an unfinished adoption, or has a path outside
+        within the window, has an unfinished adoption, waits for a free resume (#783),
+        or has a path outside
         ``worktrees_root``. Already-missing directories are skipped silently so repeated
         passes are no-ops; a failure on one worktree is recorded and does not stop the others.
         """
@@ -74,7 +75,9 @@ class CleanupMixin:
             rows = self._conn.execute(
                 "SELECT id, ended_at, worktree_path FROM experiments "
                 f"WHERE status IN ({', '.join('?' * len(_TERMINAL_STATUSES))}) "
-                "AND worktree_path IS NOT NULL AND worktree_path != ''",
+                "AND worktree_path IS NOT NULL AND worktree_path != '' "
+                # A run parked for a free resume (#783) still needs its worktree.
+                "AND COALESCE(resume_pending, 0) = 0 AND resume_owner IS NULL",
                 _TERMINAL_STATUSES,
             ).fetchall()
         for row in rows:
@@ -103,6 +106,7 @@ class CleanupMixin:
             # candidates were listed.
             still_expired = self._conn.execute(
                 f"SELECT 1 FROM experiments e WHERE e.id = ? AND e.status IN ({terminal}) "
+                "AND COALESCE(e.resume_pending, 0) = 0 AND e.resume_owner IS NULL "
                 "AND NOT EXISTS (SELECT 1 FROM experiment_adoptions a "
                 f"WHERE a.experiment_id = e.id AND a.status NOT IN ({finished}))",
                 (experiment_id, *_TERMINAL_STATUSES, *_ADOPTION_TERMINAL_STATUSES),

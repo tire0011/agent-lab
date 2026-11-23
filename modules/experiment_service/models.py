@@ -167,6 +167,15 @@ class Experiment:
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     baseline_test_classifications: dict[str, str] | None = None
+    # Free resume of an interrupted run whose paid implementation finished (#783):
+    # resume_pending=1 while the nexus tick has not picked it up yet; resume_count
+    # counts resumes whose verification started (at most one per experiment);
+    # resume_owner names the process that runs a claimed resume.
+    resume_pending: int = 0
+    resume_count: int = 0
+    resume_owner: str | None = None
+    implementation_base_sha: str | None = None
+    resume_snapshot_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +236,9 @@ class Experiment:
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
             "baseline_test_classifications": self.baseline_test_classifications,
+            "resume_pending": self.resume_pending,
+            "resume_count": self.resume_count,
+            "resume_owner": self.resume_owner,
         }
 
 
@@ -262,6 +274,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         plan=_json_or_none(row["plan_json"]),
         worktree_path=row["worktree_path"],
         branch_name=row["branch_name"],
+        implementation_base_sha=row["implementation_base_sha"] if "implementation_base_sha" in row.keys() else None,
+        resume_snapshot_sha=row["resume_snapshot_sha"] if "resume_snapshot_sha" in row.keys() else None,
         base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in row.keys() else None,
         research_task_id=row["research_task_id"],
         research_started_at=row["research_started_at"],
@@ -302,6 +316,16 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         baseline_test_classifications=(
             _json_or_none(row["baseline_test_classifications_json"])
             if "baseline_test_classifications_json" in row.keys() else None
+        ),
+        resume_pending=(
+            int(row["resume_pending"] or 0) if "resume_pending" in row.keys() else 0
+        ),
+        resume_count=(
+            int(row["resume_count"] or 0) if "resume_count" in row.keys() else 0
+        ),
+        resume_owner=(
+            (str(row["resume_owner"]) if row["resume_owner"] else None)
+            if "resume_owner" in row.keys() else None
         ),
     )
 

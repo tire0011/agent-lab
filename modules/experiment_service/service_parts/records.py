@@ -306,13 +306,16 @@ class RecordsMixin:
             try:
                 if issue_number is not None:
                     placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
+                    # An interrupted run parked for a free resume (#783) still owns
+                    # its issue: a replacement start would pay for finished work.
                     active_rows = self._conn.execute(
                         f"""
                         SELECT id, status, goal FROM experiments
                         WHERE status NOT IN ({placeholders})
+                           OR (status = ? AND COALESCE(resume_pending, 0) = 1)
                         ORDER BY created_at ASC
                         """,
-                        _TERMINAL_STATUSES,
+                        (*_TERMINAL_STATUSES, STATUS_INTERRUPTED),
                     ).fetchall()
                     active = next(
                         (
@@ -777,7 +780,10 @@ class RecordsMixin:
         return json.dumps(usage) if usage else None
 
 
-    def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
+    def _transition(
+        self, experiment_id: str, from_status: str, to_status: str, *,
+        require_unowned: bool = False, **fields: Any,
+    ) -> bool:
         """Atomically move ``from_status`` -> ``to_status`` iff still ``from_status``.
 
         Returns True if the transition happened; extra ``fields`` are set in the same
@@ -793,7 +799,7 @@ class RecordsMixin:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} "
-                "WHERE id = ? AND status = ?",
+                "WHERE id = ? AND status = ?" + (" AND resume_owner IS NULL" if require_unowned else ""),
                 values,
             )
             moved = cursor.rowcount == 1
@@ -890,34 +896,75 @@ class RecordsMixin:
         )
 
 
+    def _has_finished_implementation_work(self, row: sqlite3.Row) -> bool:
+        """Whether an interrupted row's paid implementation finished and left work (#783).
+
+        True when ``implementation_ended_at`` is set, the worktree still exists, and the
+        worktree holds real work: the branch has at least one commit ahead of its base
+        commit, or there is an uncommitted diff. Any git failure counts as "no work" -
+        a resumable verdict is never guessed.
+        """
+        from ..resume import worktree_has_work
+
+        if not row["implementation_ended_at"]:
+            return False
+        return worktree_has_work(str(row["worktree_path"] or "").strip(), row["base_commit_sha"])
+
+
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Reconcile experiments orphaned by a service restart (#281).
+        """Reconcile experiments orphaned by a service restart (#281, #783).
 
         An experiment runs in a daemon thread of the ``agent-api`` process, so a restart
         kills it mid-flight and leaves its row active forever. Called once at process
-        startup, before any new experiment runs. Never resumes the work: moving to a
-        terminal status is what lets the waiting Nexus session resume and decide.
+        startup, before any new experiment runs. Never resumes the work here: moving to
+        a terminal status is what lets the waiting Nexus session resume and decide.
         Implementation/verification become ``interrupted`` (legacy ``selecting`` becomes
         ``failed``); worktrees are deliberately retained for inspection or retry.
 
+        #783: an interrupted run whose paid implementation already finished and whose
+        worktree still holds that work (a commit ahead of its base, or an uncommitted
+        diff) is additionally parked with ``resume_pending=1`` for a free resume by the
+        nexus tick, and does not count as a used attempt while the resume is pending.
+        A resume the nexus tick is running (``resume_owner`` set) belongs to that
+        process: a live one is left alone, an orphaned one is reconciled by
+        :func:`modules.experiment_service.resume.recover_orphaned_resumes`.
+
         Returns the list of reconciled experiment ids.
         """
+        from ..resume import recover_orphaned_resumes
+
+        marked: list[str] = list(recover_orphaned_resumes(self))
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, status FROM experiments WHERE status IN (?, ?, ?)",
+                """
+                SELECT id, status, implementation_ended_at, worktree_path,
+                       branch_name, base_commit_sha, COALESCE(resume_count, 0) AS resume_count,
+                       resume_owner
+                FROM experiments WHERE status IN (?, ?, ?)
+                """,
                 (STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING),
             ).fetchall()
-        marked: list[str] = []
         for row in rows:
+            if row["resume_owner"]:
+                # Still owned by a live resume process (orphans were handled above).
+                continue
             # Conditional per row: a status that moved on in between is left alone.
             terminal_status = (
                 STATUS_FAILED if row["status"] == STATUS_SELECTING else STATUS_INTERRUPTED
             )
-            if self._transition(
-                row["id"], row["status"], terminal_status,
-                ended_at=_utcnow_iso(),
-                error=_INTERRUPTED_BY_RESTART_ERROR,
+            fields: dict[str, Any] = {
+                "ended_at": _utcnow_iso(),
+                "error": _INTERRUPTED_BY_RESTART_ERROR,
+            }
+            # A resume already spent (resume_count reached its cap) is not parked
+            # again: the run then keeps the plain terminal behaviour.
+            if (
+                terminal_status == STATUS_INTERRUPTED
+                and int(row["resume_count"] or 0) < 1
+                and self._has_finished_implementation_work(row)
             ):
+                fields["resume_pending"] = 1
+            if self._transition(row["id"], row["status"], terminal_status, require_unowned=True, **fields):
                 # Clearing the registry also makes in-process startup reconciliation safe and prevents
                 # stale cancellation targets.
                 with self._process_lock:

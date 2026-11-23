@@ -386,6 +386,11 @@ def _build_service(args) -> NexusInitiativeService:
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
         reverification_launcher=_launch_parked_reverification if use_api_reverification else None,
+        # No free resume in --integration-only mode, which never starts work (#783).
+        interrupted_resumer=(
+            _interrupted_resumer(experiment_service, controller.github_work_tracking)
+            if controller is not None else None
+        ),
         planner=_planner(args.repo_root, args.db_path) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
@@ -528,6 +533,36 @@ def _sweep_stalled_experiments(service) -> None:
     # The notification picks them up through _finished_badly.
     for experiment_id in stalled:
         logger.warning("experiment %s stalled and was marked failed", experiment_id)
+
+
+def _interrupted_resumer(experiment_service, tracking):
+    """The free resume of interrupted runs (#783) for the initiative service.
+
+    The initiative calls it inside ``tick()`` - behind the owner pause, the
+    issue-approval sweep, the busy and the stale-service guards, before
+    planning - with its ``approval_block`` check. The resume verifies the
+    already paid work in this process without a coding provider; a pass is
+    adopted by the normal integration scheduler.
+    """
+    from modules.experiment_service.resume import resume_interrupted
+
+    def resume(**kwargs):
+        summary = resume_interrupted(
+            experiment_service, datetime.now(timezone.utc),
+            github_work_tracking=tracking, **kwargs,
+        )
+        if summary and summary.get("resumed"):
+            logger.info(
+                "resumed interrupted experiment %s after restart (no new paid start): %s",
+                summary.get("experiment_id"), summary.get("status"),
+            )
+            _events.append(
+                f"Resumed experiment {str(summary.get('experiment_id'))[:8]} after a service "
+                f"restart, no new paid start: verification ended {summary.get('status')}"
+            )
+        return summary
+
+    return resume
 
 
 def _wait_for_experiments(service=None) -> None:

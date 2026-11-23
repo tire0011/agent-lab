@@ -29,7 +29,10 @@ _LABELS = {
     "local_replay_units": "local hunk replays",
     "planner_shadow": "planner shadow",
     "local_model_bakeoffs": "local model bake-offs",
+    "interrupted_resumes": "free resumes",
 }
+# #783: resumed interrupted runs and their outcomes, over this many days.
+RESUME_WINDOW_DAYS = 14
 
 
 def check_pipelines(
@@ -123,7 +126,21 @@ def check_pipelines(
             result["status"] = "stuck"
         if scheduled and _timestamp(latest) < cutoff:
             result.update(status="stale", max_age_hours=max_age_hours)
+    if "activity_log" in tables:
+        results["interrupted_resumes"] = resume_health(db, now)
     return results
+
+
+def resume_health(db: sqlite3.Connection, now: datetime) -> dict[str, Any]:
+    """Free resumes of interrupted runs (#783): starts, outcomes, saved paid starts.
+
+    A count, not a pipeline with a cadence: always ``ok``; it carries no
+    ``count`` key, so it never reads as a stuck streak.
+    """
+    from modules.experiment_service.resume import resume_stats
+
+    stats = resume_stats(db, now, days=RESUME_WINDOW_DAYS)
+    return {"status": "ok", "enabled": True, "latest_at": None, **stats}
 
 
 def _diagnostic(outcome: str, error: str) -> str:
@@ -195,6 +212,10 @@ def read_health(db_path: str | Path, now: datetime) -> dict[str, dict[str, Any]]
 
 def health_summary(name: str, result: dict[str, Any]) -> str:
     label = _LABELS[name]
+    if name == "interrupted_resumes":
+        from modules.experiment_service.resume import resume_stats_summary
+
+        return f"{label}: {resume_stats_summary(result)}"
     streak = ""
     if "count" in result:
         streak = f"{result['count']}x {result['outcome']}"

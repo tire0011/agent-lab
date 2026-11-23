@@ -282,6 +282,45 @@ timed-out attempts leave the experiment parked.
   completion. The default is 600 seconds (10 minutes). A stall stops the tests
   and records `hung_test` with the active test ID when available.
 
+### Free resume of interrupted experiments (#783)
+
+At API startup, `mark_interrupted_experiments_failed()` marks a run killed by
+the restart `interrupted`. When its paid implementation had already finished
+(`implementation_ended_at` set) and its worktree still holds the work (a commit
+ahead of the recorded base or an uncommitted diff), the run is also parked with
+`resume_pending=1`. A parked run reserves its issue and keeps its worktree, but
+does not count as a used attempt.
+
+The initiative tick resumes at most one parked run per tick, after the owner
+pause, the issue-approval sweep, the busy guard and the stale-service guard, and
+before planning. The resume never calls a coding provider:
+
+- An explicitly revoked or rejected issue approval, a missing worktree or a
+  worktree without the work ends the parking (`experiment_resume_skipped`). The
+  run then counts as an attempt, as before #783.
+- The uncommitted publishable diff is committed to
+  `refs/nexus/resume/<experiment id>` with the checkpoint exclusions, so no
+  `.env`, keys, `state/` or `logs/` files are included. This ref is never pushed.
+  The original branch, index and files are preserved. If a file is partially
+  staged, verification uses its staged version. The full snapshot delta is
+  checked against the implementation baseline recorded after merging main.
+- `_verify` uses the original worktree for Git operations and a temporary
+  checkout of the snapshot for local tests. For linked experiments it uses
+  GitHub tracking: checkpoint, exact-commit CI and PR diagnostics. A pass is adopted
+  by the normal integration scheduler. A failure keeps the normal result and
+  counts as an attempt. A run is resumed at most once (`resume_count`).
+- The Issue gets the comment `resumed after restart, no new paid start`. The
+  activity log records `experiment_resumed` and `experiment_resume_finished`;
+  the second event's `to_status` is the outcome. `measurement_health`
+  (`interrupted_resumes`) and the status issue show the 14-day counts and the
+  saved paid starts.
+- `resume_owner` names the process running a resume. Startup leaves a live
+  resume alone. If the owner died before verification started, the run is
+  parked again (at most 3 claims). If it died during verification, the run
+  ends `interrupted`. If a verdict was already persisted, the next tick records
+  that outcome and releases ownership.
+- `NEXUS_RESUME_INTERRUPTED=0` disables the resume.
+
 The tick logs each start-to-start interval and the maximum interval ending in
 the preceding 72 hours. Search the `nexus-tick.service` journal for
 `initiative tick start gap`. A gap of 1200 seconds or more is logged as a warning.

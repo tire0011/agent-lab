@@ -166,6 +166,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
             base_commit_sha TEXT NULL,
+            implementation_base_sha TEXT NULL,
+            resume_snapshot_sha TEXT NULL,
             selection_task_id TEXT NULL,
             reformat_retry_task_id TEXT NULL,
             reformat_retry_runtime_ms INTEGER NULL,
@@ -193,7 +195,12 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT NULL,
             policy_rule TEXT NULL,
             quality_evaluation_json TEXT NULL,
-            baseline_test_classifications_json TEXT NULL
+            baseline_test_classifications_json TEXT NULL,
+            -- An interrupted run whose paid implementation already finished is
+            -- parked for a free resume instead of a new paid start (#783).
+            resume_pending INTEGER NOT NULL DEFAULT 0,
+            resume_count INTEGER NOT NULL DEFAULT 0,
+            resume_owner TEXT NULL
         );
 
         CREATE TABLE IF NOT EXISTS experiment_reflections (
@@ -427,6 +434,8 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     ("base_commit_sha", "TEXT"),
+    ("implementation_base_sha", "TEXT"),
+    ("resume_snapshot_sha", "TEXT"),
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),
@@ -436,6 +445,14 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
+    # Free resume of an interrupted run whose implementation already finished
+    # (#783): resume_pending=1 parks it for the nexus tick, resume_count counts
+    # resumes whose verification started (at most one per experiment), and
+    # resume_owner names the process running a claimed resume, so startup
+    # reconciliation only touches orphaned ones.
+    ("resume_pending", "INTEGER NOT NULL DEFAULT 0"),
+    ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("resume_owner", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
