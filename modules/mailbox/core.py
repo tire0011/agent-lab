@@ -341,6 +341,37 @@ def git_add_and_commit(
     return True
 
 
+def git_add_and_commit_paths(
+    repo_path: Path,
+    files: list[Path],
+    message: str,
+) -> bool:
+    """Stage exactly *files* and commit only those paths. Return True on success.
+
+    Unlike :func:`git_add_and_commit`, which commits the whole index, the
+    commit here is limited to the given pathspecs (``git commit --only --
+    <paths>``), so unrelated staged entries and another concurrent
+    submission's staged files stay staged and are not published by this
+    commit (#812, review on #774). Staging runs with check=True: a staging
+    failure raises ``CalledProcessError`` instead of returning False.
+    """
+    rels = []
+    for f in files:
+        rel = f.relative_to(repo_path)
+        _git(["add", "--", str(rel)], repo_path)
+        rels.append(str(rel))
+
+    result = _git(
+        ["commit", "--no-verify", "-m", message, "--only", "--", *rels],
+        repo_path,
+        check=False,
+    )
+    if result.returncode != 0:
+        logger.warning("git commit failed: %s", result.stderr.strip())
+        return False
+    return True
+
+
 def git_push(repo_path: Path) -> bool:
     """Push to the tracked remote branch (no --force). Return True on success."""
     result = _git(["push"], repo_path, check=False)
@@ -378,10 +409,22 @@ def _outbox_filename(msg: "MailboxMessage", ts: str) -> str:
 
 
 def _atomic_write(path: Path, content: str) -> None:
-    """Write content atomically via a unique temp file and replace."""
+    """Write content atomically via a unique temp file and replace.
+
+    The temp file is removed when the write or the final replace fails, so a
+    partial write never leaves a ``<name>.tmp-*`` file behind (#812, review
+    on #774) - callers that roll back ``path`` stay clean too.
+    """
     tmp = path.with_name(f"{path.name}.tmp-{uuid.uuid4().hex}")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    except BaseException:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("could not remove temporary file %s", tmp)
+        raise
 
 
 def _now_iso() -> str:

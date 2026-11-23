@@ -11,14 +11,17 @@ import sqlite3
 
 from . import schema as _schema
 from .records import (
+    HOME_GPU_JOB_COLUMNS,
     calculate_estimated_cost,
     get_applicable_price,
+    get_home_gpu_job,
     get_setting,
     insert_activity,
     insert_home_gpu_job,
     insert_run,
     insert_tool_calls,
     list_activity,
+    list_home_gpu_jobs,
     list_local_localizations,
     set_setting,
     upsert_local_localization,
@@ -58,9 +61,11 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
 __all__ = [
     "DEFAULT_DB_PATH",
     "LEGACY_DB_PATH",
+    "HOME_GPU_JOB_COLUMNS",
     "_connect",
     "calculate_estimated_cost",
     "get_applicable_price",
+    "get_home_gpu_job",
     "get_setting",
     "init_db",
     "insert_activity",
@@ -68,6 +73,7 @@ __all__ = [
     "insert_run",
     "insert_tool_calls",
     "list_activity",
+    "list_home_gpu_jobs",
     "list_local_localizations",
     "set_setting",
     "upsert_local_localization",

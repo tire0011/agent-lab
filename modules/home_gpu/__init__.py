@@ -17,6 +17,7 @@ from .jobs import (
     SubmittedJob,
     check_payload,
     home_gpu_enabled,
+    recover_unpublished_jobs,
     submit_job,
 )
 
@@ -30,5 +31,6 @@ __all__ = [
     "SubmittedJob",
     "check_payload",
     "home_gpu_enabled",
+    "recover_unpublished_jobs",
     "submit_job",
 ]
