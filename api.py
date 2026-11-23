@@ -607,6 +607,25 @@ def authorize(x_api_key: str | None):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
+
+@app.post("/internal/reverify-parked", status_code=202)
+def launch_parked_reverification(x_api_key: str | None = Header(default=None)):
+    authorize(x_api_key)
+
+    def run() -> None:
+        from modules.experiment_service.reverify_worker import run_parked_maintenance
+
+        try:
+            run_parked_maintenance(DEFAULT_DB_PATH, str(Path(__file__).resolve().parent))
+        except Exception:
+            _logger.exception("parked re-verification background job failed")
+
+    # The tick's oneshot cgroup is torn down on exit. The API owns the worker
+    # so it can keep running and reaping its verification process after that.
+    threading.Thread(target=run, daemon=True, name="parked-reverification").start()
+    return {"status": "scheduled"}
+
+
 _PUBLIC_PHASES = {
     "queued": "queued", "selecting": "selecting", "implementing": "implementing",
     "verifying": "verifying", "succeeded": "succeeded", "failed": "failed",

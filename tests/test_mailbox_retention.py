@@ -28,8 +28,10 @@ os.environ.setdefault("AGENT_API_KEY", "test-key")
 NOW = datetime(2026, 9, 7, 12, 0, 0, tzinfo=timezone.utc)
 
 
-def _git(cwd: Path, *args: str) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+def _git(cwd: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+    ).stdout.strip()
 
 
 def _stamp(days_ago: float) -> str:
@@ -53,7 +55,7 @@ class RetentionPolicyTests(unittest.TestCase):
         parsed = retention.message_timestamp("20260906114422-command-48ff369c.md")
         self.assertEqual(parsed, datetime(2026, 9, 6, 11, 44, 22, tzinfo=timezone.utc))
 
-    def test_unrecognized_filenames_have_no_age_and_are_left_alone(self):
+    def test_unrecognized_filenames_have_no_timestamp_prefix(self):
         for name in ("README.md", "notes.md", "2026-command.md"):
             with self.subTest(name=name):
                 self.assertIsNone(retention.message_timestamp(name))
@@ -72,13 +74,26 @@ class _MailboxRepoFixture:
         _git(self.repo, "config", "user.email", "test@test.com")
         _git(self.repo, "config", "user.name", "Test")
         (self.inbox / ".gitkeep").write_text("")
-        _git(self.repo, "add", "-A")
-        _git(self.repo, "commit", "-m", "init")
+        self._record_files(days_ago=10)
 
         self.db_path = str(Path(self._tmp.name) / "agent.db")
         self.conn = init_db(self.db_path)
         init_mailbox_db(self.conn)
         self.addCleanup(self.conn.close)
+
+    def _record_files(self, days_ago: int, *paths: Path) -> None:
+        parent = ["-p", _git(self.repo, "rev-parse", "HEAD")] if paths else []
+        pathspecs = [str(path.relative_to(self.repo)) for path in paths] or ["."]
+        _git(self.repo, "add", "--", *pathspecs)
+        date = (NOW - timedelta(days=days_ago)).isoformat()
+        with patch.dict(os.environ, {"GIT_AUTHOR_DATE": NOW.isoformat(), "GIT_COMMITTER_DATE": date}):
+            commit = _git(self.repo, "commit-tree", _git(self.repo, "write-tree"), *parent, "-m", "fixture")
+        _git(self.repo, "update-ref", "HEAD", commit)
+
+    def _dated_file(self, path: Path, days_ago: int) -> Path:
+        path.write_text("response\n", encoding="utf-8")
+        self._record_files(days_ago, path)
+        return path
 
     def _outbox_file(self, days_ago: float, suffix: str = "command-abc") -> Path:
         path = self.outbox / f"{_stamp(days_ago)}-{suffix}.md"
@@ -115,13 +130,43 @@ class PruneTests(_MailboxRepoFixture, unittest.TestCase):
         self.assertEqual([p.name for p in plan.outbox], [old.name])
         self.assertNotIn(recent.name, [p.name for p in plan.outbox])
 
+    def test_unprefixed_outbox_uses_the_last_commit_date(self):
+        old = self._dated_file(self.outbox / "task-approval-result-x.md", 6)
+        updated = self._dated_file(self.outbox / "task-approval-result-y.md", 6)
+        updated.write_text("updated\n", encoding="utf-8")
+        self._record_files(1, updated)
+        recent = self._dated_file(self.outbox / "task-approval-result-z.md", 1)
+        old_mtime = (NOW - timedelta(days=10)).timestamp()
+        os.utime(recent, (old_mtime, old_mtime))
+        self.assertEqual(self._plan().outbox, [old])
+
+    def test_untracked_outbox_falls_back_to_mtime(self):
+        old = self.outbox / "failure-analysis-x.md"
+        old.write_text("response\n", encoding="utf-8")
+        old_mtime = (NOW - timedelta(days=6)).timestamp()
+        os.utime(old, (old_mtime, old_mtime))
+
+        self.assertEqual(self._plan().outbox, [old])
+
+    def test_timestamped_files_use_their_name_even_with_git_history(self):
+        recent = self._outbox_file(days_ago=1)
+        self._record_files(6, recent)
+        old = self._outbox_file(days_ago=6)
+        self._record_files(1, old)
+
+        self.assertEqual(self._plan().outbox, [old])
+
     def test_boundary_file_inside_the_window_is_kept(self):
         self._outbox_file(days_ago=4.9)
         self.assertEqual(self._plan().outbox, [])
 
     def test_pruning_is_disabled_when_the_window_is_zero(self):
-        self._outbox_file(days_ago=90)
-        self.assertFalse(self._plan(days=0))
+        self._dated_file(self.outbox / "task-approval-result-x.md", 6)
+        archive = self.repo / "archive"
+        archive.mkdir()
+        self._dated_file(archive / "old.md", 6)
+        with patch.dict(os.environ, {retention.ENV_RETENTION_DAYS: "0"}):
+            self.assertFalse(self._plan(days=retention.retention_days()))
 
     def test_file_still_needed_to_finalize_a_commit_is_never_pruned(self):
         """The hard constraint: retry_pending_git_commits() re-reads this
@@ -141,9 +186,9 @@ class PruneTests(_MailboxRepoFixture, unittest.TestCase):
         self.assertEqual([p.name for p in self._plan().outbox], [done.name])
 
     def test_unpublished_operation_chain_and_approval_files_are_protected(self):
-        chain = self._outbox_file(days_ago=30, suffix="operation-chain-result-x")
-        approval = self._outbox_file(days_ago=30, suffix="task-approval-y")
-        pushed = self._outbox_file(days_ago=30, suffix="task-approval-z")
+        chain = self._dated_file(self.outbox / "operation-chain-result-x.md", 30)
+        approval = self._dated_file(self.outbox / "task-approval-result-y.md", 30)
+        pushed = self._dated_file(self.outbox / "task-approval-result-z.md", 30)
         self.conn.execute(
             "INSERT INTO operation_chains (request_id, outbox_file, publish_status, "
             "status, request_json, created_at, updated_at) "
@@ -179,6 +224,25 @@ class PruneTests(_MailboxRepoFixture, unittest.TestCase):
         self.assertNotIn(approval.name, pruned)
         # A fully pushed record no longer needs its file.
         self.assertIn(pushed.name, pruned)
+
+    def test_failure_analysis_is_protected_until_pushed(self):
+        pending = self._dated_file(self.outbox / "failure-analysis-x.md", 6)
+        self.conn.execute(
+            """
+            INSERT INTO failure_analyses
+                (id, subject_type, subject_id, created_at, provider, category,
+                 confidence, analysis_json, outbox_file, publish_status)
+            VALUES ('x', 'task', 'task-1', '2026-08-01', 'test', 'test',
+                    1, '{}', ?, 'written')
+            """,
+            (pending.name,),
+        )
+        self.conn.commit()
+        self.assertEqual(self._plan().outbox, [])
+
+        self.conn.execute("UPDATE failure_analyses SET publish_status = 'pushed' WHERE id = 'x'")
+        self.conn.commit()
+        self.assertEqual(self._plan().outbox, [pending])
 
     def test_inbox_messages_that_exhausted_their_retries_are_dropped(self):
         stuck = self.inbox / "202608291430-read-chat-job-chatgpt.md"
@@ -225,6 +289,21 @@ class PruneTests(_MailboxRepoFixture, unittest.TestCase):
         self.assertEqual(len(plan.outbox), 5)
         self.assertTrue(plan.truncated)
 
+    def test_archive_shares_the_deletion_budget(self):
+        archive = self.repo / "archive"
+        archive.mkdir()
+        old = self._dated_file(archive / "old.md", 6)
+        self._dated_file(archive / "recent.md", 1)
+        response = self._outbox_file(days_ago=6)
+
+        self.assertEqual(self._plan().archive, [old])
+        limited = retention.plan_prune(
+            self.conn, inbox=self.inbox, outbox=self.outbox, days=5, now=NOW,
+            max_deletions=1,
+        )
+        self.assertEqual(limited.paths, [response])
+        self.assertTrue(limited.truncated)
+
 
 class PruneCommitTests(_MailboxRepoFixture, unittest.TestCase):
     """The processor's side: delete, commit with explicit pathspecs, and
@@ -255,6 +334,24 @@ class PruneCommitTests(_MailboxRepoFixture, unittest.TestCase):
             ["git", "rev-list", "--count", "HEAD"], cwd=str(self.repo),
             capture_output=True, text=True, check=True,
         ).stdout.strip())
+
+    def test_one_prune_pass_leaves_recent_files_and_passes_deletions_to_git(self):
+        old = self._dated_file(self.outbox / "task-approval-result-x.md", 6)
+        recent = self._dated_file(self.outbox / "task-approval-result-y.md", 1)
+        archive = self.repo / "archive"
+        archive.mkdir()
+        archived = self._dated_file(archive / "old.md", 6)
+
+        with (
+            patch.dict(os.environ, {retention.ENV_RETENTION_DAYS: "5"}),
+            patch("modules.mailbox.processing.git_add_and_commit", return_value=True) as publish,
+        ):
+            self._processor().prune_old_messages(now=NOW)
+
+        self.assertEqual(list(self.outbox.iterdir()), [recent])
+        self.assertFalse(archived.exists())
+        publish.assert_called_once()
+        self.assertEqual(publish.call_args.args[1], [old, archived])
 
     def test_pruning_deletes_the_files_and_commits_them(self):
         old = self._outbox_file(days_ago=30)

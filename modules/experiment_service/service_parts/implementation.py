@@ -23,6 +23,7 @@ from modules.experiment_handover import model_written_tests_block, with_model_wr
 from modules import handover_fact_check
 from modules.local_coding_worker import _goal_text, local_not_called_reason
 from modules.local_file_localizer import with_hint as with_likely_files_hint
+from modules.checkout_guard import GuardedWorker
 
 from ..git_utils import _run_git
 from ..models import (
@@ -302,6 +303,7 @@ class ImplementationMixin:
             and not self._must_use_external_provider(experiment)
         )
         worker = self.local_worker_factory(worktree_path) if use_local else self.worker_factory(worktree_path)
+        worker = GuardedWorker(worker, self.repo_root)
         # Record which coding agent got this experiment before the call, so a timeout or
         # crash still leaves the run attributable.
         implementation_provider = provider_of(worker)
@@ -380,7 +382,7 @@ class ImplementationMixin:
                 )
             else:
                 implementation_prompt = _with_repo_facts(implementation_prompt, worktree_path, elog)
-            worker = self.worker_factory(worktree_path)
+            worker = GuardedWorker(self.worker_factory(worktree_path), self.repo_root)
             implementation_provider = provider_of(worker)
             elog.warning(
                 "implementation", "implementation_provider_fallback",
@@ -444,7 +446,7 @@ class ImplementationMixin:
                 f"{implementation_provider} is overloaded; implementation runs on {fallback}",
                 provider=fallback,
             )
-            worker = build_worker(fallback, db_path=self.db_path)
+            worker = GuardedWorker(build_worker(fallback, db_path=self.db_path), self.repo_root)
             implementation_provider = fallback
             self._force_status(
                 experiment_id, STATUS_IMPLEMENTING,
@@ -647,7 +649,7 @@ class ImplementationMixin:
                 )
                 break
 
-            worker = self.worker_factory(worktree_path)
+            worker = GuardedWorker(self.worker_factory(worktree_path), self.repo_root)
             self._force_status(
                 experiment_id, STATUS_VERIFYING,
                 implementation_provider=provider_of(worker),

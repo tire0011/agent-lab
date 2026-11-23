@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ElementTree
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
+from modules.verification_runner import HungTest, WatchdogConfig, run_verification_test_monitored
 from modules.verification_env import CLOCK_DRIFT_ENV, build_verification_test_env
 
 
@@ -127,6 +128,8 @@ def control_check(
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
     tails: dict[str, str] | None = None,
+    watchdog: WatchdogConfig | None = None,
+    run_id: str = "timing-check",
 ) -> tuple[list[str], list[str]] | None:
     """Rerun flagged tests without drift: ``(drift_only, fails_without_drift)``.
 
@@ -139,6 +142,8 @@ def control_check(
     tests = list(flagged)
     # Drift 0 keeps the fixture installed but adds nothing, so the clocks are real.
     kwargs = {"tails": tails} if tails is not None else {}
+    if watchdog is not None:
+        kwargs.update(watchdog=watchdog, run_id=run_id)
     control = run_timing_check(repo, tests, 0, on_process=on_process, python=python, **kwargs)
     if control == "ok":
         return tests, []
@@ -242,6 +247,8 @@ def run_timing_check(
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
     tails: dict[str, str] | None = None,
+    watchdog: WatchdogConfig | None = None,
+    run_id: str = "timing-check",
 ) -> str:
     """Run every selected test under clock drift and summarize the outcome.
 
@@ -258,7 +265,37 @@ def run_timing_check(
     env = build_verification_test_env()
     env[CLOCK_DRIFT_ENV] = str(drift_ms)
     env["PYTHONUNBUFFERED"] = "1"
-    return _run_timing_check_env(repo, tests, env, on_process=on_process, python=python, tails=tails)
+    return _run_timing_check_env(
+        repo, tests, env, on_process=on_process, python=python, tails=tails,
+        watchdog=watchdog, run_id=run_id,
+    )
+
+
+# Pytest captures stderr during tests. Duplicate it before capture and emit
+# start/end events in the format understood by the shared progress watchdog.
+_PYTEST_PROGRESS = r"""
+import os
+import sys
+import pytest
+
+progress = os.dup(2)
+
+class Progress:
+    def pytest_runtest_logstart(self, nodeid):
+        os.write(progress, (nodeid + " ... ").encode())
+        self.result = b"ok"
+
+    def pytest_runtest_logreport(self, report):
+        if report.failed:
+            self.result = b"FAIL"
+        elif report.skipped and self.result == b"ok":
+            self.result = b"skipped"
+
+    def pytest_runtest_logfinish(self, nodeid):
+        os.write(progress, self.result + b"\n")
+
+sys.exit(pytest.main(sys.argv[1:], plugins=[Progress()]))
+"""
 
 
 def _run_timing_check_env(
@@ -269,6 +306,8 @@ def _run_timing_check_env(
     on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
     python: str | None = None,
     tails: dict[str, str] | None = None,
+    watchdog: WatchdogConfig | None = None,
+    run_id: str = "timing-check",
 ) -> str:
     """Implementation shared with the old-vs-new environment probe (#738)."""
 
@@ -280,31 +319,39 @@ def _run_timing_check_env(
     report_dir = tempfile.TemporaryDirectory(prefix="nexus-timing-check-")
     report = Path(report_dir.name) / "junit.xml"
     try:
-        proc = subprocess.Popen(
-            [
-                python or sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
-                "--tb=short", f"--junitxml={report}", *test_list,
-            ],
-            cwd=Path(repo),
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            start_new_session=True,
-        )
-        if on_process is not None:
-            on_process(proc)
-        output, _ = proc.communicate()
-        if proc.returncode == 0:
+        arguments = ["-q", "-p", "no:cacheprovider", "--tb=short", f"--junitxml={report}", *test_list]
+        executable = python or sys.executable
+        if watchdog is None:
+            proc = subprocess.Popen(
+                [executable, "-m", "pytest", *arguments],
+                cwd=Path(repo), env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, start_new_session=True,
+            )
+            if on_process is not None:
+                on_process(proc)
+            output, _ = proc.communicate()
+            returncode = proc.returncode
+        else:
+            monitored = run_verification_test_monitored(
+                [executable, "-c", _PYTEST_PROGRESS, *arguments],
+                cwd=str(repo), config=watchdog, run_id=run_id,
+                on_process=on_process, tests_only_progress=True, test_env=env,
+            )
+            if monitored.stalled:
+                raise HungTest(monitored.aborted_test_id or "no active pytest test reported")
+            output, returncode = monitored.output, monitored.exit_code
+        if returncode == 0:
             result = "ok"
-        elif proc.returncode == 1:
+        elif returncode == 1:
             failed = _failed_ids(output or "")
             result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
-        if tails is not None and proc.returncode != 0 and report.is_file():
+        if tails is not None and returncode != 0 and report.is_file():
             try:
                 tails.update(failure_tails(report, _failed_ids(output or ""), repo))
             except (ElementTree.ParseError, OSError):
                 pass  # tails are diagnostics; the verdict does not depend on them
+    except HungTest:
+        raise
     except Exception:  # spawning, observers, and malformed process results are check errors
         result = "error"
     finally:

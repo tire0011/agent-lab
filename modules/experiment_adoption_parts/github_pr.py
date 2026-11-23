@@ -51,6 +51,36 @@ class GitHubPrMixin:
             return None
 
 
+    def _open_review_follow_ups(self, work_ref, result, elog) -> None:
+        """Deferred review findings do not vanish: edge cases become one issue
+        Nexus can work on, work outside this repo one question to the owner."""
+        issue = getattr(work_ref, "issue_number", None)
+        source = f"#{issue}" if issue else f"PR #{work_ref.pr_number}"
+        groups = {
+            "edge_case": [t for k, t in result.deferred if k != "elsewhere"],
+            "elsewhere": [t for k, t in result.deferred if k == "elsewhere"],
+        }
+        for kind, items in groups.items():
+            if not items:
+                continue
+            body = (f"Found by the {result.reviewer} review of PR #{work_ref.pr_number} ({source}) "
+                    "and deferred so the change could merge:\n\n"
+                    + "\n".join(f"- {text}" for text in items))
+            try:
+                if kind == "elsewhere":
+                    opened = self.github_work_tracking.open_need_issue(
+                        f"decision or outside change from review of {source}", body)
+                else:
+                    opened = self.github_work_tracking.open_issue(
+                        f"Review follow-up for {source}: edge cases", body)
+                if elog is not None:
+                    elog.info("adoption", "review_follow_up_opened",
+                              f"Deferred review findings ({kind}) -> issue #{opened.get('number')}",
+                              kind=kind, count=len(items))
+            except Exception as exc:  # noqa: BLE001 - the merge must not fail on this
+                logger.warning("could not open review follow-up for %s: %s", source, exc)
+
+
     def _review_blocks(
         self, experiment_id, goal, work_ref, integration_path, elog, *, gate_findings: str = "",
         model_written_tests: str = "",
@@ -90,6 +120,8 @@ class GitHubPrMixin:
             logger.warning("could not post the review on PR #%s: %s", work_ref.pr_number, exc)
         if result.blocks:
             return f"Review by {result.reviewer} blocked the merge: {result.summary}"
+        if getattr(result, "deferred", None):
+            self._open_review_follow_ups(work_ref, result, elog)
         if gate_findings and result.verdict != "approve":
             return no_verdict
         return None

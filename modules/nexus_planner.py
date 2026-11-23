@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -22,6 +23,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 
+from modules.local_model_rates import LocalModelRates
 from modules.measurement_health import health_summary, read_health
 
 logger = logging.getLogger(__name__)
@@ -97,6 +99,10 @@ def _history_line(r: dict[str, Any]) -> str:
         reason = r.get("adoption_reason") or ""
         detail = reason or r.get("error") or ""
         head = f"- {r.get('status', '')} / merge: {_merge_label(r['adoption_status'], reason)}"
+    verdict = r.get("reverification_verdict")
+    if verdict in {"hung_test", "reverify_timeout"}:
+        reason = r.get("reverification_reason")
+        detail = f"{verdict} — {reason}" if reason else verdict
     drift = (
         f" [commits_behind={r.get('commits_behind', 'unknown')}, "
         f"overlap_files={r.get('overlap_files', 'unknown')}]"
@@ -193,6 +199,177 @@ def planning_prompt(
         + _proposals_section(proposals) + _decisions_section(decisions)
         + _reflections_section(reflections)
     )
+
+
+# The compact local shadow prompt (#770, part 1 in #781): the full prompt
+# above is about 6-9k tokens, which the CPU llama-server cannot read within
+# any useful timeout. _start_shadow sends only this compact prompt (#790).
+DEFAULT_SHADOW_PROMPT_TOKENS = 1500
+_COMPACT_TITLE_CHARS = 90
+_COMPACT_TITLE_CHARS_TRIMMED = 40
+_COMPACT_LINE_CHARS = 160
+_COMPACT_RECENT = 5
+
+# Fixed first, so llama-server's prompt cache (#685) reuses it on every tick.
+_COMPACT_HEADER = (
+    "You are Nexus, an agent that develops its own code. Pick the ONE open issue "
+    "that is the most useful to work on next. Prefer issues that unblock or "
+    "simplify later work. Skip issues that need a human decision, a purchase or "
+    "setup outside the repository. An issue tagged out-of-attempts cannot be "
+    "done now; blocked-by-review means the last attempt passed its tests but the "
+    "review stopped it.\n"
+    'Answer with exactly one JSON object: {"issue": <number from OPEN ISSUES>, '
+    '"reason": "<one short sentence>"}\n\n'
+)
+
+
+def estimate_tokens(text: str) -> int:
+    """The bytes/4 token estimate, rounded up: ceil(utf-8 bytes / 4) (#789).
+
+    Rounding down let a prompt of up to 4 * max_tokens + 3 bytes pass as
+    within budget (the codex finding on #787).
+    """
+    return -(-len(text.encode("utf-8")) // 4)
+
+
+def _utf8_len(text: str) -> int:
+    return len(text.encode("utf-8"))
+
+
+def _one_line(value: Any, limit: int) -> str:
+    return " ".join(str(value or "").split())[:limit]
+
+
+def _compact_issue_line(issue: dict[str, Any], title_chars: int = _COMPACT_TITLE_CHARS) -> str:
+    left = issue.get("attempts_left")
+    tags = []
+    if left is not None and int(left) <= 0:
+        tags.append("out-of-attempts")
+    if issue.get("review_blocked"):
+        tags.append("blocked-by-review")
+    line = f"#{issue['number']} {_one_line(issue.get('title'), title_chars)}"
+    if left is not None:
+        line += f" | attempts left: {max(0, int(left))}"
+    return line + "".join(f" [{tag}]" for tag in tags)
+
+
+def _compact_recent_line(r: dict[str, Any]) -> str:
+    if "adoption_status" in r:
+        reason = str(r.get("adoption_reason") or "")
+        outcome = f"{r.get('status', '')} / merge: {_merge_label(str(r['adoption_status']), reason)}"
+    else:
+        outcome = str(r.get("status", ""))
+    return _one_line(f"- {outcome}: {r.get('title', '')}", _COMPACT_LINE_CHARS)
+
+
+def compact_planning_prompt(
+    issues: list[dict[str, Any]],
+    recent: list[dict[str, Any]] | None,
+    stuck_measurements: list[str] | None,
+    budget_left: int | None,
+    max_tokens: int = DEFAULT_SHADOW_PROMPT_TOKENS,
+) -> str | None:
+    """A short planning prompt for the local model (#770, #781).
+
+    One line per open issue (number, title, attempts left, blocked/out-of-
+    attempts tag - no bodies), the last five experiment outcomes, the stuck
+    measurement pipelines and the budget last. The fixed header comes first
+    and is byte-stable across calls, so the server's prompt cache can reuse
+    the prefix.
+
+    The result never has more than ``4 * max_tokens`` utf-8 bytes, so
+    ``estimate_tokens(result) <= max_tokens``. Trimming order:
+    the oldest outcomes first, then the oldest (lowest numbered) issues - the
+    newest issue is always kept - then the titles cut to 40 characters. When
+    even that does not fit (tiny budgets), ``None`` is returned instead of an
+    over-budget prompt (#773's codex finding).
+    """
+    try:
+        max_tokens = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens = DEFAULT_SHADOW_PROMPT_TOKENS
+    ordered = sorted(issues, key=lambda i: int(i["number"]))
+    recent_lines = [_compact_recent_line(r) for r in (recent or [])[:_COMPACT_RECENT]]
+    stuck_lines = [_one_line(line, _COMPACT_LINE_CHARS) for line in stuck_measurements or []]
+    budget = ("unknown" if budget_left is None else str(max(0, int(budget_left))))
+
+    def build(kept: list[dict[str, Any]], outcomes: list[str], title_chars: int) -> str:
+        return (
+            _COMPACT_HEADER
+            + "OPEN ISSUES:\n" + "\n".join(_compact_issue_line(i, title_chars) for i in kept) + "\n\n"
+            + "RECENT EXPERIMENTS:\n" + ("\n".join(outcomes) or "(none yet)") + "\n\n"
+            + "STUCK MEASUREMENTS:\n" + ("\n".join(stuck_lines) or "(none)") + "\n\n"
+            + f"Paid starts left today: {budget}\n"
+        )
+
+    # Compare bytes with the byte cap directly, never a rounded token count.
+    cap = 4 * max_tokens
+    if _utf8_len(_COMPACT_HEADER) > cap:
+        return None  # even the fixed header does not fit
+    kept = list(ordered)
+    outcomes = list(recent_lines)
+    prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while _utf8_len(prompt) > cap and outcomes:
+        outcomes.pop()  # newest first: the oldest outcome goes first
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    while _utf8_len(prompt) > cap and len(kept) > 1:
+        kept.pop(0)  # oldest issue first; the newest one stays
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS)
+    if _utf8_len(prompt) > cap:
+        prompt = build(kept, outcomes, _COMPACT_TITLE_CHARS_TRIMMED)
+    if _utf8_len(prompt) > cap:
+        return None
+    return prompt
+
+
+# Part 2a of #782 (#796): ONE rate-based timeout drives both the shadow HTTP
+# client and the monitor that joins it. The hard-coded 55 s in nexus_tick.py
+# made all 48 planner_shadow rows end in 'local model call timed out after 55s'.
+SHADOW_GEN_TOKENS = 120  # max_tokens of the shadow call in nexus_tick.py
+SHADOW_TIMEOUT_OVERHEAD_SECONDS = 10.0
+SHADOW_TIMEOUT_CAP_SECONDS = 240.0
+SHADOW_TIMEOUT_FALLBACK_SECONDS = 120.0  # when no rate is known
+# The monitor joins the shadow worker on T + this grace, so a request the
+# client bounds by T can never outlive the monitor.
+SHADOW_MONITOR_GRACE_SECONDS = 5.0
+
+
+def _positive_rate(value: Any) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value > 0)
+
+
+def shadow_timeout_seconds(prompt_tokens: Any, rates: Any) -> float:
+    """The one shadow timeout, in seconds (#796): read the prompt, generate the
+    answer, plus overhead - ``prompt_tokens/prompt_tps + 120/gen_tps + 10``,
+    capped at 240 s.
+
+    *rates* is a :class:`~modules.local_model_rates.LocalModelRates` (anything
+    with a ``medians()`` method) or the ``(prompt_tps, gen_tps)`` pair itself.
+    When ``medians()`` returns ``None`` for either rate (no samples yet) or a
+    non-positive rate, the fallback of 120 s is returned.
+    """
+    if callable(getattr(rates, "medians", None)):
+        try:
+            rates = rates.medians()
+        except Exception:  # noqa: BLE001 - a broken rates store means "no samples"
+            rates = None
+    try:
+        prompt_tps, gen_tps = rates if rates is not None else (None, None)
+    except (TypeError, ValueError):
+        prompt_tps = gen_tps = None
+    if not _positive_rate(prompt_tps) or not _positive_rate(gen_tps):
+        return SHADOW_TIMEOUT_FALLBACK_SECONDS
+    try:
+        tokens = float(prompt_tokens)
+    except (TypeError, ValueError):
+        tokens = 0.0
+    if not math.isfinite(tokens) or tokens < 0:
+        tokens = 0.0
+    seconds = (tokens / float(prompt_tps)
+               + SHADOW_GEN_TOKENS / float(gen_tps)
+               + SHADOW_TIMEOUT_OVERHEAD_SECONDS)
+    return min(SHADOW_TIMEOUT_CAP_SECONDS, seconds)
 
 
 def _reflections_section(reflections: list[dict[str, str]] | None) -> str:
@@ -315,16 +492,18 @@ class IssuePlanner:
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
-        shadow: Callable[[str], str] | None = None,
+        shadow: Callable[[str, float], str] | None = None,
         *,
         db_path: str | None = None,
-        shadow_timeout: float = 60.0,
+        rates: Any = None,
     ) -> None:
         self._complete = complete
         self._explore = explore
         self._shadow = shadow
         self._db_path = db_path
-        self._shadow_timeout = shadow_timeout
+        # #796: the rate store the shadow timeout is computed from; a
+        # LocalModelRates (or anything with medians()), None reads the default.
+        self._rates = rates
 
     def choose(
         self,
@@ -371,11 +550,39 @@ class IssuePlanner:
         if (self._shadow is None or not self._db_path or
                 os.environ.get("NEXUS_PLANNER_SHADOW", "1").strip() == "0"):
             return
-        prompt = planning_prompt(issues, recent, explore=False, **context) + (
+        shadow_instructions = (
             '\n\nLOCAL SHADOW ANSWER: Pick only from OPEN ISSUES. Return exactly a short JSON '
             'object with only {"issue": <number>, "reason": "<short reason>"}.'
         )
-        prompt_tokens = max(1, len(prompt.encode("utf-8")) // 4)
+        # Reserve the suffix's UTF-8 bytes, rounding up to whole estimated tokens.
+        try:
+            shadow_max_tokens = int(os.environ.get("NEXUS_PLANNER_SHADOW_PROMPT_TOKENS")
+                                    or DEFAULT_SHADOW_PROMPT_TOKENS)
+        except ValueError:
+            shadow_max_tokens = DEFAULT_SHADOW_PROMPT_TOKENS
+        compact = compact_planning_prompt(
+            issues, recent, context.get("stuck_measurements"), context.get("budget_left"),
+            max_tokens=shadow_max_tokens - estimate_tokens(shadow_instructions),
+        )
+        if compact is None:
+            # Over budget even after trimming: record the skip synchronously and
+            # never call the model (#790).
+            try:
+                from modules.planner_shadow import record
+                record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
+                       local_issue=None, local_valid=0,
+                       prompt_tokens=0, seconds=0.0,
+                       error="skipped: prompt_over_budget")
+            except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
+                logger.warning("planner shadow: could not store skip: %s", exc)
+            return
+        prompt = compact + shadow_instructions
+        prompt_tokens = max(1, estimate_tokens(prompt))
+        # #796: one rate-based timeout drives both the HTTP client (handed to
+        # the shadow callable) and this monitor's join below.
+        rates = self._rates if self._rates is not None else LocalModelRates()
+        timeout = shadow_timeout_seconds(prompt_tokens, rates)
+        join_timeout = timeout + SHADOW_MONITOR_GRACE_SECONDS
 
         def monitor() -> None:
             result: list[str] = []
@@ -383,20 +590,20 @@ class IssuePlanner:
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt))  # type: ignore[misc]
+                    result.append(self._shadow(prompt, timeout))
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
-            started = time.monotonic()
             worker = threading.Thread(target=call, name="planner-shadow-call", daemon=True)
             worker.start()
-            worker.join(self._shadow_timeout)
+            started = time.monotonic()  # the clock starts after worker.start() (#796)
+            worker.join(join_timeout)
             elapsed = time.monotonic() - started
             local_issue: int | None = None
             valid = False
             error: str | None = None
             if worker.is_alive():
-                error = f"timeout after {self._shadow_timeout:g}s"
+                error = f"timeout after {join_timeout:g}s"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:

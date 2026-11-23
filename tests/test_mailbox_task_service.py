@@ -61,6 +61,7 @@ def _make_service(
     exp_service=None,
     orchestrator_factory=None,
     github_work_tracking=None,
+    failure_analysis_service=None,
 ) -> MailboxTaskService:
     db_path = str(tmp_path / "test.db")
     conn = init_db(db_path)
@@ -83,6 +84,7 @@ def _make_service(
         issue_number=42, branch_name="nexus/42-mailbox"
     )
     return MailboxTaskService(
+        failure_analysis_service=failure_analysis_service,
         db_path=db_path,
         experiment_service=exp_service,
         outbox_dir=str(tmp_path / "outbox"),

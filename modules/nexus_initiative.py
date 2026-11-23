@@ -212,6 +212,10 @@ def _last_reason(attempts: dict[str, tuple[str, str]]) -> str:
     return sanitized_reason(" ".join(max(attempts.values())[1].split())) or "no reason recorded"
 
 
+#: ``detail`` of a dispatch paid from ``extra_budget_<provider>``.
+PROVIDER_EXTRA_PREFIX = "provider_extra:"
+
+
 @dataclass(slots=True)
 class Candidate:
     kind: str
@@ -268,12 +272,14 @@ class NexusInitiativeService:
         proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
+        reverification_launcher: Callable[[], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
         self.adoption_service = adoption_service
         self.controller = controller
         self._issue_lister = issue_lister
+        self._reverification_launcher = reverification_launcher
         self._idea_lister = idea_lister
         # Planning step (#354): which open issue is the most useful next one.
         self._planner = planner
@@ -475,6 +481,44 @@ class NexusInitiativeService:
             return max(0, int(row[0]))
         except (sqlite3.Error, ValueError, TypeError):
             return 0
+
+    def _provider_extra_left(self) -> str | None:
+        """A coding provider with an unused ``extra_budget_<provider>`` (mailbox,
+        valid 24 hours), installed and not cooling down; ``None`` if there is none."""
+        from modules.coding_provider import available_providers, provider_cooldowns
+
+        try:
+            cooled = provider_cooldowns(db_path=self.db_path)
+            providers = available_providers()
+        except Exception:  # noqa: BLE001 - no extra start rather than a broken tick
+            return None
+        now = _utcnow()
+        for provider in providers:
+            if provider in cooled:
+                continue
+            try:
+                row = self._conn.execute(
+                    "SELECT value, updated_at FROM service_settings WHERE key = ?",
+                    (f"nexus.extra_budget.{provider}",),
+                ).fetchone()
+                if not row:
+                    continue
+                set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+                if set_at.tzinfo is None:
+                    set_at = set_at.replace(tzinfo=timezone.utc)
+                if now - set_at > timedelta(days=1):
+                    continue
+                since = max(set_at, now - timedelta(days=1)).isoformat()
+                used = self._conn.execute(
+                    "SELECT COUNT(*) FROM nexus_initiative_log "
+                    "WHERE decision = 'dispatched' AND detail = ? AND created_at >= ?",
+                    (PROVIDER_EXTRA_PREFIX + provider, since),
+                ).fetchone()[0]
+                if int(row[0]) > int(used):
+                    return provider
+            except (sqlite3.Error, ValueError, TypeError):
+                continue
+        return None
 
     def _spent_today(self) -> int:
         since = (_utcnow() - timedelta(days=1)).isoformat()
@@ -1336,13 +1380,17 @@ class NexusInitiativeService:
             rows = self._conn.execute(
                 "SELECT e.id, e.goal, e.status, e.error, "
                 "a.status AS adoption_status, a.reason AS adoption_reason, "
-                "(SELECT r.verdict FROM reverifications r WHERE r.experiment_id=e.id "
-                " ORDER BY r.id DESC LIMIT 1) AS reverification_verdict "
+                "r.verdict AS reverification_verdict, r.reason AS reverification_reason "
                 "FROM experiments e "
                 "LEFT JOIN experiment_adoptions a ON a.rowid = ("
                 "  SELECT a2.rowid FROM experiment_adoptions a2 "
                 "  WHERE a2.experiment_id = e.id ORDER BY a2.rowid DESC LIMIT 1) "
-                "WHERE e.ended_at IS NOT NULL ORDER BY e.ended_at DESC LIMIT ?",
+                "LEFT JOIN reverifications r ON r.id = ("
+                "  SELECT r2.id FROM reverifications r2 "
+                "  WHERE r2.experiment_id=e.id ORDER BY r2.id DESC LIMIT 1) "
+                "WHERE e.ended_at IS NOT NULL ORDER BY CASE "
+                " WHEN r.verdict IN ('hung_test', 'reverify_timeout') "
+                " THEN MAX(e.ended_at, r.finished_at) ELSE e.ended_at END DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         except sqlite3.OperationalError:
@@ -1350,7 +1398,7 @@ class NexusInitiativeService:
                 rows = self._conn.execute(
                     "SELECT e.id, e.goal, e.status, e.error, "
                     "a.status AS adoption_status, a.reason AS adoption_reason, "
-                    "'' AS reverification_verdict "
+                    "'' AS reverification_verdict, '' AS reverification_reason "
                     "FROM experiments e "
                     "LEFT JOIN experiment_adoptions a ON a.rowid = ("
                     "  SELECT a2.rowid FROM experiment_adoptions a2 "
@@ -1380,6 +1428,7 @@ class NexusInitiativeService:
                 entry["adoption_status"] = str(row["adoption_status"] or "")
                 entry["adoption_reason"] = " ".join(str(row["adoption_reason"] or "").split())[:200]
                 entry["reverification_verdict"] = str(row["reverification_verdict"] or "")
+                entry["reverification_reason"] = str(row["reverification_reason"] or "")
             try:
                 worktree_path = None
                 get_experiment = getattr(self.experiment_service, "get", None)
@@ -1410,34 +1459,11 @@ class NexusInitiativeService:
         if (os.environ.get("NEXUS_REVERIFY_PARKED", "1").strip().lower()
                 in {"0", "false", "off", "no"}):
             return
-        from modules.experiment_service.reverify import (
-            SKIPPED_PREFIX, current_main, parked_candidates, reverify_parked,
-        )
-
-        repo = str(getattr(self.experiment_service, "repo_root", ""))
-        if not repo or self._issue_lister is None:
-            # Without the open-issue list nothing could run anyway.
-            return
-        try:
-            main = current_main(repo)
-            open_numbers = {
-                int(item["number"]) for item in (self._issue_lister() or [])
-                if item.get("number") is not None
-            }
-            runs = 0
-            # Skipped rows (closed issue) do not count, so up to three real runs
-            # happen even when newer parked experiments belong to closed issues.
-            for experiment_id in parked_candidates(self.experiment_service, main, limit=20):
-                outcome = reverify_parked(
-                    experiment_id, service=self.experiment_service,
-                    issue_is_open=lambda number: number in open_numbers, main_sha=main,
-                )
-                if outcome and not str(outcome.get("verdict", "")).startswith(SKIPPED_PREFIX):
-                    runs += 1
-                    if runs >= 3:
-                        break
-        except Exception as exc:  # noqa: BLE001 - maintenance must not stop a tick
-            logger.warning("initiative: parked re-verification failed: %s", exc)
+        if self._reverification_launcher is not None:
+            try:
+                self._reverification_launcher()
+            except Exception as exc:
+                logger.warning("initiative: could not schedule parked re-verification: %s", exc)
 
     def _planned_issue(self, issues: list[Candidate], *, act: bool = True) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).
@@ -1713,9 +1739,8 @@ class NexusInitiativeService:
                     self._record(decision, update=True)
             return decision
 
-        # Re-verification can run tests for several minutes, so only do it after
-        # the busy and stale-service guards. A pass becomes an adoption candidate
-        # below in this same tick; the reviewer is therefore never bypassed.
+        # Hand off maintenance after the busy and stale-service guards.
+        # A completed pass can enter the normal adoption path on a later tick.
         self._reverify_parked()
 
         cooling = self._providers_cooling_down()
@@ -1730,6 +1755,7 @@ class NexusInitiativeService:
                 tick_id=tick_id,
             ))
 
+        extra_provider: str | None = None
         if self.daily_budget and self._spent_today() >= self.daily_budget:
             # Verified work is still adopted, and review findings still go back
             # to the coder, when the budget for new work is used up (#538).
@@ -1739,6 +1765,14 @@ class NexusInitiativeService:
             ]
             if self.controller:
                 found += [c for c in self._issue_candidates() if c.reason == REVIEW_RETRY_REASON]
+            if not found and self.controller:
+                # Provider-specific extra budget (mailbox ``extra_budget_<provider>``):
+                # new work that is pinned to that provider.
+                extra_provider = self._provider_extra_left()
+                if extra_provider is not None:
+                    found = [c for c in self.candidates() if c.kind in (KIND_ISSUE, KIND_IDEA)]
+                    if not found:
+                        extra_provider = None
             if not found:
                 return self._record(
                     InitiativeDecision(
@@ -1814,6 +1848,12 @@ class NexusInitiativeService:
         decision = InitiativeDecision(
             "dispatched", candidate=chosen, considered=found[:10], tick_id=tick_id
         )
+        if extra_provider is not None and chosen.kind in (KIND_ISSUE, KIND_IDEA):
+            # Counted against extra_budget_<provider>; the coding run uses it.
+            from modules.coding_provider import pin_next_provider
+
+            decision.detail = PROVIDER_EXTRA_PREFIX + extra_provider
+            pin_next_provider(extra_provider, db_path=self.db_path)
         # Persist the intent *before* acting, so a crash mid-dispatch leaves a
         # record of what Nexus was trying to do rather than a silent gap.
         self._record(decision)

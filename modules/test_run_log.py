@@ -196,7 +196,7 @@ def prune_test_logs(
         return 0
     removed = 0
     for stale in logs[max(0, keep):]:
-        for path in (stale, stale.with_suffix(".heartbeat.json")):
+        for path in (stale, stale.with_suffix(".heartbeat.json"), stale.with_suffix(".slow-stacks.txt")):
             try:
                 path.unlink(missing_ok=True)
             except OSError:  # pragma: no cover - best effort cleanup

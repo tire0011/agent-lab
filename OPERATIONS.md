@@ -263,6 +263,42 @@ error.
 - GitHub mailbox webhook: `POST /mailbox/webhook/github` — authenticated via `X-Hub-Signature-256`
 - `MailboxTaskWorker` daemon starts at API startup, polls every 10 s for queued tasks to hand to Nexus
 
+### Parked branch re-verification
+
+The initiative tick hands re-verification to the local API service as a
+background job. One parked branch is checked at a time, once per experiment
+and main commit, and the check uses no coding budget. Failed, stalled, and
+timed-out attempts leave the experiment parked.
+
+- `NEXUS_REVERIFY_PARKED=0` disables the tick hand-off.
+- `NEXUS_REVERIFY_URL` sets the hand-off endpoint. The default is
+  `http://127.0.0.1:8000/internal/reverify-parked`. The tick waits at most
+  2 seconds for the `202` response, so an API that does not respond cannot
+  block the tick.
+- `NEXUS_REVERIFY_TIMEOUT_SECONDS` sets the deadline for the whole branch
+  attempt. The default is 2700 seconds (45 minutes). The worker kills the
+  process group and records `reverify_timeout` at the deadline.
+- `NEXUS_REVERIFY_STALL_SECONDS` sets the maximum time without a test start or
+  completion. The default is 600 seconds (10 minutes). A stall stops the tests
+  and records `hung_test` with the active test ID when available.
+
+The tick logs each start-to-start interval and the maximum interval ending in
+the preceding 72 hours. Search the `nexus-tick.service` journal for
+`initiative tick start gap`. A gap of 1200 seconds or more is logged as a warning.
+
+The verification test environment (`build_verification_test_env`) also replaces
+`AGENT_DB_PATH` with a temporary database when the parent sets it, so a suite run
+inside the tick (`python -m unittest discover`, where `tests/conftest.py` does not
+run) can never open or lock the production database. It also points
+`LOCAL_MODEL_URL`, `LLAMA_CPP_BASE_URL` and `LLAMA_API_URL` at the unreachable
+`http://127.0.0.1:9`, as `tests/conftest.py` does. This was the cause of the
+2026-11-19 hang: under unittest discovery a mailbox test's background failure
+analysis sent a real request to llama-server, and `LocalLlmJobService.close()`
+waits for an in-flight job to finish. `MailboxTaskService.close()`
+waits at most `NEXUS_FAILURE_ANALYSIS_CLOSE_GRACE_SECONDS` (default 5) for a running
+failure analysis before abandoning it - a diagnosis stuck on the local LLM or a
+locked database can never wedge the poll process again (#766).
+
 ## Operational checks
 
 1. Verify API liveness via `/health`.
@@ -469,9 +505,19 @@ rate that was never measured. Admission: when the rates leave fewer than
 ends `local_too_slow` with the numbers. The experiment hands over to the paid
 coder as for `context_too_small`, and a shadow replay stores status
 `local_too_slow`. Admission only applies to a measured generation rate (a guess
-never locks the worker out). Because a refused call measures nothing, delete
-the rates file after making the server faster (threads, model), or the old
-measurements keep refusing. Rates files written before #667 may hold
+never locks the worker out). A refused call measures nothing, so before
+refusing the worker may re-probe the rates (#772): one tiny llama-server call
+(fixed ~150-token prompt, 48 output tokens, `cache_prompt` off, fixed seed)
+whose timings replace the rate window. It runs when this would be the
+`NEXUS_RATE_REPROBE_AFTER`-th refusal in a row (default `3`) or the newest
+sample is older than `NEXUS_RATE_MAX_AGE_H` hours (default `12`), and not
+within `NEXUS_RATE_REPROBE_COOLDOWN_MIN` minutes of the last probe (default
+`60`); `0` disables a trigger. Each probe logs `rate_reprobe` (old/new medians,
+admitted or not), and the refusal message ends with
+`[rates: newest sample … h old; …]`. Samples carry UTC `sampled_at`
+timestamps; the refusal counter and `last_probe_at` live in the same rates
+file. Files without timestamps count as old. Deleting the rates file after
+making the server faster still works. Rates files written before #667 may hold
 guessed values among the measured ones; delete the file once after deploying
 #667.
 

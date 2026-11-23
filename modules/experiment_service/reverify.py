@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import sqlite3
@@ -9,6 +10,8 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+from modules.verification_runner import HungTest
 
 from .git_utils import _run_git
 from .models import STATUS_NEEDS_REVIEW, STATUS_SUCCEEDED, STATUS_VERIFYING
@@ -24,7 +27,7 @@ _EVIDENCE_COLUMNS = (
     "failure_type", "baseline_test_classifications_json",
 )
 # Verdicts that did not really run the branch; they do not count toward the
-# per-tick limit, so closed issues can never starve open ones.
+# per-job limit, so closed issues can never starve open ones.
 SKIPPED_PREFIX = "skipped:"
 _ISSUE_RE = re.compile(r"\bGitHub\s+Issue\s+#(\d+)\b", re.IGNORECASE)
 
@@ -107,8 +110,40 @@ def _branch_sha(repo: str, branch: str) -> str | None:
 
 def _record(service: Any, experiment_id: str, issue_number: int | None, main_sha: str,
             branch: str | None, old_sha: str | None, new_sha: str | None,
-            verdict: str, reason: str | None, started: str) -> dict[str, Any]:
+            verdict: str, reason: str | None, started: str,
+            *, publish_evidence: dict[str, Any] | None = None,
+            parked_error: str | None = None,
+            outcome_path: Path | None = None) -> dict[str, Any]:
+    if outcome_path is not None:
+        # A killed attempt cannot publish even a verdict prepared just before
+        # the deadline. The supervisor publishes only after a clean exit.
+        outcome = {
+            "experiment_id": experiment_id, "issue_number": issue_number,
+            "main_sha": main_sha, "branch": branch, "old_sha": old_sha, "new_sha": new_sha,
+            "verdict": verdict, "reason": reason, "started": started,
+            "publish_evidence": publish_evidence, "parked_error": parked_error,
+        }
+        outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+        return outcome
     with service._lock, service._conn:
+        if publish_evidence is not None:
+            assignments = ", ".join(f"{column}=?" for column in _EVIDENCE_COLUMNS)
+            updated = service._conn.execute(
+                f"UPDATE main.experiments SET {assignments} WHERE id=? AND status=? AND error=?",
+                (*(publish_evidence[column] for column in _EVIDENCE_COLUMNS),
+                 experiment_id, STATUS_NEEDS_REVIEW, parked_error),
+            )
+            if not updated.rowcount:
+                verdict = "still_blocked:experiment changed during re-verification"
+                reason = "parked experiment was updated before the verdict could be published"
+        if verdict == "passes_now":
+            try:
+                service._conn.execute(
+                    "UPDATE github_experiment_links SET checkpoint_sha=?, updated_at=? "
+                    "WHERE experiment_id=?", (new_sha, _now(), experiment_id),
+                )
+            except sqlite3.OperationalError:
+                pass
         service._conn.execute(
             """INSERT OR IGNORE INTO reverifications
                (experiment_id, issue_number, main_commit_sha, branch_name,
@@ -159,13 +194,18 @@ def reverify_parked(
     service: Any,
     issue_is_open: Callable[[int], bool] | None = None,
     main_sha: str | None = None,
+    worktree_root: Path | None = None,
+    outcome_path: Path | None = None,
 ) -> dict[str, Any] | None:
     """Rebase and run the normal verifier without calling a coding model.
 
     ``None`` means ineligible or already checked at the current main commit.
     A failed/conflicting rebase is performed in a detached temporary worktree,
     so the published branch remains byte-for-byte untouched.
+    The background worker supplies a private experiment row and owns worktree
+    cleanup, even when the attempt is killed.
     """
+    isolated = outcome_path is not None
     experiment = service.get_experiment(experiment_id)
     if experiment.status != STATUS_NEEDS_REVIEW or not str(experiment.error or "").startswith(
         _ALLOWED_ERROR_PREFIXES
@@ -191,14 +231,15 @@ def reverify_parked(
     if issue_number is None or not issue_is_open(issue_number):
         verdict = f"{SKIPPED_PREFIX}{'no_issue' if issue_number is None else 'issue_closed'}"
         return _record(service, experiment_id, issue_number, main_sha,
-                       experiment.branch_name, None, None, verdict, None, started)
+                       experiment.branch_name, None, None, verdict, None, started,
+                       outcome_path=outcome_path)
     branch = str(experiment.branch_name or "").strip()
     snapshot = _snapshot(service, experiment_id)
     old_sha: str | None = None
     new_sha: str | None = None
     reason: str | None = None
     verdict = "branch_missing"
-    temp_root = Path(tempfile.mkdtemp(prefix="nexus-reverify-"))
+    temp_root = worktree_root or Path(tempfile.mkdtemp(prefix="nexus-reverify-"))
     worktree = temp_root / "worktree"
     added = False
     keep_worktree = False
@@ -232,9 +273,12 @@ def reverify_parked(
                     # Same gate as the original GitHub-tracked run: soft quality
                     # findings go to the reviewer at adoption (#519), not to a
                     # hard needs_review stop.
+                    options = {"abort_on_test_stall": True} if isolated else {}
                     result = service._verify(
-                        experiment_id, str(worktree), soft_findings_to_reviewer=True,
+                        experiment_id, str(worktree), soft_findings_to_reviewer=True, **options,
                     )
+                except HungTest:
+                    raise
                 except Exception as exc:  # a crashed verifier is not a pass
                     reason = f"verification error: {type(exc).__name__}: {str(exc)[:1000]}"
                     verdict = f"still_blocked:{reason}"
@@ -269,17 +313,6 @@ def reverify_parked(
                         # path consumes it; deleting it here would make the
                         # freshly succeeded experiment impossible to adopt.
                         keep_worktree = True
-                        # Adoption and its mandatory review/CI checks must inspect
-                        # the rebased commit, never the stale pre-rebase checkpoint.
-                        try:
-                            with service._lock, service._conn:
-                                service._conn.execute(
-                                    "UPDATE github_experiment_links SET checkpoint_sha=?, updated_at=? "
-                                    "WHERE experiment_id=?",
-                                    (new_sha, _now(), experiment_id),
-                                )
-                        except sqlite3.OperationalError:
-                            pass
                 elif result is not None:
                     reason = str(result.error or f"verification ended {result.status}")
                     verdict = f"still_blocked:{reason}"
@@ -290,6 +323,8 @@ def reverify_parked(
                     service._force_status(
                         experiment_id, STATUS_NEEDS_REVIEW, error=reason, ended_at=_now(),
                     )
+    except HungTest as exc:
+        verdict, reason = "hung_test", str(exc)
     except Exception as exc:  # every attempted run gets a durable verdict
         reason = f"reverification error: {type(exc).__name__}: {str(exc)[:1000]}"
         verdict = f"still_blocked:{reason}"
@@ -299,14 +334,16 @@ def reverify_parked(
                 experiment_id, STATUS_NEEDS_REVIEW, error=reason, ended_at=_now(),
             )
     finally:
-        if added and not keep_worktree:
+        if not isolated and added and not keep_worktree:
             _run_git(["worktree", "remove", "--force", str(worktree)], cwd=repo)
-        if not keep_worktree:
+        if not isolated and not keep_worktree:
             shutil.rmtree(temp_root, ignore_errors=True)
 
-    if verdict != "passes_now":
+    if verdict != "passes_now" and not isolated:
         # Not a pass: the parked run's evidence and error stand unchanged, so
         # the experiment stays eligible and nothing points at a deleted path.
         _restore(service, experiment_id, snapshot)
+    evidence = _snapshot(service, experiment_id) if isolated and keep_worktree else None
     return _record(service, experiment_id, issue_number, main_sha, branch,
-                   old_sha, new_sha, verdict, reason, started)
+                   old_sha, new_sha, verdict, reason, started,
+                   publish_evidence=evidence, parked_error=snapshot.get("error"), outcome_path=outcome_path)

@@ -15,7 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 os.environ.setdefault("AGENT_API_KEY", "test-key")
 
@@ -50,6 +50,14 @@ class PublicUnifiedLogsApiTests(unittest.TestCase):
         api.app.dependency_overrides[api.get_experiment_service] = lambda: self.service
         api.app.dependency_overrides[api.get_codex_service] = lambda: codex
         api.app.dependency_overrides[api.get_mailbox_task_service] = lambda: mailbox
+        # The real LogReader merges the host's systemd journal into this feed.
+        # On the VM that added ~300 real entries (305 != 5), so these tests
+        # failed there with and without clock drift and the timing check had
+        # no verdict for any change touching api.py (#766). Same isolation as
+        # test_unified_logs_api.py.
+        log_reader = MagicMock()
+        log_reader.read_all_journal_entries = AsyncMock(return_value=([], {}))
+        api.app.dependency_overrides[api.get_log_reader] = lambda: log_reader
         self.client = TestClient(api.app)
         self.addCleanup(api.app.dependency_overrides.clear)
 

@@ -27,6 +27,15 @@ Speculative decoding (#669): when llama-server runs with a draft model its
 :meth:`LocalModelRates.record` keeps in its own rolling window
 (:meth:`LocalModelRates.draft_acceptance`). Without them nothing changes.
 
+Sample age and re-probe state (#772): every stored sample batch gets a UTC
+timestamp in the parallel list ``sampled_at`` (:meth:`LocalModelRates.newest_sample_age`).
+Admission refusals are counted (:meth:`LocalModelRates.record_refusal`,
+:meth:`LocalModelRates.consecutive_refusals`) and the last rate re-probe is kept
+(:meth:`LocalModelRates.record_probe_attempt`); a refused call never measures
+anything, so without them a slow median could never change again. Any stored
+sample resets the refusal counter. Files written before #772 have none of these
+keys; their samples count as of unknown, i.e. old, age.
+
 Failure behaviour: a missing, unreadable, corrupt or half-written file reads
 as "no measurements yet", which leaves prompts untouched; a failed write is
 dropped. Writes go to a unique temporary file that is atomically renamed, so a
@@ -42,6 +51,7 @@ import math
 import os
 import statistics
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +67,10 @@ _ESTIMATED = {key: f"estimated_{key}" for key in _KEYS}
 _DRAFT_KEY = "draft_acceptance_rate"
 _ALL_KEYS = (*_KEYS, *_ESTIMATED.values(), _DRAFT_KEY)
 _DEFAULT_DB_PATH = "/var/lib/nexus/agent.db"
+# #772: per-model state next to the rolling samples.
+_SAMPLED_AT = "sampled_at"
+_REFUSALS = "consecutive_refusals"
+_LAST_PROBE = "last_probe_at"
 
 
 def default_rates_path() -> Path:
@@ -77,6 +91,22 @@ def _valid_sample(key: str, value: Any) -> bool:
 def _valid_rate(value: Any) -> bool:
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value > 0)
+
+
+def _utc(now: datetime | None) -> datetime:
+    if now is None:
+        return datetime.now(timezone.utc)
+    return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+
+
+def _parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def draft_from_timings(timings: dict[str, Any] | None) -> dict[str, float | int]:
@@ -120,7 +150,7 @@ class LocalModelRates:
         self.path = Path(path) if path else default_rates_path()
         self.model = str(model or "default")
 
-    def _read_all(self) -> dict[str, dict[str, list[float]]]:
+    def _read_all(self) -> dict[str, dict[str, Any]]:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError, TypeError):
@@ -128,19 +158,31 @@ class LocalModelRates:
         models = data.get("models") if isinstance(data, dict) else None
         if not isinstance(models, dict):
             return {}
-        result: dict[str, dict[str, list[float]]] = {}
+        result: dict[str, dict[str, Any]] = {}
         for name, entry in models.items():
             if not isinstance(entry, dict):
                 continue
-            result[str(name)] = {
+            parsed: dict[str, Any] = {
                 key: [float(v) for v in entry.get(key, []) if _valid_sample(key, v)]
                 if isinstance(entry.get(key), list) else []
                 for key in _ALL_KEYS
             }
+            stamps = entry.get(_SAMPLED_AT)
+            parsed[_SAMPLED_AT] = ([v for v in stamps if _parse_time(v) is not None]
+                                   if isinstance(stamps, list) else [])
+            refusals = entry.get(_REFUSALS)
+            parsed[_REFUSALS] = (refusals if isinstance(refusals, int)
+                                 and not isinstance(refusals, bool) and refusals > 0 else 0)
+            probe = entry.get(_LAST_PROBE)
+            parsed[_LAST_PROBE] = probe if _parse_time(probe) is not None else None
+            result[str(name)] = parsed
         return result
 
-    def _samples(self) -> dict[str, list[float]]:
-        return self._read_all().get(self.model) or {key: [] for key in _ALL_KEYS}
+    def _empty(self) -> dict[str, Any]:
+        return {**{key: [] for key in _ALL_KEYS}, _SAMPLED_AT: [], _REFUSALS: 0, _LAST_PROBE: None}
+
+    def _samples(self) -> dict[str, Any]:
+        return self._read_all().get(self.model) or self._empty()
 
     def medians(self) -> tuple[float | None, float | None]:
         """``(prompt tokens/s, generation tokens/s)``; ``None`` where nothing is known.
@@ -163,11 +205,16 @@ class LocalModelRates:
         """Whether the generation rate comes from real timings, not a guess."""
         return bool(self._samples().get("generation_tokens_per_second"))
 
-    def record(self, timings: dict[str, Any] | None) -> bool:
+    def record(self, timings: dict[str, Any] | None, *, replace: bool = False) -> bool:
         """Add one call's rates; ``True`` if something was stored. Never raises.
 
         With speculative decoding the call's draft acceptance rate is stored
         with them (#669); it alone does not count as a stored measurement.
+
+        *replace* (#772, the rate re-probe) first drops the stored prompt and
+        generation samples, measured and estimated: the probe only runs when
+        that window is suspect (stale or refusing every call), and a single
+        sample could never move its median. Real calls rebuild the window.
         """
         try:
             samples: dict[str, float] = rates_from_timings(timings)
@@ -176,7 +223,7 @@ class LocalModelRates:
             draft = draft_from_timings(timings)
             if draft:
                 samples[_DRAFT_KEY] = float(draft["draft_acceptance_rate"])
-            self._append(samples)
+            self._append(samples, replace=replace)
             return True
         except Exception:  # measuring must never fail a model call
             logger.warning("could not record local model rates in %s", self.path, exc_info=True)
@@ -249,13 +296,78 @@ class LocalModelRates:
                            exc_info=True)
             return False
 
-    def _append(self, samples: dict[str, float]) -> None:
+    # Sample age, refusals and re-probes (#772)
+
+    def newest_sample_age(self, now: datetime | None = None) -> float | None:
+        """Seconds since the newest stored rate sample.
+
+        ``None`` without any rate sample; ``math.inf`` when samples exist but
+        carry no timestamp (a file written before #772), so they count as old.
+        """
+        samples = self._samples()
+        if not any(samples.get(key) for key in (*_KEYS, *_ESTIMATED.values())):
+            return None
+        stamps = [t for t in (_parse_time(v) for v in samples.get(_SAMPLED_AT) or []) if t]
+        if not stamps:
+            return math.inf
+        return max(0.0, (_utc(now) - max(stamps)).total_seconds())
+
+    def consecutive_refusals(self) -> int:
+        """Admission refusals since the last stored sample."""
+        return int(self._samples().get(_REFUSALS) or 0)
+
+    def record_refusal(self) -> int:
+        """Count one admission refusal; the new count (0 if it could not be stored)."""
+        try:
+            def change(entry: dict[str, Any]) -> None:
+                entry[_REFUSALS] = int(entry.get(_REFUSALS) or 0) + 1
+            return int(self._update(change).get(_REFUSALS) or 0)
+        except Exception:
+            logger.warning("could not record a local admission refusal in %s", self.path,
+                           exc_info=True)
+            return 0
+
+    def seconds_since_probe(self, now: datetime | None = None) -> float | None:
+        """Seconds since the last rate re-probe started; ``None`` if there was none."""
+        probe = _parse_time(self._samples().get(_LAST_PROBE))
+        if probe is None:
+            return None
+        return max(0.0, (_utc(now) - probe).total_seconds())
+
+    def record_probe_attempt(self, now: datetime | None = None) -> bool:
+        """Remember that a re-probe starts now (the cooldown runs from here)."""
+        try:
+            stamp = _utc(now).isoformat()
+
+            def change(entry: dict[str, Any]) -> None:
+                entry[_LAST_PROBE] = stamp
+            self._update(change)
+            return True
+        except Exception:
+            logger.warning("could not record a local rate probe in %s", self.path, exc_info=True)
+            return False
+
+    def _update(self, change: Any) -> dict[str, Any]:
         models = self._read_all()
-        entry = models.get(self.model) or {key: [] for key in _ALL_KEYS}
-        for key, sample in samples.items():
-            entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
+        entry = models.get(self.model) or self._empty()
+        change(entry)
         models[self.model] = entry
         self._write({"models": models})
+        return entry
+
+    def _append(self, samples: dict[str, float], now: datetime | None = None, *,
+                replace: bool = False) -> None:
+        stamp = _utc(now).isoformat()
+
+        def change(entry: dict[str, Any]) -> None:
+            if replace:
+                for key in (*_KEYS, *_ESTIMATED.values(), _SAMPLED_AT):
+                    entry[key] = []
+            for key, sample in samples.items():
+                entry[key] = [*entry.get(key, []), sample][-MAX_SAMPLES:]
+            entry[_SAMPLED_AT] = [*entry.get(_SAMPLED_AT, []), stamp][-MAX_SAMPLES:]
+            entry[_REFUSALS] = 0  # a real call measured something
+        self._update(change)
 
     def _write(self, data: dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -135,7 +135,13 @@ def _diagnostic(outcome: str, error: str) -> str:
     return ""
 
 
+# #772: the bounded rate-age / re-probe suffix of a local_too_slow refusal. It
+# varies between rows of the same stuck streak, so it is not compared.
+_REPROBE_SUFFIX = re.compile(r"\s*\[rates: [^\]]*\]\s*$")
+
+
 def _normalize(reason: str) -> str:
+    reason = _REPROBE_SUFFIX.sub("", reason)
     return " ".join(_NUMBERS.sub("", reason).casefold().split())
 
 
