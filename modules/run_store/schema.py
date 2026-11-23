@@ -107,6 +107,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             PRIMARY KEY (reason, reply_key)
         );
 
+        CREATE TABLE IF NOT EXISTS home_gpu_reply_receipts (
+            job_id TEXT PRIMARY KEY NOT NULL REFERENCES home_gpu_jobs(job_id),
+            filename TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS model_prices (
             provider TEXT NOT NULL,
             model TEXT NOT NULL,

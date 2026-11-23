@@ -106,9 +106,22 @@ def collect_replies(
             if updated:
                 answers.mkdir(parents=True, exist_ok=True)
                 _atomic_write(answer_path, answer)
+                db.execute(
+                    "INSERT INTO home_gpu_reply_receipts (job_id, filename) VALUES (?, ?)",
+                    (job_id, path.name),
+                )
         if updated:
             collected += 1
             continue
-        known = db.execute("SELECT 1 FROM home_gpu_jobs WHERE job_id = ?", (job_id,)).fetchone()
-        _ignore(db, "job is no longer queued" if known else "unknown job", job_id)
+        job = db.execute(
+            """SELECT receipts.filename
+               FROM home_gpu_jobs AS jobs
+               LEFT JOIN home_gpu_reply_receipts AS receipts USING (job_id)
+               WHERE jobs.job_id = ?""",
+            (job_id,),
+        ).fetchone()
+        if job is None:
+            _ignore(db, "unknown job", job_id)
+        elif job[0] != path.name:
+            _ignore(db, "job is no longer queued", job_id)
     return collected

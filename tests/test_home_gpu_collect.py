@@ -57,6 +57,8 @@ def test_collects_answer_and_leaves_job_unchanged_on_duplicate(queued, caplog):
         path = Path(row[8])
         assert path.is_relative_to(db_path.parent)
         assert path.read_bytes() == answer.encode()
+        assert collect_replies(mailbox, db) == 0
+        assert "job is no longer queued" not in caplog.text
         (mailbox / "outbox" / "copy.md").write_text(reply, encoding="utf-8")
         assert collect_replies(mailbox, db) == 0
         assert db.execute("SELECT answer_path, answered_at FROM home_gpu_jobs").fetchone() == (str(path), row[6])
@@ -89,6 +91,24 @@ def test_accepts_mailbox_client_filename_correlation(queued):
     mailbox, db_path, job = queued
     (mailbox / "outbox" / "reply.md").write_text(_reply(f"{job.job_id}.md"), encoding="utf-8")
     with closing(init_db(db_path)) as db:
+        assert collect_replies(mailbox, db) == 1
+
+
+def test_failed_answer_write_leaves_job_queued_for_retry(queued, monkeypatch):
+    from modules.home_gpu import collect
+
+    mailbox, db_path, job = queued
+    (mailbox / "outbox" / "reply.md").write_text(_reply(job.job_id), encoding="utf-8")
+
+    def fail_write(path, answer):
+        raise OSError("answer write failed")
+
+    with closing(init_db(db_path)) as db:
+        with monkeypatch.context() as patch:
+            patch.setattr(collect, "_atomic_write", fail_write)
+            with pytest.raises(OSError, match="answer write failed"):
+                collect_replies(mailbox, db)
+        assert db.execute("SELECT status, answer_path FROM home_gpu_jobs").fetchone() == ("queued", None)
         assert collect_replies(mailbox, db) == 1
 
 
