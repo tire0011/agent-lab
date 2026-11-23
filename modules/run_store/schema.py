@@ -378,6 +378,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_home_gpu_jobs(conn)
     conn.commit()
     return conn
 
@@ -1200,3 +1201,41 @@ def _widen_local_replays_status_check(conn: sqlite3.Connection) -> None:
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def _migrate_home_gpu_jobs(conn: sqlite3.Connection) -> None:
+    """Create home_gpu_jobs (#812): one row per home-GPU batch job.
+
+    ``submit_job`` (#759) inserts a ``queued`` row only after the inbox file
+    is committed to the mailbox repository, so a failed publication never
+    leaves a row behind. The answer columns (``answered_at`` ... ``host``)
+    stay NULL until the home GPU's reply is collected (#774). ``status`` has
+    no CHECK constraint on purpose: later parts widen the status list, and
+    SQLite cannot alter a CHECK, so a list here would force a table rebuild.
+    """
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS home_gpu_jobs (
+            job_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            submitted_at TEXT NOT NULL,
+            deadline TEXT NOT NULL,
+            answered_at TEXT NULL,
+            model TEXT NULL,
+            prompt_tokens INTEGER NULL,
+            completion_tokens INTEGER NULL,
+            seconds REAL NULL,
+            input_sha256 TEXT NOT NULL,
+            answer_sha256 TEXT NULL,
+            answer_path TEXT NULL,
+            host TEXT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_status
+            ON home_gpu_jobs(status);
+
+        CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_submitted_at
+            ON home_gpu_jobs(submitted_at DESC);
+        """
+    )

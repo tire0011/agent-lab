@@ -38,6 +38,58 @@ class RunStoreTests(unittest.TestCase):
         self.assertIn("model_prices", tables)
         self.assertIn("tool_calls", tables)
         self.assertIn("knowledge", tables)
+        self.assertIn("home_gpu_jobs", tables)
+
+    def test_home_gpu_jobs_table_columns_and_defaults(self):
+        conn = self._init_db()
+
+        columns = {
+            row[1]: row[2]
+            for row in conn.execute("PRAGMA table_info(home_gpu_jobs)").fetchall()
+        }
+        self.assertEqual(columns, {
+            "job_id": "TEXT",
+            "kind": "TEXT",
+            "status": "TEXT",
+            "submitted_at": "TEXT",
+            "deadline": "TEXT",
+            "answered_at": "TEXT",
+            "model": "TEXT",
+            "prompt_tokens": "INTEGER",
+            "completion_tokens": "INTEGER",
+            "seconds": "REAL",
+            "input_sha256": "TEXT",
+            "answer_sha256": "TEXT",
+            "answer_path": "TEXT",
+            "host": "TEXT",
+        })
+        pk = [row[1] for row in conn.execute("PRAGMA table_info(home_gpu_jobs)") if row[5]]
+        self.assertEqual(pk, ["job_id"])
+
+        run_store.insert_home_gpu_job(
+            conn,
+            job_id="hg-test-1",
+            kind="chat_completion",
+            submitted_at="2026-11-23T12:00:00Z",
+            deadline="2026-11-23T18:00:00Z",
+            input_sha256="abc123",
+        )
+        row = conn.execute(
+            "SELECT kind, status, submitted_at, deadline, input_sha256, answered_at,"
+            " model, prompt_tokens, completion_tokens, seconds, answer_sha256,"
+            " answer_path, host FROM home_gpu_jobs WHERE job_id = 'hg-test-1'"
+        ).fetchone()
+        self.assertEqual(
+            row,
+            ("chat_completion", "queued", "2026-11-23T12:00:00Z", "2026-11-23T18:00:00Z",
+             "abc123", None, None, None, None, None, None, None, None),
+        )
+
+        # init_db is idempotent: re-opening keeps the table and its rows.
+        conn2 = self._init_db()
+        self.assertEqual(
+            conn2.execute("SELECT count(*) FROM home_gpu_jobs").fetchone()[0], 1
+        )
 
     def test_storing_run_persists_row(self):
         conn = self._init_db()

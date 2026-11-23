@@ -1,7 +1,7 @@
 """SQLite run-store public API and backwards-compatible package façade.
 
 Schema creation and additive migrations live in :mod:`.schema`; run, price,
-activity, and settings helpers live in :mod:`.records`.
+activity, settings, and home-GPU job helpers live in :mod:`.records`.
 """
 
 from __future__ import annotations
@@ -11,13 +11,17 @@ import sqlite3
 
 from . import schema as _schema
 from .records import (
+    HOME_GPU_JOB_COLUMNS,
     calculate_estimated_cost,
     get_applicable_price,
+    get_home_gpu_job,
     get_setting,
     insert_activity,
+    insert_home_gpu_job,
     insert_run,
     insert_tool_calls,
     list_activity,
+    list_home_gpu_jobs,
     list_local_localizations,
     set_setting,
     upsert_local_localization,
@@ -57,15 +61,19 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
 __all__ = [
     "DEFAULT_DB_PATH",
     "LEGACY_DB_PATH",
+    "HOME_GPU_JOB_COLUMNS",
     "_connect",
     "calculate_estimated_cost",
     "get_applicable_price",
+    "get_home_gpu_job",
     "get_setting",
     "init_db",
     "insert_activity",
+    "insert_home_gpu_job",
     "insert_run",
     "insert_tool_calls",
     "list_activity",
+    "list_home_gpu_jobs",
     "list_local_localizations",
     "set_setting",
     "upsert_local_localization",

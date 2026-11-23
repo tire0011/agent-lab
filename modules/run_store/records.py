@@ -297,3 +297,71 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str, *, updated_at: s
         (key, value, updated_at),
     )
     conn.commit()
+
+
+def insert_home_gpu_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    kind: str,
+    submitted_at: str,
+    deadline: str,
+    input_sha256: str,
+    status: str = "queued",
+) -> None:
+    """Record one home-GPU batch job (#812).
+
+    ``submit_job`` calls this only after the inbox file is committed to the
+    mailbox repository, so a row always has a published file behind it; the
+    answer columns stay NULL until the reply is collected (#774).
+    """
+    conn.execute(
+        """
+        INSERT INTO home_gpu_jobs (
+            job_id, kind, status, submitted_at, deadline, input_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (job_id, kind, status, submitted_at, deadline, input_sha256),
+    )
+    conn.commit()
+
+
+#: Column order of a ``home_gpu_jobs`` row, as returned by ``get_home_gpu_job``.
+HOME_GPU_JOB_COLUMNS = (
+    "job_id",
+    "kind",
+    "status",
+    "submitted_at",
+    "deadline",
+    "answered_at",
+    "model",
+    "prompt_tokens",
+    "completion_tokens",
+    "seconds",
+    "input_sha256",
+    "answer_sha256",
+    "answer_path",
+    "host",
+)
+
+
+def get_home_gpu_job(conn: sqlite3.Connection, job_id: str) -> dict[str, Any] | None:
+    """Return the ``home_gpu_jobs`` row for *job_id* as a dict, or None (#812)."""
+    row = conn.execute(
+        f"SELECT {', '.join(HOME_GPU_JOB_COLUMNS)} FROM home_gpu_jobs WHERE job_id = ?",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return dict(zip(HOME_GPU_JOB_COLUMNS, row))
+
+
+def list_home_gpu_jobs(conn: sqlite3.Connection, *, status: str | None = None) -> list[dict[str, Any]]:
+    """List ``home_gpu_jobs`` rows, newest submission first (#812)."""
+    query = f"SELECT {', '.join(HOME_GPU_JOB_COLUMNS)} FROM home_gpu_jobs"
+    params: tuple = ()
+    if status is not None:
+        query += " WHERE status = ?"
+        params = (status,)
+    query += " ORDER BY submitted_at DESC, job_id DESC"
+    return [dict(zip(HOME_GPU_JOB_COLUMNS, row)) for row in conn.execute(query, params)]
