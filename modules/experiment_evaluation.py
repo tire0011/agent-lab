@@ -194,6 +194,26 @@ def goal_names_only_test_paths(goal: str) -> bool:
     )
 
 
+def original_task_text(goal: str) -> str:
+    """Return the goal without appended handover / earlier-attempts sections.
+
+    A retry goal appends the previous failure or review reason (#374), and
+    that reason can quote nothing but ``tests/...::...`` ids (a timing-check
+    or failing-test list). Paths inside such an appended section must never
+    count as "the task names only test paths" (#792), so the tests_only
+    decision in :func:`validate_plan` and :func:`evaluate_implementation`
+    matches this text (or an explicitly passed ``issue_text``) only.
+    """
+    from modules.experiment_handover import (
+        EARLIER_ATTEMPTS_HEADING, HANDOVER_HEADING, MODEL_WRITTEN_TESTS_HEADING,
+    )
+
+    task = goal or ""
+    for heading in (HANDOVER_HEADING, EARLIER_ATTEMPTS_HEADING, MODEL_WRITTEN_TESTS_HEADING):
+        task = task.split(heading, 1)[0]
+    return task
+
+
 class PlanLike:
     """Backward-compatible read-only view over a plan object or stored dict."""
 
@@ -232,9 +252,16 @@ class PlanLike:
         return non_test
 
 
-def validate_plan(plan: Any, goal: str) -> str | None:
-    """Return a deterministic pre-implementation rejection reason, if any."""
+def validate_plan(plan: Any, goal: str, issue_text: str | None = None) -> str | None:
+    """Return a deterministic pre-implementation rejection reason, if any.
+
+    ``issue_text`` is the original task text; when it is not passed, it is
+    derived from ``goal`` by stripping appended handover/earlier-attempts
+    sections, so paths quoted in a prior-failure reason never justify a
+    tests_only plan (#792).
+    """
     p = PlanLike.from_any(plan)
+    task = issue_text if issue_text is not None else original_task_text(goal)
 
     if p.change_kind not in VALID_CHANGE_KINDS:
         return f"plan declares an unknown change_kind {p.change_kind!r}"
@@ -247,7 +274,7 @@ def validate_plan(plan: Any, goal: str) -> str | None:
                 "plan declares change_kind='tests_only' but affected_files names "
                 f"non-test file(s): {non_test_affected!r}"
             )
-        if not (goal_is_explicit_tests_only(goal) or goal_names_only_test_paths(goal)):
+        if not (goal_is_explicit_tests_only(task) or goal_names_only_test_paths(task)):
             return (
                 "plan declares change_kind='tests_only' but the original task did "
                 "not explicitly request a tests-only change or name only test paths"
@@ -349,17 +376,26 @@ def evaluate_implementation(
     goal: str,
     changed: ChangedFiles,
     worktree_path: str | None,
+    issue_text: str | None = None,
 ) -> EvaluationResult:
-    """Evaluate an implementation after tests pass; never promote failed tests."""
+    """Evaluate an implementation after tests pass; never promote failed tests.
+
+    ``issue_text`` is the original task text; when it is not passed, it is
+    derived from ``goal`` by stripping appended handover/earlier-attempts
+    sections. The tests_only relaxation is decided from that text only, so
+    test ids quoted in an appended prior-failure/review reason can never
+    turn an implementation issue into a tests_only plan (#792).
+    """
     p = PlanLike.from_any(plan)
     all_changed = changed.all_paths()
     test_changed, non_test_changed = split_test_and_non_test(all_changed)
+    task = issue_text if issue_text is not None else original_task_text(goal)
     # The planner may list production files it only had to read for a tests-only task (#493).
     affected_files_are_tests_only = (
         bool(p.affected_files) and all(is_test_path(path) for path in p.affected_files)
     )
-    explicit_tests_only = goal_is_explicit_tests_only(goal)
-    goal_allows_tests_only = explicit_tests_only or goal_names_only_test_paths(goal)
+    explicit_tests_only = goal_is_explicit_tests_only(task)
+    goal_allows_tests_only = explicit_tests_only or goal_names_only_test_paths(task)
     only_tests_changed = bool(test_changed) and not non_test_changed
     if p.change_kind == DEFAULT_CHANGE_KIND and (
         ((plan is None or affected_files_are_tests_only) and goal_allows_tests_only)
