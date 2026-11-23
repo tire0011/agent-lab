@@ -492,7 +492,9 @@ class IssuePlanner:
         self,
         complete: Callable[[str], str],
         explore: Callable[[str], str] | None = None,
-        shadow: Callable[[str, float], str] | None = None,
+        # #798: the shadow callable also receives the allowed issue numbers
+        # (prompt, timeout, allowed) so it can pin them in its json_schema enum.
+        shadow: Callable[[str, float, set[int]], str] | None = None,
         *,
         db_path: str | None = None,
         rates: Any = None,
@@ -590,7 +592,9 @@ class IssuePlanner:
 
             def call() -> None:
                 try:
-                    result.append(self._shadow(prompt, timeout))
+                    # #798: allowed travels with the prompt so the callable can
+                    # build its response_format enum from it.
+                    result.append(self._shadow(prompt, timeout, allowed))
                 except BaseException as exc:  # noqa: BLE001 - recorded, never propagated
                     failure.append(exc)
 
@@ -607,6 +611,9 @@ class IssuePlanner:
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
+                # #798: kept even though the shadow's json_schema enum now
+                # constrains the wire format - the monitor still validates
+                # independently, each failure with its own error string.
                 data = _json_object(result[0] if result else "")
                 if data is None:
                     error = "invalid JSON"

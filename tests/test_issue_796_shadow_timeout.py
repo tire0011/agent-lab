@@ -6,10 +6,10 @@ while the monitor joined on its own fixed timeout. Now the pure function
 :func:`modules.nexus_planner.shadow_timeout_seconds` computes one T from the
 measured LocalModelRates medians (``prompt_tokens/prompt_tps + 120/gen_tps + 10``,
 capped at 240 s, fallback 120 s without samples), the monitor passes T to the
-shadow callable (``shadow(prompt, timeout)``) whose client is built with
+shadow callable (``shadow(prompt, timeout, allowed)``) whose client is built with
 ``timeout=T``, and the monitor joins the worker on T+5 so the request can never
 outlive the monitor. The clock starts after ``worker.start()``. No schema or DB
-changes.
+changes (#798 later adds the allowed-set enum and the reason maxLength).
 """
 
 import inspect
@@ -123,7 +123,7 @@ class ShadowMonitorTimeoutTests(unittest.TestCase):
         rates = FakeRates((50.0, 5.0))
         received = []
 
-        def fake_shadow(prompt, timeout):
+        def fake_shadow(prompt, timeout, allowed):
             received.append((prompt, timeout))
             return '{"issue": 1, "reason": "local"}'
 
@@ -151,7 +151,7 @@ class ShadowMonitorTimeoutTests(unittest.TestCase):
         received = []
         with patch.object(nexus_planner, "shadow_timeout_seconds", lambda pt, r: t), \
                 patch.object(nexus_planner, "SHADOW_MONITOR_GRACE_SECONDS", grace):
-            def slow(prompt, timeout):
+            def slow(prompt, timeout, allowed):
                 received.append(timeout)
                 time.sleep(1.0)
                 return "{}"
@@ -181,7 +181,7 @@ class ShadowMonitorTimeoutTests(unittest.TestCase):
         source = inspect.getsource(nexus_planner.IssuePlanner._start_shadow)
         self.assertIn("worker.join(join_timeout)", source)
         self.assertIn("join_timeout = timeout + SHADOW_MONITOR_GRACE_SECONDS", source)
-        self.assertIn("self._shadow(prompt, timeout)", source)
+        self.assertIn("self._shadow(prompt, timeout, allowed)", source)
         # The clock starts after worker.start(), not before it.
         self.assertLess(source.index("worker.start()"),
                         source.index("started = time.monotonic()"))
@@ -207,6 +207,7 @@ class NexusTickShadowWiringTests(unittest.TestCase):
             async def chat_completion(self, messages, max_tokens=1024, **kwargs):
                 captured["messages"] = messages
                 captured["max_tokens"] = max_tokens
+                captured["response_format"] = kwargs.get("response_format")
                 return {"choices": [{"message": {"content": '{"issue": 1, "reason": "x"}'}}]}
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -214,13 +215,16 @@ class NexusTickShadowWiringTests(unittest.TestCase):
             planner = nexus_tick._planner(tmp, db_path=str(Path(tmp) / "agent.db"))
             shadow = planner._shadow
             self.assertIsNotNone(shadow)
-            result = shadow("the compact prompt", 123.0)
+            result = shadow("the compact prompt", 123.0, {1, 2})
         self.assertEqual(result, '{"issue": 1, "reason": "x"}')
         # LlamaCppClient(timeout=T, stream=False) with the same T the monitor used.
         self.assertEqual(captured["timeout"], 123.0)
         self.assertIs(captured["stream"], False)
         self.assertEqual(captured["messages"], [{"role": "user", "content": "the compact prompt"}])
         self.assertEqual(captured["max_tokens"], 120)
+        # #798: the schema's issue enum is the allowed set that was passed in.
+        schema = captured["response_format"]["json_schema"]["schema"]
+        self.assertEqual(schema["properties"]["issue"]["enum"], [1, 2])
 
     def test_planner_gets_rates_for_the_shadow_clients_model(self):
         import nexus_tick
