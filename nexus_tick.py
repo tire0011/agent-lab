@@ -321,7 +321,7 @@ def _planner(repo_root: str, db_path: str | None = None):
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
     from modules.local_model_rates import LocalModelRates
 
-    def shadow(prompt: str, timeout: float) -> str:
+    def shadow(prompt: str, timeout: float, allowed: set[int]) -> str:
         # #796: the same rate-based timeout T that the monitor joins on bounds
         # this request, so the request can never outlive the monitor.
         client = LlamaCppClient(timeout=timeout, stream=False)
@@ -329,8 +329,12 @@ def _planner(repo_root: str, db_path: str | None = None):
             [{"role": "user", "content": prompt}], max_tokens=120,
             response_format=json_schema_response_format(
                 "planner_shadow",
+                # #798: the enum pins the answer to the allowed issue numbers
+                # and maxLength caps the reason, so the wire schema rejects
+                # anything else before the monitor ever has to.
                 {"type": "object", "properties": {
-                    "issue": {"type": "integer"}, "reason": {"type": "string"}},
+                    "issue": {"type": "integer", "enum": sorted(allowed)},
+                    "reason": {"type": "string", "maxLength": 160}},
                  "required": ["issue", "reason"], "additionalProperties": False},
             ),
         ))

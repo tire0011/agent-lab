@@ -40,7 +40,7 @@ class PlannerShadowTests(unittest.TestCase):
         return IssuePlanner(lambda _: PAID, shadow=shadow, db_path=self.db)
 
     def test_shadow_never_changes_paid_choice_and_writes_row(self):
-        choice = self.planner(lambda prompt, timeout: '{"issue": 1, "reason": "local"}').choose(
+        choice = self.planner(lambda prompt, timeout, allowed: '{"issue": 1, "reason": "local"}').choose(
             ISSUES, tick_id="tick-a")
         self.assertEqual(choice.issue, 2)
         row = self.wait_for_row()
@@ -50,14 +50,14 @@ class PlannerShadowTests(unittest.TestCase):
         self.assertGreater(row["prompt_tokens"], 0)
 
     def test_outside_allowed_is_invalid(self):
-        self.planner(lambda prompt, timeout: '{"issue": 99, "reason": "local"}').choose(ISSUES)
+        self.planner(lambda prompt, timeout, allowed: '{"issue": 99, "reason": "local"}').choose(ISSUES)
         row = self.wait_for_row()
         self.assertEqual(row["local_issue"], 99)
         self.assertEqual(row["local_valid"], 0)
         self.assertIn("not allowed", row["error"])
 
     def test_exception_and_timeout_are_recorded_without_blocking(self):
-        def broken(prompt, timeout):
+        def broken(prompt, timeout, allowed):
             raise RuntimeError("offline")
 
         started = time.monotonic()
@@ -73,7 +73,7 @@ class PlannerShadowTests(unittest.TestCase):
         with patch.object(nexus_planner, "shadow_timeout_seconds", lambda pt, r: t), \
                 patch.object(nexus_planner, "SHADOW_MONITOR_GRACE_SECONDS", 0.01):
             slow = IssuePlanner(lambda _: PAID,
-                                shadow=lambda prompt, timeout: time.sleep(0.5) or "{}",
+                                shadow=lambda prompt, timeout, allowed: time.sleep(0.5) or "{}",
                                 db_path=other_db)
             self.db = other_db
             self.assertEqual(slow.choose(ISSUES).issue, 2)
@@ -112,7 +112,7 @@ class PlannerShadowTests(unittest.TestCase):
     def test_zero_disables_shadow_call(self):
         called = []
         with patch.dict(os.environ, {"NEXUS_PLANNER_SHADOW": "0"}):
-            choice = self.planner(lambda prompt, timeout: called.append(prompt) or "{}").choose(ISSUES)
+            choice = self.planner(lambda prompt, timeout, allowed: called.append(prompt) or "{}").choose(ISSUES)
         self.assertEqual(choice.issue, 2)
         time.sleep(.03)
         self.assertEqual(called, [])
