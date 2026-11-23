@@ -167,6 +167,11 @@ class Experiment:
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     baseline_test_classifications: dict[str, str] | None = None
+    # Free resume of an interrupted run whose paid implementation finished (#783):
+    # resume_pending=1 while the nexus tick has not picked it up yet; resume_count
+    # caps the resumes at one per experiment.
+    resume_pending: int = 0
+    resume_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +232,8 @@ class Experiment:
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
             "baseline_test_classifications": self.baseline_test_classifications,
+            "resume_pending": self.resume_pending,
+            "resume_count": self.resume_count,
         }
 
 
@@ -302,6 +309,12 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         baseline_test_classifications=(
             _json_or_none(row["baseline_test_classifications_json"])
             if "baseline_test_classifications_json" in row.keys() else None
+        ),
+        resume_pending=(
+            int(row["resume_pending"] or 0) if "resume_pending" in row.keys() else 0
+        ),
+        resume_count=(
+            int(row["resume_count"] or 0) if "resume_count" in row.keys() else 0
         ),
     )
 

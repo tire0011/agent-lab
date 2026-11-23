@@ -25,6 +25,7 @@ from modules.coding_provider import (
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
 
+from ..git_utils import _run_git
 from ..models import (
     Experiment,
     ExperimentAlreadyActiveError,
@@ -890,21 +891,68 @@ class RecordsMixin:
         )
 
 
+    def _has_finished_implementation_work(self, row: sqlite3.Row) -> bool:
+        """Whether an interrupted row's paid implementation finished and left work (#783).
+
+        True when ``implementation_ended_at`` is set, the worktree still exists, and the
+        worktree holds real work: the branch has at least one commit ahead of its base
+        commit, or there is an uncommitted diff. Any git failure counts as "no work" -
+        a resumable verdict is never guessed.
+        """
+        if not row["implementation_ended_at"]:
+            return False
+        worktree = str(row["worktree_path"] or "").strip()
+        if not worktree or not Path(worktree).is_dir():
+            return False
+        try:
+            base = str(row["base_commit_sha"] or "").strip()
+            if base:
+                ahead = _run_git(
+                    ["rev-list", "--count", f"{base}..HEAD"], cwd=worktree, timeout=30,
+                )
+                if ahead.returncode == 0:
+                    try:
+                        if int(ahead.stdout.strip() or "0") >= 1:
+                            return True
+                    except ValueError:
+                        pass
+            status = _run_git(
+                ["status", "--porcelain", "--untracked-files=all"], cwd=worktree, timeout=30,
+            )
+            if status.returncode == 0 and status.stdout.strip():
+                return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.warning(
+                "experiment %s: could not inspect worktree %s for a resume: %s",
+                row["id"], worktree, exc,
+            )
+        return False
+
+
     def mark_interrupted_experiments_failed(self) -> list[str]:
-        """Reconcile experiments orphaned by a service restart (#281).
+        """Reconcile experiments orphaned by a service restart (#281, #783).
 
         An experiment runs in a daemon thread of the ``agent-api`` process, so a restart
         kills it mid-flight and leaves its row active forever. Called once at process
-        startup, before any new experiment runs. Never resumes the work: moving to a
-        terminal status is what lets the waiting Nexus session resume and decide.
+        startup, before any new experiment runs. Never resumes the work here: moving to
+        a terminal status is what lets the waiting Nexus session resume and decide.
         Implementation/verification become ``interrupted`` (legacy ``selecting`` becomes
         ``failed``); worktrees are deliberately retained for inspection or retry.
+
+        #783: an interrupted run whose paid implementation already finished and whose
+        worktree still holds that work (a commit ahead of its base, or an uncommitted
+        diff) is additionally parked with ``resume_pending=1`` for a free resume by the
+        nexus tick, and does not count as a used attempt while the resume is pending.
 
         Returns the list of reconciled experiment ids.
         """
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, status FROM experiments WHERE status IN (?, ?, ?)",
+                """
+                SELECT id, status, implementation_ended_at, worktree_path,
+                       branch_name, base_commit_sha, COALESCE(resume_count, 0) AS resume_count
+                FROM experiments WHERE status IN (?, ?, ?)
+                """,
                 (STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING),
             ).fetchall()
         marked: list[str] = []
@@ -913,11 +961,19 @@ class RecordsMixin:
             terminal_status = (
                 STATUS_FAILED if row["status"] == STATUS_SELECTING else STATUS_INTERRUPTED
             )
-            if self._transition(
-                row["id"], row["status"], terminal_status,
-                ended_at=_utcnow_iso(),
-                error=_INTERRUPTED_BY_RESTART_ERROR,
+            fields: dict[str, Any] = {
+                "ended_at": _utcnow_iso(),
+                "error": _INTERRUPTED_BY_RESTART_ERROR,
+            }
+            # A resume already spent (resume_count reached its cap) is not parked
+            # again: the run then keeps the plain terminal behaviour.
+            if (
+                terminal_status == STATUS_INTERRUPTED
+                and int(row["resume_count"] or 0) < 1
+                and self._has_finished_implementation_work(row)
             ):
+                fields["resume_pending"] = 1
+            if self._transition(row["id"], row["status"], terminal_status, **fields):
                 # Clearing the registry also makes in-process startup reconciliation safe and prevents
                 # stale cancellation targets.
                 with self._process_lock:

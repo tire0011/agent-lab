@@ -530,6 +530,36 @@ def _sweep_stalled_experiments(service) -> None:
         logger.warning("experiment %s stalled and was marked failed", experiment_id)
 
 
+def _resume_interrupted_after_restart(service, tick_start) -> None:
+    """Resume at most one interrupted experiment whose paid implementation finished (#783).
+
+    Runs before planning and never fails the tick: the resume commits the leftover
+    worktree diff and re-verifies the already paid work for free, without calling a
+    coding provider. Skipped while another experiment or adoption is still running -
+    the next tick picks the pending resume up.
+    """
+    from modules.experiment_service.resume import resume_interrupted
+
+    try:
+        if service.busy_reason() is not None:
+            return
+        tracking = getattr(getattr(service, "controller", None), "github_work_tracking", None)
+        summary = resume_interrupted(service, tick_start, github_work_tracking=tracking)
+    except Exception as exc:  # noqa: BLE001 - a broken resume must not break a tick
+        logger.warning("could not resume an interrupted experiment: %s", exc)
+        return
+    if summary:
+        logger.info(
+            "resumed interrupted experiment %s after restart (no new paid start): %s",
+            summary.get("experiment_id"),
+            summary.get("status") or summary.get("reason"),
+        )
+        _events.append(
+            f"Resumed experiment {str(summary.get('experiment_id'))[:8]} after a service "
+            "restart, no new paid start"
+        )
+
+
 def _wait_for_experiments(service=None) -> None:
     """Keep the process alive until the work it started has ended (#358).
 
@@ -816,6 +846,10 @@ def main(argv: list[str] | None = None) -> int:
                 chosen.kind, chosen.ref, chosen.reason, len(candidates),
             )
             return 0
+
+        # Before planning: re-verify work whose paid implementation already
+        # finished when a restart interrupted it (#783) - free, no provider call.
+        _resume_interrupted_after_restart(service, tick_start)
 
         decision = service.tick()
         if decision.acted and decision.candidate is not None:

@@ -75,6 +75,9 @@ _PROGRESS_MESSAGES = {
     "needs_review": "requires review.",
     "completed": "completed.",
     "failed": "failed.",
+    # #783: a run whose paid implementation finished before a service restart is
+    # resumed for free instead of being started (and paid) again.
+    "experiment_resumed": "resumed after restart, no new paid start",
 }
 _MAX_PROGRESS_DETAIL_CHARS = 500
 

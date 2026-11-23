@@ -1024,6 +1024,17 @@ class NexusInitiativeService:
         # issue -> experiment -> (when it ended, the crash)
         crashes: dict[int, dict[str, tuple[str, str]]] = {}
         blocked: set[int] = set()
+        # An older/partial experiments table may lack resume_pending (#783); the
+        # expression degrades to 0 so such a schema keeps working unchanged.
+        try:
+            experiment_columns = {
+                row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")
+            }
+        except sqlite3.Error:
+            experiment_columns = set()
+        resume_pending = (
+            "COALESCE(e.resume_pending, 0)" if "resume_pending" in experiment_columns else "0"
+        )
         for table in ("github_experiment_links", "github_work_links"):
             try:
                 rows = self._conn.execute(
@@ -1031,6 +1042,7 @@ class NexusInitiativeService:
                     SELECT l.issue_number AS issue_number,
                            l.experiment_id AS experiment_id, e.status AS status,
                            e.error AS error, e.created_at AS created_at, e.ended_at AS ended_at,
+                           {resume_pending} AS resume_pending,
                            a.status AS adoption_status, a.reason AS adoption_reason
                     FROM {table} l LEFT JOIN experiments e ON e.id = l.experiment_id
                     LEFT JOIN experiment_adoptions a ON a.experiment_id = l.experiment_id
@@ -1046,6 +1058,11 @@ class NexusInitiativeService:
                 # ensure_for_source records the source before any experiment
                 # exists (#464): a link without an experiment is no work.
                 if row["experiment_id"] is None:
+                    continue
+                # A pending free resume (#783) is not a used attempt yet: the run's
+                # paid implementation finished, and the resume either succeeds or
+                # only then counts.
+                if int(row["resume_pending"] or 0):
                     continue
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
@@ -1128,6 +1145,10 @@ class NexusInitiativeService:
         except sqlite3.Error:
             return {}
         diff = "e.diff_text" if "diff_text" in columns else "NULL"
+        # #783: same degradation for a table without the resume column.
+        resume_pending = (
+            "COALESCE(e.resume_pending, 0)" if "resume_pending" in columns else "0"
+        )
         ends: dict[int, dict[str, datetime]] = {}
         for table in ("github_experiment_links", "github_work_links"):
             try:
@@ -1135,7 +1156,8 @@ class NexusInitiativeService:
                     f"""
                     SELECT l.issue_number AS issue_number, e.id AS experiment_id,
                            e.status AS status, e.error AS error,
-                           e.ended_at AS ended_at, e.created_at AS created_at
+                           e.ended_at AS ended_at, e.created_at AS created_at,
+                           {resume_pending} AS resume_pending
                     FROM {table} l JOIN experiments e ON e.id = l.experiment_id
                     WHERE e.status IN ({placeholders})
                       AND (COALESCE({diff}, '') = ''
@@ -1146,6 +1168,10 @@ class NexusInitiativeService:
             except sqlite3.OperationalError:
                 continue
             for row in rows:
+                # A pending free resume (#783) has not produced its verdict yet;
+                # it is not a no-change attempt while the resume is still pending.
+                if int(row["resume_pending"] or 0):
+                    continue
                 if _is_goal_policy_rejection(row["status"], row["error"]):
                     continue  # rejected before any work (#408)
                 ended = _parse_timestamp(row["ended_at"] or row["created_at"])

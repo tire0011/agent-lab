@@ -193,7 +193,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT NULL,
             policy_rule TEXT NULL,
             quality_evaluation_json TEXT NULL,
-            baseline_test_classifications_json TEXT NULL
+            baseline_test_classifications_json TEXT NULL,
+            -- An interrupted run whose paid implementation already finished is
+            -- parked for a free resume instead of a new paid start (#783).
+            resume_pending INTEGER NOT NULL DEFAULT 0,
+            resume_count INTEGER NOT NULL DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS experiment_reflections (
@@ -436,6 +440,11 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
+    # Free resume of an interrupted run whose implementation already finished
+    # (#783): resume_pending=1 parks it for the nexus tick, resume_count caps
+    # the resumes at one per experiment.
+    ("resume_pending", "INTEGER NOT NULL DEFAULT 0"),
+    ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second
