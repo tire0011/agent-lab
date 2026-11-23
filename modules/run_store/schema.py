@@ -436,6 +436,10 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
+    # Classified reason an experiment ended without publishable changes (#811), e.g.
+    # wrote_outside_worktree / limit_or_timeout / answered_without_edits /
+    # already_done_on_main / other; NULL for runs that did produce changes.
+    ("no_changes_cause", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

@@ -382,6 +382,29 @@ and compares a run to a stored baseline; see `benchmarks/README.md`. A run makes
 billed coding-agent calls. Results stay in `benchmark.db`, not in the production
 database.
 
+## "No changes" experiments (#811)
+
+Experiments that end with "implementation produced no publishable
+source/test/documentation changes" are classified per run by
+`modules/no_changes_cause.py`: the cause (`wrote_outside_worktree`,
+`limit_or_timeout`, `already_done_on_main`, `answered_without_edits`, `other`)
+is written to `experiments.no_changes_cause`, logged as a `no_changes_cause`
+event in the experiment's JSONL log, and appended to the `error` text as
+`no_changes_cause=...`. The weekly review's starter pack counts the causes and
+the no-change share of ended experiments per week, so the trend is visible in
+every Wochenreview. To (re)classify the most recent no-change runs of a
+database by hand:
+
+```bash
+python -m modules.no_changes_cause "$AGENT_DB_PATH" --log-dir state/experiment-logs --limit 20
+# add --dry-run to only print the counts
+```
+
+The most frequent cause so far was the agent editing the deployed checkout
+instead of its worktree; `modules/checkout_guard.py` now also scrubs the
+checkout's absolute path out of the implementation prompt, so the agent never
+sees the path that documentation quotes.
+
 ## Local shadow replay (#637)
 
 `modules/local_shadow_replay.py` turns every merged experiment of a paid coder

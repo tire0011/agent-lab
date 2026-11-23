@@ -24,6 +24,11 @@ from modules import handover_fact_check
 from modules.local_coding_worker import _goal_text, local_not_called_reason
 from modules.local_file_localizer import with_hint as with_likely_files_hint
 from modules.checkout_guard import GuardedWorker
+from modules.no_changes_cause import (
+    classify_no_changes_cause,
+    is_no_changes_error,
+    record_no_changes_cause,
+)
 
 from ..git_utils import _run_git
 from ..models import (
@@ -476,8 +481,9 @@ class ImplementationMixin:
             return self.get_experiment(experiment_id)
 
         if implementation_result.timed_out:
-            checkpoint_error = self._checkpoint_interrupted_work(
-                experiment_id, worktree_path, github_work_tracking, elog
+            checkpoint_error, checkpoint_cause = self._checkpoint_interrupted_work(
+                experiment_id, worktree_path, github_work_tracking, elog,
+                implementation_error=implementation_result.error,
             )
             self._force_status(
                 experiment_id, STATUS_TIMED_OUT,
@@ -489,12 +495,14 @@ class ImplementationMixin:
                 error="implementation phase timed out"
                 + (f" ({implementation_result.error})" if implementation_result.error else "")
                 + checkpoint_error,
+                **({"no_changes_cause": checkpoint_cause} if checkpoint_cause else {}),
             )
             return self.get_experiment(experiment_id)
 
         if implementation_result.error:
-            checkpoint_error = self._checkpoint_interrupted_work(
-                experiment_id, worktree_path, github_work_tracking, elog
+            checkpoint_error, checkpoint_cause = self._checkpoint_interrupted_work(
+                experiment_id, worktree_path, github_work_tracking, elog,
+                implementation_error=implementation_result.error,
             )
             self._force_status(
                 experiment_id, STATUS_FAILED,
@@ -504,6 +512,7 @@ class ImplementationMixin:
                 implementation_runtime_ms=implementation_result.runtime_ms,
                 implementation_usage_json=implementation_usage_json,
                 error=implementation_result.error + checkpoint_error,
+                **({"no_changes_cause": checkpoint_cause} if checkpoint_cause else {}),
             )
             return self.get_experiment(experiment_id)
 
@@ -525,6 +534,7 @@ class ImplementationMixin:
             worktree_path,
             elog,
             github_work_tracking=github_work_tracking,
+            implementation_error=implementation_result.error,
         )
         return self._repair_failed_verification(
             experiment_id, worktree_path, elog, result,
@@ -694,6 +704,7 @@ class ImplementationMixin:
                 experiment_id, worktree_path, elog,
                 github_work_tracking=github_work_tracking,
                 repair_iteration=repair_iteration,
+                implementation_error=repair_result.error,
             )
             if result.status != STATUS_FAILED:
                 return result
@@ -714,19 +725,39 @@ class ImplementationMixin:
         worktree_path: str,
         github_work_tracking: Any | None,
         elog: ExperimentLogger,
-    ) -> str:
+        implementation_error: str | None = None,
+    ) -> tuple[str, str | None]:
+        """Checkpoint interrupted work; returns (error suffix, no_changes_cause).
+
+        The cause is classified and recorded (#811) when the checkpoint failed
+        because there was nothing publishable, so the weekly review can count
+        why the run produced no changes. *implementation_error* is the worker's
+        own error, not yet persisted on the row at this point.
+        """
         if github_work_tracking is None:
-            return ""
+            return "", None
         try:
             github_work_tracking.checkpoint_experiment(experiment_id, worktree_path)
             elog.info(
                 "implementation", "github_checkpoint_published",
                 "Published interrupted implementation checkpoint to Draft PR",
             )
-            return ""
+            return "", None
         except Exception as exc:  # noqa: BLE001 - preserve original terminal state
             elog.error(
                 "implementation", "github_checkpoint_failed",
                 "Could not publish interrupted implementation checkpoint", exc=exc,
             )
-            return f"; GitHub checkpoint failed: {str(exc)[:1000]}"
+            suffix = f"; GitHub checkpoint failed: {str(exc)[:1000]}"
+            cause = None
+            if is_no_changes_error(exc):
+                cause = record_no_changes_cause(
+                    self._conn, experiment_id,
+                    classify_no_changes_cause(
+                        self._conn, experiment_id, self.experiment_log_dir,
+                        extra_error=implementation_error,
+                    ),
+                    elog, phase="implementation",
+                )
+                suffix += f"; no_changes_cause={cause}"
+            return suffix, cause

@@ -165,6 +165,9 @@ class Experiment:
     diff_text: str | None = None
     error: str | None = None
     policy_rule: str | None = None
+    # Classified reason this run produced no publishable changes (#811); None
+    # for runs that did produce changes.
+    no_changes_cause: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     baseline_test_classifications: dict[str, str] | None = None
 
@@ -225,6 +228,7 @@ class Experiment:
             "diff_text": self.diff_text,
             "error": self.error,
             "policy_rule": self.policy_rule,
+            "no_changes_cause": self.no_changes_cause,
             "quality_evaluation": self.quality_evaluation,
             "baseline_test_classifications": self.baseline_test_classifications,
         }
@@ -296,6 +300,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         diff_text=row["diff_text"],
         error=row["error"],
         policy_rule=row["policy_rule"] if "policy_rule" in row.keys() else None,
+        no_changes_cause=(
+            row["no_changes_cause"] if "no_changes_cause" in row.keys() else None
+        ),
         quality_evaluation=(
             _json_or_none(row["quality_evaluation_json"]) if "quality_evaluation_json" in row.keys() else None
         ),

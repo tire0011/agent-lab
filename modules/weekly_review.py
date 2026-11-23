@@ -20,6 +20,8 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from typing import Callable
 
+from modules.no_changes_cause import no_change_cause_counts, no_change_share
+
 INTERVAL = timedelta(days=7)
 TIMEOUT_SECONDS = 1800
 STALL_SECONDS = 600
@@ -109,6 +111,24 @@ def starter_pack(db_path: str, repo_root: str, now: datetime) -> str:
             for title, (sql, args) in sections.items():
                 lines.append(f"## {title}")
                 lines.extend("  " + " | ".join(str(v) for v in row) for row in _rows(conn, sql, args))
+            # #811: why experiments produced no publishable changes, and the
+            # week's no-change share - the two numbers the review must compare
+            # week over week. n/a on a database predating the cause column.
+            try:
+                lines.append("## experiments without publishable changes, by recorded cause (#811)")
+                cause_lines = [
+                    "  " + " | ".join(str(v) for v in row)
+                    for row in no_change_cause_counts(conn, since)
+                ]
+                lines.extend(cause_lines or ["  (none this week)"])
+                lines.append("## no-change share of ended experiments (#811): no-change | ended | %")
+                share = no_change_share(conn, since)
+                lines.append(
+                    f"  no-change: {share[0]} | {share[1]} | {share[2]}%"
+                    if share is not None else "  (no ended experiments this week)"
+                )
+            except sqlite3.Error as exc:
+                lines.append(f"## no-change causes (#811)\n  n/a: {exc}")
         finally:
             conn.close()
     usage = shutil.disk_usage("/")

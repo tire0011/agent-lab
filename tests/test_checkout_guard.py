@@ -66,8 +66,27 @@ class GuardTests(unittest.TestCase):
         worker = FakeWorker()
         result = self.run_guarded(worker)
         self.assertTrue(result.success)
-        self.assertIn(f"The deployed checkout {self.repo} is off-limits", worker.task)
+        # #811: the hint forbids the deployed checkout but must not name its
+        # absolute path - a path named in the prompt is a path the agent can
+        # write to (run 1b9c8642/#797 wrote into the checkout the docs named).
+        self.assertIn(f"Work only inside your working directory {self.wt}", worker.task)
+        self.assertIn("off-limits", worker.task)
+        self.assertNotIn(str(self.repo), worker.task)
         self.elog.error.assert_not_called()
+
+    def test_absolute_paths_of_the_deployed_checkout_are_scrubbed_from_the_prompt(self):
+        worker = FakeWorker()
+        task = (
+            f"Fix the bug described in {self.repo}/OPERATIONS.md; see also "
+            f"{self.repo}/modules/nexus_tick.py and the checkout at {self.repo}."
+        )
+        result = GuardedWorker(worker, str(self.repo)).run(
+            task, str(self.wt), experiment_logger=self.elog, phase="implementation")
+        self.assertTrue(result.success)
+        self.assertNotIn(str(self.repo), worker.task)
+        self.assertIn("<deployed-checkout>/OPERATIONS.md", worker.task)
+        self.assertIn("<deployed-checkout>/modules/nexus_tick.py", worker.task)
+        self.assertIn("the checkout at <deployed-checkout>.", worker.task)
 
     def test_writing_into_the_deployed_checkout_fails_the_run_and_is_stashed(self):
         result = self.run_guarded(FakeWorker(write_to=self.repo))
@@ -83,6 +102,19 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(kwargs["provider"], "mistral")
         self.assertEqual(kwargs["files"], ["nexus_tick.py"])
         self.assertFalse(kwargs["prompt_mentions_repo_root"])
+        # #811: the event carries the recordable cause so the weekly review can
+        # count these runs without re-deriving them from the message text.
+        self.assertEqual(kwargs["no_changes_cause"], "wrote_outside_worktree")
+
+    def test_a_prompt_that_named_the_checkout_is_recorded_when_the_guard_fires(self):
+        worker = FakeWorker(write_to=self.repo)
+        task = f"As documented in {self.repo}/README.md, edit {self.repo}/nexus_tick.py."
+        GuardedWorker(worker, str(self.repo)).run(
+            task, str(self.wt), experiment_logger=self.elog, phase="implementation")
+        args, kwargs = self.elog.error.call_args
+        self.assertTrue(kwargs["prompt_mentions_repo_root"])
+        self.assertGreater(kwargs["repo_root_mentions_scrubbed"], 0)
+        self.assertNotIn(str(self.repo), worker.task)
 
     def test_attributes_pass_through_to_the_wrapped_worker(self):
         self.assertEqual(GuardedWorker(FakeWorker(), str(self.repo)).provider, "mistral")
