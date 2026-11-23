@@ -82,6 +82,36 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             error TEXT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS home_gpu_jobs (
+            job_id TEXT PRIMARY KEY NOT NULL,
+            kind TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('queued', 'answered', 'expired', 'fallback', 'rejected')),
+            submitted_at TEXT NOT NULL,
+            deadline TEXT NOT NULL,
+            answered_at TEXT,
+            model TEXT,
+            prompt_tokens INTEGER CHECK (prompt_tokens >= 0),
+            completion_tokens INTEGER CHECK (completion_tokens >= 0),
+            seconds REAL CHECK (seconds >= 0),
+            input_sha256 TEXT NOT NULL,
+            answer_sha256 TEXT,
+            answer_path TEXT,
+            host TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_recent
+            ON home_gpu_jobs (submitted_at DESC, job_id DESC);
+
+        CREATE TABLE IF NOT EXISTS home_gpu_ignored_replies (
+            reason TEXT NOT NULL,
+            reply_key TEXT NOT NULL,
+            PRIMARY KEY (reason, reply_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS home_gpu_reply_receipts (
+            job_id TEXT PRIMARY KEY NOT NULL REFERENCES home_gpu_jobs(job_id),
+            filename TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS model_prices (
             provider TEXT NOT NULL,
             model TEXT NOT NULL,

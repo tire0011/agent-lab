@@ -49,7 +49,8 @@ def enabled(monkeypatch):
 
 
 @pytest.fixture
-def mailbox(tmp_path):
+def mailbox(tmp_path, monkeypatch):
+    monkeypatch.setattr(jobs.run_store, "DEFAULT_DB_PATH", str(tmp_path / "agent.db"))
     (tmp_path / "inbox").mkdir()
     return tmp_path
 
@@ -94,13 +95,14 @@ def test_front_matter_routing_and_hash(enabled, mailbox, git_calls):
     lines = header.splitlines()
     assert lines[0] == "---"
     fields = [line.split(":", 1)[0] for line in lines[1:]]
-    assert fields == ["type", "to", "created_by", "job_id", "kind", "deadline", "input_sha256"]
+    assert fields == ["type", "to", "created_by", "id", "job_id", "kind", "deadline", "input_sha256"]
 
     meta, body = mailbox_core.parse_front_matter(text)
     assert meta == {
         "type": "batch_job",
         "to": "home-gpu",
         "created_by": "nexus",
+        "id": job.job_id,
         "job_id": job.job_id,
         "kind": "chat_completion",
         "deadline": job.deadline,

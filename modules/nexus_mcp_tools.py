@@ -19,6 +19,7 @@ READ_ONLY_TOOLS: tuple[str, ...] = (
     "mailbox_tasks_list",
     "mailbox_task_get",
     "mailbox_messages_list",
+    "home_gpu_jobs_list",
     "experiments_list",
     "experiments_gate_recheck",
     "reverifications_list",
