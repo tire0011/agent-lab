@@ -1,7 +1,7 @@
 """SQLite run-store public API and backwards-compatible package façade.
 
 Schema creation and additive migrations live in :mod:`.schema`; run, price,
-activity, and settings helpers live in :mod:`.records`.
+activity, settings, and home-GPU job helpers live in :mod:`.records`.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from .records import (
     get_applicable_price,
     get_setting,
     insert_activity,
+    insert_home_gpu_job,
     insert_run,
     insert_tool_calls,
     list_activity,
@@ -63,6 +64,7 @@ __all__ = [
     "get_setting",
     "init_db",
     "insert_activity",
+    "insert_home_gpu_job",
     "insert_run",
     "insert_tool_calls",
     "list_activity",

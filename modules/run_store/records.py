@@ -297,3 +297,30 @@ def set_setting(conn: sqlite3.Connection, key: str, value: str, *, updated_at: s
         (key, value, updated_at),
     )
     conn.commit()
+
+
+def insert_home_gpu_job(
+    conn: sqlite3.Connection,
+    *,
+    job_id: str,
+    kind: str,
+    submitted_at: str,
+    deadline: str,
+    input_sha256: str,
+    status: str = "queued",
+) -> None:
+    """Record one home-GPU batch job (#812).
+
+    ``submit_job`` calls this only after the inbox file is committed to the
+    mailbox repository, so a row always has a published file behind it; the
+    answer columns stay NULL until the reply is collected (#774).
+    """
+    conn.execute(
+        """
+        INSERT INTO home_gpu_jobs (
+            job_id, kind, status, submitted_at, deadline, input_sha256
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (job_id, kind, status, submitted_at, deadline, input_sha256),
+    )
+    conn.commit()

@@ -21,14 +21,23 @@ so ``check_payload`` only lets public, repo-relative data through: at most
 GitHub and nothing the mailbox secret scanner flags.
 
 Commit and push reuse the mailbox git helpers (``git_add_and_commit`` and
-``git_push`` from ``modules.mailbox.core``); this module has no git code.
-The whole feature is off unless ``NEXUS_HOME_GPU=1``.
+``git_push`` from ``modules.mailbox.core``); this module has no git code
+except the rollback reset. The whole feature is off unless
+``NEXUS_HOME_GPU=1``.
+
+Submission is atomic (#812): the inbox file is written, staged and committed,
+and only then is the ``queued`` row inserted into ``home_gpu_jobs`` in the run
+store - all inside one try block. If staging or the commit fails, the inbox
+file is removed, ``git reset`` unstages the path, no row is written and a
+``HomeGpuSubmitError`` is raised, so the mailbox poll sees no change and a
+retry can reuse a fresh job ID without a stray file or orphan row.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import uuid
@@ -37,7 +46,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+import modules.run_store as run_store
 from modules.mailbox import core as mailbox_core
+
+logger = logging.getLogger(__name__)
 
 ENV_FLAG = "NEXUS_HOME_GPU"
 RECIPIENT = "home-gpu"
@@ -76,6 +88,17 @@ class HomeGpuDisabled(HomeGpuJobError):
 
 class PayloadRejected(HomeGpuJobError, ValueError):
     """The payload is not public, repo-relative data; nothing was written."""
+
+
+class HomeGpuSubmitError(HomeGpuJobError):
+    """Publishing the job to the mailbox failed (#812).
+
+    When staging or the git commit fails, the inbox file is removed, the path
+    is unstaged with ``git reset`` and no ``queued`` row is written, so this
+    error never leaves a stray file, staging or row behind. A job whose commit
+    succeeded but whose bookkeeping failed is reported here too; its file
+    stays committed for the mailbox poll to push.
+    """
 
 
 @dataclass(frozen=True)
@@ -161,6 +184,29 @@ def _new_job_id(now: datetime) -> str:
     return f"hg-{now.strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:12]}"
 
 
+def _rollback_publication(repo: Path, path: Path, *, remove_inbox: bool) -> None:
+    """Best-effort undo of a job file that could not be published (#812).
+
+    Removes the inbox file, then runs ``git reset`` on that path so a staged
+    entry is dropped too. Never raises: a failed rollback is logged, the
+    original ``HomeGpuSubmitError`` is what the caller sees.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("home-gpu rollback: could not remove %s: %s", path, exc)
+    try:
+        rel = path.relative_to(repo)
+        mailbox_core._git(["reset", "--", str(rel)], repo, check=False)
+    except (OSError, ValueError) as exc:
+        logger.warning("home-gpu rollback: git reset of %s failed: %s", path, exc)
+    if remove_inbox:
+        try:
+            (repo / "inbox").rmdir()
+        except OSError:
+            pass  # not empty or already gone; an empty inbox dir is harmless
+
+
 def submit_job(
     kind: str,
     payload: Any,
@@ -168,15 +214,23 @@ def submit_job(
     *,
     mailbox_dir: Path | str,
     commit: bool,
+    db_path: str | Path | None = None,
 ) -> SubmittedJob:
     """Write a ``batch_job`` for the home GPU into ``<mailbox_dir>/inbox``.
 
-    With *commit* the file is committed and pushed through the mailbox git
-    helpers; without it the caller commits. Every check runs before anything
-    is written: disabled flag, unknown kind, bad deadline and rejected payload
-    all raise and leave the mailbox untouched. A failed push is reported via
-    ``pushed=False`` (the mailbox poll retries unpushed commits); a failed
-    commit raises.
+    With *commit* the file is staged, committed and pushed through the mailbox
+    git helpers; without it the caller commits. Every check runs before
+    anything is written: disabled flag, unknown kind, bad deadline and
+    rejected payload all raise and leave the mailbox untouched.
+
+    The submission itself is atomic (#812), inside one try block: the inbox
+    file is written, staged and committed, and only then is the ``queued`` row
+    inserted into ``home_gpu_jobs`` in the run store (*db_path*, default
+    ``AGENT_DB_PATH``). If staging or the commit raises or fails, the inbox
+    file is removed, ``git reset`` unstages the path, no row is written and
+    ``HomeGpuSubmitError`` is raised - the mailbox poll then sees no change.
+    A failed push is still only reported via ``pushed=False`` (the mailbox
+    poll retries unpushed commits); a committed job keeps its row.
     """
     if not home_gpu_enabled():
         raise HomeGpuDisabled(f"{ENV_FLAG}=1 is not set; home-GPU jobs are off")
@@ -195,6 +249,7 @@ def submit_job(
 
     now = datetime.now(timezone.utc)
     job_id = _new_job_id(now)
+    submitted_at = _iso(now)
     deadline = _iso(now + timedelta(seconds=deadline_s))
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     content = (
@@ -211,19 +266,60 @@ def submit_job(
     )
 
     inbox = repo / "inbox"
+    created_inbox = not inbox.exists()
     inbox.mkdir(exist_ok=True)
     path = inbox / f"{job_id}.md"
-    mailbox_core._atomic_write(path, content)
 
     committed = pushed = False
-    if commit:
-        message = f"home-gpu: submit {kind} job [{job_id}]"
-        if not mailbox_core.git_add_and_commit(repo, [path], message):
-            raise HomeGpuJobError(
-                f"job file {path.name} written but the mailbox commit failed"
+    try:
+        mailbox_core._atomic_write(path, content)
+        if commit:
+            message = f"home-gpu: submit {kind} job [{job_id}]"
+            # ``git_add_and_commit`` stages with check=True (a staging failure
+            # raises) and commits with check=False (a commit failure returns
+            # False); both leave the file untracked or staged, so both are
+            # publication failures that must roll the file back (#812).
+            if not mailbox_core.git_add_and_commit(repo, [path], message):
+                raise HomeGpuSubmitError(
+                    f"mailbox commit failed for job file {path.name}; "
+                    "the file and any staging are rolled back and no job is queued"
+                )
+            committed = True
+        # The queued row is written only after the inbox file is committed
+        # (with commit=False: after it is written); a publication failure
+        # above therefore leaves no row behind.
+        conn = run_store.init_db(
+            str(db_path) if db_path is not None else run_store.DEFAULT_DB_PATH
+        )
+        try:
+            run_store.insert_home_gpu_job(
+                conn,
+                job_id=job_id,
+                kind=kind,
+                submitted_at=submitted_at,
+                deadline=deadline,
+                input_sha256=digest,
             )
-        committed = True
-        pushed = mailbox_core.git_push(repo)
+        finally:
+            conn.close()
+        if commit:
+            pushed = mailbox_core.git_push(repo)
+    except Exception as exc:
+        if not committed:
+            _rollback_publication(repo, path, remove_inbox=created_inbox)
+        if isinstance(exc, HomeGpuSubmitError):
+            raise
+        detail = mailbox_core.redact(str(exc))[:300]
+        if committed:
+            # The commit already succeeded; the file stays for the poll.
+            raise HomeGpuSubmitError(
+                f"job {job_id} is committed in the mailbox but the submit "
+                f"failed afterwards: {detail}"
+            ) from exc
+        raise HomeGpuSubmitError(
+            f"publishing job file {path.name} failed: {detail}; "
+            "the inbox file, any staging and any queued row were rolled back"
+        ) from exc
 
     return SubmittedJob(
         job_id=job_id,
