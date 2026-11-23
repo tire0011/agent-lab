@@ -77,7 +77,7 @@ class CleanupMixin:
                 f"WHERE status IN ({', '.join('?' * len(_TERMINAL_STATUSES))}) "
                 "AND worktree_path IS NOT NULL AND worktree_path != '' "
                 # A run parked for a free resume (#783) still needs its worktree.
-                "AND COALESCE(resume_pending, 0) = 0",
+                "AND COALESCE(resume_pending, 0) = 0 AND resume_owner IS NULL",
                 _TERMINAL_STATUSES,
             ).fetchall()
         for row in rows:

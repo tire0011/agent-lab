@@ -9,44 +9,26 @@ guards, before planning. It runs the existing ``_verify`` in the same worktree
 without calling a coding provider, so a finished implementation is not paid for
 twice.
 
-How the resume keeps the normal verification and adoption contract:
-
-* The uncommitted publishable diff is committed - through a temporary index,
-  with the publication exclusions of the GitHub checkpoint (no ``.env``, keys,
-  ``state/``, ``logs/`` ...) - to ``refs/nexus/resume/<experiment id>``. HEAD and
-  the index stay untouched, so ``_verify`` still sees the whole change.
-* Work already committed ahead of the recorded base is exposed again as an
-  uncommitted ``base..HEAD`` change (``git reset --mixed <base>``, the #718
-  pattern), so the diff, the whitespace check and the quality gate judge the
-  full experiment delta, not an empty HEAD diff.
-* A GitHub-linked experiment is verified *with* its GitHub tracking: checkpoint
-  publication, exact-commit CI lookup and the PR diagnostics run as in a normal
-  run, so adoption later finds a matching verified checkpoint.
-* No repair loop and no adoption start here: a pass becomes a normal
-  ``succeeded`` run that the integration scheduler adopts (PR and review); a
-  failure keeps the normal ``needs_review``/``failed`` result, which then
-  counts as an attempt.
-
-Crash safety: the claim, the ``interrupted -> verifying`` move and the
-``experiment_resumed`` activity row are one transaction. ``resume_owner`` names
-the process that runs the resume, so the API's startup reconciliation leaves a
-live tick-owned resume alone and only reconciles orphaned ones. A resume whose
-process died before verification started is parked again (bounded); one that
-died during verification ends ``interrupted`` and is spent.
+The resume prepares an immutable snapshot while preserving the original
+branch, index, and files. Verification and adoption use the same snapshot.
+The process claim and verification start are separate durable transitions.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import shutil
 import socket
 import sqlite3
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.redaction import sanitized_reason
 from modules.github_work_tracking import GitHubWorkTrackingService
 from modules.run_store import insert_activity
 
@@ -72,6 +54,7 @@ RESUME_FINISHED_EVENT = "experiment_resume_finished"
 RESUME_SKIPPED_EVENT = "experiment_resume_skipped"
 # A resume whose process died before verification started, parked again.
 RESUME_RECOVERED_EVENT = "experiment_resume_recovered"
+RESUME_CLAIMED_EVENT = "experiment_resume_claimed"
 # Where the committed resume snapshot is kept; never pushed.
 RESUME_REF_PREFIX = "refs/nexus/resume/"
 # Never more than one resumed verification per experiment.
@@ -86,6 +69,7 @@ _COMMIT_IDENTITY = {
     "GIT_COMMITTER_EMAIL": "nexus@agent-lab.local",
 }
 _STATS_WINDOW_DAYS = 14
+_ACTIVE_RESUMES: set[str] = set()
 
 
 class ResumeStepError(RuntimeError):
@@ -110,7 +94,7 @@ def _process_start_ticks(pid: int) -> str:
         return ""
     fields = data.rsplit(")", 1)[-1].split()
     # Field 22 (starttime); the fields after ``comm`` start at field 3.
-    return fields[19] if len(fields) > 19 else ""
+    return fields[19] if len(fields) > 19 and fields[0] != "Z" else ""
 
 
 def owner_token(pid: int | None = None) -> str:
@@ -122,8 +106,8 @@ def owner_token(pid: int | None = None) -> str:
 def owner_alive(token: str | None) -> bool:
     """Whether the process named by *token* still runs.
 
-    Another host cannot be checked from here; it counts as alive (the stall
-    sweep stays the backstop). A malformed token counts as dead.
+    This store is shared by the API and tick on the same host. An owner
+    on another host is treated conservatively as alive.
     """
     if not token:
         return False
@@ -136,6 +120,9 @@ def owner_alive(token: str | None) -> bool:
         return True
     if pid <= 0:
         return False
+    start, _, invocation = start.partition("/")
+    if pid == os.getpid() and invocation:
+        return token in _ACTIVE_RESUMES
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -145,7 +132,7 @@ def owner_alive(token: str | None) -> bool:
     except OSError:
         return False
     current = _process_start_ticks(pid)
-    return not (start and current and current != start)
+    return not start or current == start
 
 
 # ---- what counts as finished work -----------------------------------------------
@@ -158,6 +145,9 @@ def worktree_has_work(worktree: str, base: str | None) -> bool:
     if not worktree or not Path(worktree).is_dir():
         return False
     try:
+        root = _run_git(["rev-parse", "--show-toplevel"], cwd=worktree, timeout=30)
+        if root.returncode or Path(root.stdout.strip()).resolve() != Path(worktree).resolve():
+            return False
         base = str(base or "").strip()
         if base:
             ahead = _run_git(
@@ -170,7 +160,7 @@ def worktree_has_work(worktree: str, base: str | None) -> bool:
                 except ValueError:
                     pass
         status = _run_git(
-            ["status", "--porcelain", "--untracked-files=all"], cwd=worktree, timeout=30,
+            ["--no-optional-locks", "status", "--porcelain", "--untracked-files=all"], cwd=worktree, timeout=30,
         )
         return status.returncode == 0 and bool(status.stdout.strip())
     except (OSError, subprocess.SubprocessError) as exc:
@@ -183,12 +173,38 @@ def _claims(service: Any, experiment_id: str) -> int:
         row = service._conn.execute(
             "SELECT COUNT(*) FROM activity_log WHERE entity_type = 'experiment' "
             "AND entity_id = ? AND event = ?",
-            (experiment_id, RESUME_EVENT),
+            (experiment_id, RESUME_CLAIMED_EVENT),
         ).fetchone()
     return int(row[0] or 0) if row else 0
 
 
 # ---- orphaned resumes -----------------------------------------------------------
+
+def _scratch_path(token: str) -> Path | None:
+    _, separator, invocation = token.partition("/")
+    if separator and len(invocation) == 32 and all(c in "0123456789abcdef" for c in invocation):
+        return Path(tempfile.gettempdir()) / f"nexus-resume-{invocation}"
+    return None
+
+
+def _remove_scratch(service: Any, token: str) -> None:
+    scratch = _scratch_path(token)
+    if scratch is None or not scratch.is_dir() or scratch.is_symlink():
+        return
+    checkout = scratch / "worktree"
+    try:
+        if checkout.exists():
+            proc = _run_git(
+                ["worktree", "remove", "--force", str(checkout)],
+                cwd=service.repo_root, timeout=_GIT_TIMEOUT_SECONDS,
+            )
+            if proc.returncode and (checkout / ".git").exists():
+                logger.warning("could not unregister resume checkout %s", checkout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("could not remove resume checkout: %s", exc)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
 
 def recover_orphaned_resumes(service: Any, now: Any = None) -> list[str]:
     """Reconcile claimed resumes whose owning process is gone.
@@ -202,9 +218,8 @@ def recover_orphaned_resumes(service: Any, now: Any = None) -> list[str]:
     stamp = _iso(now)
     with service._lock:
         rows = service._conn.execute(
-            "SELECT id, resume_owner, COALESCE(resume_count, 0) AS resume_count "
-            "FROM experiments WHERE status = ? AND resume_owner IS NOT NULL",
-            (STATUS_VERIFYING,),
+            "SELECT id, status, resume_owner, resume_count, worker_pgid FROM experiments "
+            "WHERE resume_owner IS NOT NULL",
         ).fetchall()
     reconciled: list[str] = []
     for row in rows:
@@ -212,6 +227,11 @@ def recover_orphaned_resumes(service: Any, now: Any = None) -> list[str]:
         if owner_alive(token):
             continue
         experiment_id = str(row["id"])
+        if row["status"] != STATUS_VERIFYING:
+            _finish(service, experiment_id, token, "reconciled after resume owner exited")
+            _remove_scratch(service, token)
+            reconciled.append(experiment_id)
+            continue
         before_verification = int(row["resume_count"] or 0) < _MAX_RESUME_COUNT
         repark = before_verification and _claims(service, experiment_id) < _MAX_RESUME_CLAIMS
         if repark:
@@ -225,7 +245,8 @@ def recover_orphaned_resumes(service: Any, now: Any = None) -> list[str]:
                 f"{_INTERRUPTED_BY_RESTART_ERROR}; the resume was interrupted "
                 + ("during verification" if not before_verification else "before verification too often")
             )
-            event, message = RESUME_FINISHED_EVENT, f"{RESUME_MESSAGE}; {error}"
+            event = RESUME_SKIPPED_EVENT if before_verification else RESUME_FINISHED_EVENT
+            message = error
         with service._lock, service._conn:
             moved = service._conn.execute(
                 "UPDATE experiments SET status = ?, resume_pending = ?, resume_owner = NULL, "
@@ -242,6 +263,9 @@ def recover_orphaned_resumes(service: Any, now: Any = None) -> list[str]:
                     message=message,
                 )
         if moved:
+            if row["worker_pgid"]:
+                service._stop_stalled_worker(experiment_id, row["worker_pgid"])
+            _remove_scratch(service, token)
             logger.warning("experiment %s: orphaned resume reconciled (%s)", experiment_id, message)
             reconciled.append(experiment_id)
     return reconciled
@@ -307,11 +331,7 @@ def _skip(service: Any, experiment_id: str, reason: str, stamp: str) -> bool:
 
 
 def _claim(service: Any, experiment_id: str, token: str, stamp: str) -> bool:
-    """Claim, move to ``verifying`` and record ``experiment_resumed`` atomically.
-
-    One transaction: either all three happen or none, so a failed activity
-    write leaves the run pending for the next tick instead of half-claimed.
-    """
+    """Reserve the experiment without announcing or spending verification."""
     with service._lock, service._conn:
         moved = service._conn.execute(
             """
@@ -320,6 +340,7 @@ def _claim(service: Any, experiment_id: str, token: str, stamp: str) -> bool:
                 error = NULL
             WHERE id = ? AND status = ? AND COALESCE(resume_pending, 0) = 1
               AND COALESCE(resume_count, 0) < ?
+              AND NOT EXISTS (SELECT 1 FROM experiments WHERE resume_owner IS NOT NULL)
             """,
             (STATUS_VERIFYING, token, experiment_id, STATUS_INTERRUPTED, _MAX_RESUME_COUNT),
         ).rowcount == 1
@@ -327,40 +348,73 @@ def _claim(service: Any, experiment_id: str, token: str, stamp: str) -> bool:
             return False
         insert_activity(
             service._conn, timestamp=stamp, entity_type="experiment",
-            entity_id=experiment_id, event=RESUME_EVENT,
+            entity_id=experiment_id, event=RESUME_CLAIMED_EVENT,
             from_status=STATUS_INTERRUPTED, to_status=STATUS_VERIFYING,
-            message=RESUME_MESSAGE,
         )
     return True
 
 
-def _start_verification(service: Any, experiment_id: str, token: str) -> bool:
-    """Spend the resume right before ``_verify`` runs; False when the run moved on."""
+def _start_verification(
+    service: Any, experiment_id: str, token: str, stamp: str | None = None, *,
+    snapshot: str | None = None, baseline: str | None = None,
+) -> bool:
+    """Spend the resume and record its start atomically."""
     with service._lock, service._conn:
-        return service._conn.execute(
-            "UPDATE experiments SET resume_count = COALESCE(resume_count, 0) + 1 "
-            "WHERE id = ? AND status = ? AND resume_owner = ?",
-            (experiment_id, STATUS_VERIFYING, token),
+        moved = service._conn.execute(
+            "UPDATE experiments SET resume_count = 1, resume_snapshot_sha = ?, implementation_base_sha = ? "
+            "WHERE id = ? AND status = ? AND resume_owner = ? AND resume_count = 0",
+            (snapshot, baseline, experiment_id, STATUS_VERIFYING, token),
         ).rowcount == 1
+        if moved:
+            insert_activity(
+                service._conn, timestamp=stamp or _utcnow_iso(), entity_type="experiment",
+                entity_id=experiment_id, event=RESUME_EVENT,
+                from_status=STATUS_INTERRUPTED, to_status=STATUS_VERIFYING, message=RESUME_MESSAGE,
+            )
+    return moved
+
+
+def _release_preparation(
+    service: Any, experiment_id: str, token: str, reason: str, *, repark: bool,
+) -> None:
+    stamp = _utcnow_iso()
+    with service._lock, service._conn:
+        moved = service._conn.execute(
+            "UPDATE experiments SET status = ?, resume_pending = ?, resume_owner = NULL, "
+            "ended_at = ?, error = ? WHERE id = ? AND status = ? AND resume_owner = ? "
+            "AND resume_count = 0",
+            (STATUS_INTERRUPTED, int(repark), stamp,
+             f"{_INTERRUPTED_BY_RESTART_ERROR}; resume stopped before verification: {reason}"[:2000],
+             experiment_id, STATUS_VERIFYING, token),
+        ).rowcount == 1
+        if moved:
+            insert_activity(
+                service._conn, timestamp=stamp, entity_type="experiment",
+                entity_id=experiment_id, event=RESUME_RECOVERED_EVENT if repark else RESUME_SKIPPED_EVENT,
+                from_status=STATUS_VERIFYING, to_status=STATUS_INTERRUPTED, message=reason[:1000],
+            )
 
 
 def _finish(service: Any, experiment_id: str, token: str, detail: str) -> str:
-    """Release the claim and record the resume's outcome in one transaction."""
+    """Release a terminal claim and record its outcome once."""
     with service._lock, service._conn:
         row = service._conn.execute(
-            "SELECT status FROM experiments WHERE id = ?", (experiment_id,),
+            "SELECT status, resume_count FROM experiments WHERE id = ?", (experiment_id,),
         ).fetchone()
-        status = str(row["status"]) if row is not None else "unknown"
-        service._conn.execute(
+        status = str(row["status"])
+        if status == STATUS_VERIFYING:
+            return status
+        released = service._conn.execute(
             "UPDATE experiments SET resume_owner = NULL WHERE id = ? AND resume_owner = ?",
             (experiment_id, token),
-        )
-        insert_activity(
-            service._conn, timestamp=_utcnow_iso(), entity_type="experiment",
-            entity_id=experiment_id, event=RESUME_FINISHED_EVENT,
-            from_status=STATUS_VERIFYING, to_status=status,
-            message=f"{RESUME_MESSAGE}; {detail}"[:1000],
-        )
+        ).rowcount == 1
+        if released and row["resume_count"]:
+            insert_activity(
+                service._conn, timestamp=_utcnow_iso(), entity_type="experiment",
+                entity_id=experiment_id, event=RESUME_FINISHED_EVENT,
+                from_status=STATUS_VERIFYING, to_status=status,
+                message=f"{RESUME_MESSAGE}; {detail}"[:1000],
+            )
     return status
 
 
@@ -379,101 +433,121 @@ def _git_or_raise(args: list[str], worktree: str, elog: Any, what: str, **kwargs
     return proc.stdout
 
 
-def commit_publishable_work(experiment_id: str, worktree: str, elog: Any) -> str | None:
-    """Commit the uncommitted publishable diff to ``refs/nexus/resume/<id>``.
-
-    Only paths the GitHub checkpoint would publish are staged (no secrets,
-    runtime state or caches); excluded paths stay where they are and are
-    logged. Uses a temporary index and ``commit-tree``, so HEAD and the index
-    of the worktree are untouched and ``_verify`` still sees the whole change.
-    Returns the commit, ``None`` when nothing publishable was uncommitted.
-    Raises :class:`ResumeStepError` when staging or committing fails.
-    """
+def _implementation_baseline(experiment: Any, worktree: str) -> str:
+    if experiment.implementation_base_sha:
+        return experiment.implementation_base_sha
+    base = experiment.base_commit_sha
+    if not base:
+        raise ResumeStepError("verification baseline is missing")
+    # Older rows recorded the issue-branch tip before Nexus merged main.
+    # Recognize the merge that Nexus itself created as the first new commit.
     raw = _git_or_raise(
-        ["status", "--porcelain=v1", "-z", "--untracked-files=all"], worktree, elog,
-        "could not list the uncommitted worktree changes",
+        ["log", "--first-parent", "--reverse", "--format=%H%x00%P%x00%ce%x00%s",
+         f"{base}..HEAD", "--"],
+        worktree, None, "could not inspect the legacy implementation baseline",
     )
-    try:
-        paths = GitHubWorkTrackingService._status_paths(raw)
-    except Exception as exc:  # noqa: BLE001 - an unreadable status is a failed step
-        raise ResumeStepError(f"could not parse the worktree status: {exc}") from exc
-    publishable = [path for path in paths if GitHubWorkTrackingService._publishable_path(path)]
-    excluded = sorted(set(paths) - set(publishable))
-    if excluded:
-        elog.warning(
-            "verifying", "resume_paths_excluded",
-            "Runtime or secret paths are left out of the resume commit",
-            excluded=excluded[:20],
-        )
-    if not publishable:
-        return None
+    if raw:
+        sha, parents, committer, subject = raw.splitlines()[0].split("\0", 3)
+        parent_shas = parents.split()
+        if (
+            len(parent_shas) == 2 and parent_shas[0] == base
+            and committer == _COMMIT_IDENTITY["GIT_COMMITTER_EMAIL"]
+            and subject.startswith(("Merge branch 'main' of ", "Merge main; conflicts left for the coding agent"))
+        ):
+            return sha
+    # A fast-forward does not have a merge commit. The worktree reflog
+    # identifies the exact move from the recorded tip when it is retained.
+    reflog = _git_or_raise(
+        ["reflog", "show", "--format=%H%x00%ge%x00%gs", "HEAD"],
+        worktree, None, "could not inspect the legacy worktree reflog",
+    )
+    entries = [line.split("\0", 2) for line in reflog.splitlines()]
+    for (sha, email, subject), (previous, _, _) in zip(entries, entries[1:]):
+        if (
+            previous == base and email == _COMMIT_IDENTITY["GIT_COMMITTER_EMAIL"]
+            and subject.startswith("merge ") and "FETCH_HEAD" in subject
+            and subject.endswith(": Fast-forward")
+        ):
+            return sha
+    return base
+
+
+def snapshot_work(experiment_id: str, worktree: str, index_path: Path, elog: Any) -> tuple[str, str | None]:
+    """Capture committed, staged, and unstaged work in a private Git ref.
+
+    The staged version wins on a partially staged path. Both versions remain
+    available in the original index and working tree.
+    """
     head = _git_or_raise(["rev-parse", "HEAD"], worktree, elog, "could not resolve HEAD").strip()
-    with tempfile.TemporaryDirectory(prefix="nexus-resume-index-") as index_dir:
-        env = dict(os.environ)
-        env.update(_COMMIT_IDENTITY)
-        env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
-        _git_or_raise(["read-tree", "HEAD"], worktree, elog, "could not stage the resume commit", env=env)
-        _git_or_raise(
-            ["add", "-A", "--", *publishable], worktree, elog,
-            "could not stage the resume commit", env=env,
+    raw = _git_or_raise(
+        ["--no-optional-locks", "status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"],
+        worktree, elog, "could not list the uncommitted worktree changes",
+    )
+    staged = []
+    unstaged = []
+    excluded = []
+    for record in raw.split("\0"):
+        if not record:
+            continue
+        code, path = record[:2], record[3:]
+        if "U" in code or code in {"AA", "DD"}:
+            raise ResumeStepError("worktree index has unresolved conflicts")
+        if not GitHubWorkTrackingService._publishable_path(path):
+            excluded.append(path)
+            continue
+        if code[0] not in " ?":
+            staged.append(path)
+        else:
+            unstaged.append(path)
+    staged_paths = set(staged)
+    unstaged = list(dict.fromkeys(path for path in unstaged if path not in staged_paths))
+    commit = head
+    if staged or unstaged:
+        env = dict(os.environ, **_COMMIT_IDENTITY)
+        env["GIT_INDEX_FILE"] = str(index_path)
+        _git_or_raise(["read-tree", head], worktree, elog, "could not initialize the snapshot", env=env)
+        if staged:
+            # Copy the actual index entries via a binary patch, including
+            # mode changes and deletions. Keep blob contents out of logs.
+            try:
+                patch = subprocess.run(
+                    ["git", "diff", "--cached", "--no-renames", "--no-ext-diff", "--no-textconv",
+                     "--binary", head, "--", *GitHubWorkTrackingService._publication_pathspecs(staged, excluded)],
+                    cwd=worktree, capture_output=True, check=True, timeout=_GIT_TIMEOUT_SECONDS,
+                ).stdout
+                if patch:
+                    subprocess.run(
+                        ["git", "apply", "--cached", "--binary", "--whitespace=nowarn", "-"],
+                        cwd=worktree, env=env, input=patch, capture_output=True,
+                        check=True, timeout=_GIT_TIMEOUT_SECONDS,
+                    )
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise ResumeStepError("could not copy staged changes into the resume snapshot") from exc
+        if unstaged:
+            _git_or_raise(
+                ["add", "-A", "--", *GitHubWorkTrackingService._publication_pathspecs(unstaged, excluded)],
+                worktree, elog,
+                "could not stage the resume snapshot", env=env,
+            )
+        paths = _git_or_raise(
+            ["diff", "--cached", "--name-only", "-z", "--no-renames", head, "--"],
+            worktree, elog, "could not audit staged snapshot paths", env=env,
         )
+        if any(not GitHubWorkTrackingService._publishable_path(path) for path in paths.split("\0") if path):
+            raise ResumeStepError("resume snapshot staged excluded publication paths")
         tree = _git_or_raise(
             ["write-tree"], worktree, elog, "could not write the resume tree", env=env,
         ).strip()
+        message = f"Resume snapshot of experiment {experiment_id[:8]}\n\nNexus-Experiment: {experiment_id}"
         commit = _git_or_raise(
-            [
-                "commit-tree", tree, "-p", head, "-m",
-                f"Resume snapshot of experiment {experiment_id[:8]} after a service restart",
-            ],
+            ["commit-tree", tree, "-p", head, "-m", message],
             worktree, elog, "could not commit the resume snapshot", env=env,
         ).strip()
     _git_or_raise(
         ["update-ref", f"{RESUME_REF_PREFIX}{experiment_id}", commit], worktree, elog,
-        "could not record the resume commit",
+        "could not record the resume snapshot",
     )
-    elog.info(
-        "verifying", "resume_committed_uncommitted_work",
-        "Committed the uncommitted publishable diff before the resumed verification",
-        commit_sha=commit, paths=publishable[:30],
-    )
-    return commit
-
-
-def expose_full_delta(worktree: str, base: str | None, elog: Any) -> bool:
-    """Make the whole ``base..worktree`` change visible to ``_verify``.
-
-    ``_verify`` (and adoption after it) read the change relative to HEAD; work
-    committed ahead of the recorded base would look empty. ``git reset --mixed``
-    moves HEAD back to the base and keeps every file, as the #718
-    re-verification does. Returns whether HEAD moved.
-    """
-    base = str(base or "").strip()
-    if not base:
-        return False
-    head = _git_or_raise(["rev-parse", "HEAD"], worktree, elog, "could not resolve HEAD").strip()
-    if head == base:
-        return False
-    try:
-        ancestor = _run_git(
-            ["merge-base", "--is-ancestor", base, head], cwd=worktree,
-            timeout=_GIT_TIMEOUT_SECONDS, elog=elog, phase="verifying",
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        raise ResumeStepError(f"could not compare HEAD with the recorded base: {exc}") from exc
-    if ancestor.returncode != 0:
-        raise ResumeStepError(
-            f"the recorded base {base[:12]} is not an ancestor of the worktree HEAD {head[:12]}"
-        )
-    _git_or_raise(
-        ["reset", "--mixed", "--quiet", base], worktree, elog,
-        "could not expose the committed work as the experiment change",
-    )
-    elog.info(
-        "verifying", "resume_full_delta_exposed",
-        "Committed work is verified as the full change since the recorded base",
-        base_commit=base, previous_head=head,
-    )
-    return True
+    return commit, commit if commit != head else None
 
 
 def _tracking_for(tracking: Any, experiment_id: str) -> Any | None:
@@ -535,81 +609,113 @@ def resume_interrupted(
     if chosen is None:
         return {"resumed": False, "skipped": skipped} if skipped else None
 
-    token = owner_token()
-    if not _claim(experiment_service, chosen, token, stamp):
-        return {"resumed": False, "skipped": skipped} if skipped else None
-    summary: dict[str, Any] = {
-        "experiment_id": chosen, "resumed": True, "resumed_at": stamp, "skipped": skipped,
-    }
-    elog = experiment_service.get_experiment_logger(chosen)
-    elog.info(
-        STATUS_VERIFYING, RESUME_EVENT,
-        f"Resuming interrupted experiment {chosen} after restart; no new paid start",
-    )
-    _report(tracking, chosen, RESUME_EVENT)
-
-    verification_started = False
-    detail = "verification did not run"
+    token = f"{owner_token()}/{uuid.uuid4().hex}"
+    _ACTIVE_RESUMES.add(token)
     try:
+        if not _claim(experiment_service, chosen, token, stamp):
+            return {"resumed": False, "skipped": skipped} if skipped else None
+        return _run_claimed_resume(experiment_service, chosen, token, stamp, skipped, tracking, approval_block)
+    finally:
+        try:
+            _remove_scratch(experiment_service, token)
+        finally:
+            _ACTIVE_RESUMES.discard(token)
+
+
+def _run_claimed_resume(
+    experiment_service: Any, chosen: str, token: str, stamp: str,
+    skipped: list[dict[str, str]], tracking: Any,
+    approval_block: Callable[[str], str | None] | None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {"experiment_id": chosen, "resumed": False, "skipped": skipped}
+    worktree = None
+    try:
+        elog = experiment_service.get_experiment_logger(chosen)
+        elog.info(STATUS_VERIFYING, RESUME_CLAIMED_EVENT, "Preparing interrupted work for verification")
+        if approval_block is not None and (blocked := approval_block(chosen)):
+            raise ResumeStepError(blocked)
         experiment = experiment_service.get_experiment(chosen)
         worktree = str(experiment.worktree_path or "").strip()
         if not worktree or not Path(worktree).is_dir():
             raise ResumeStepError("worktree missing")
+        root = _git_or_raise(
+            ["rev-parse", "--show-toplevel"], worktree, elog, "could not resolve worktree root",
+        )
+        if Path(root.strip()).resolve() != Path(worktree).resolve():
+            raise ResumeStepError("worktree missing")
         verify_tracking = _tracking_for(tracking, chosen)
-        summary["resume_commit_sha"] = commit_publishable_work(chosen, worktree, elog)
-        summary["head_reset_to_base"] = expose_full_delta(worktree, experiment.base_commit_sha, elog)
-        if not _start_verification(experiment_service, chosen, token):
-            detail = "the run moved on before verification started"
-        else:
-            verification_started = True
-            try:
-                result = experiment_service._verify(
-                    chosen, worktree, elog, github_work_tracking=verify_tracking,
-                )
-            except Exception as exc:  # noqa: BLE001 - a crashed verifier is not a pass
-                logger.warning("resume verification of %s failed: %s", chosen, exc)
-                elog.error(
-                    "verifying", "resume_verification_error",
-                    "The resumed verification crashed; the run goes to review", exc=exc,
-                )
-                experiment_service._force_status(
-                    chosen, STATUS_NEEDS_REVIEW, ended_at=_utcnow_iso(),
-                    error=f"resume verification error: {type(exc).__name__}: {str(exc)[:1000]}",
-                )
-                result = experiment_service.get_experiment(chosen)
-            detail = f"verification ended {result.status}"
-            if result.error:
-                detail += f": {str(result.error)[:300]}"
-            # Same Issue lifecycle comments as a normal run; no repair loop, which
-            # would call a coding provider.
-            from .service_parts.implementation import _final_issue_progress
+        base = _implementation_baseline(experiment, worktree)
+        scratch = _scratch_path(token)
+        if scratch is None:
+            raise ResumeStepError("invalid resume owner token")
+        scratch.mkdir(mode=0o700)
+        snapshot, new_commit = snapshot_work(chosen, worktree, scratch / "index", elog)
+        _git_or_raise(
+            ["merge-base", "--is-ancestor", base, snapshot], worktree, elog,
+            "snapshot does not descend from the implementation baseline",
+        )
+        paths = _git_or_raise(
+            ["diff", "--name-only", "-z", "--no-renames", base, snapshot, "--"], worktree, elog,
+            "could not inspect snapshot paths",
+        )
+        if not paths:
+            raise ResumeStepError("implementation produced no publishable changes")
+        if any(not GitHubWorkTrackingService._publishable_path(path) for path in paths.split("\0") if path):
+            raise ResumeStepError("committed implementation contains excluded publication paths")
+        # Run local tests against the exact commit in a detached checkout.
+        # Keep the original HEAD, index, and working files available for inspection.
+        files = scratch / "worktree"
+        _git_or_raise(
+            ["worktree", "add", "--detach", "--quiet", str(files), snapshot],
+            worktree, elog, "could not prepare snapshot files",
+        )
+        if not Path(worktree).is_dir():
+            raise ResumeStepError("worktree missing")
+        summary["resume_commit_sha"] = new_commit
+        started = _start_verification(
+            experiment_service, chosen, token, stamp, snapshot=snapshot, baseline=base,
+        )
+    except Exception as exc:
+        # Git preparation errors are terminal. A failed logger or database
+        # operation can be retried because verification has not been spent.
+        missing = worktree is not None and not Path(worktree).is_dir()
+        reason = "worktree missing" if missing else sanitized_reason(str(exc)) or type(exc).__name__
+        repark = (
+            reason != "worktree missing"
+            and not isinstance(exc, ResumeStepError)
+            and _claims(experiment_service, chosen) < _MAX_RESUME_CLAIMS
+        )
+        _release_preparation(experiment_service, chosen, token, reason, repark=repark)
+        _finish(experiment_service, chosen, token, reason)
+        summary.update(status=STATUS_INTERRUPTED, skipped=[*skipped, {"experiment_id": chosen, "reason": reason}])
+        if repark:
+            raise
+        return summary
 
-            for state, progress in _final_issue_progress(result):
-                _report(tracking, chosen, state, progress)
-    except Exception as exc:  # noqa: BLE001 - every claimed resume gets an outcome
-        if verification_started:
-            # Only reporting runs after _verify; its result already stands.
-            logger.warning("resume of %s: error after verification: %s", chosen, exc)
-            return summary
-        reason = str(exc) if isinstance(exc, ResumeStepError) else f"{type(exc).__name__}: {exc}"
-        logger.warning("resume of %s stopped before verification: %s", chosen, reason)
-        elog.error(
-            "verifying", "resume_stopped",
-            f"The resume stopped before verification: {reason}",
+    if not started:
+        summary["status"] = _finish(experiment_service, chosen, token, "status changed before verification")
+        return summary
+
+    summary.update(resumed=True, resumed_at=stamp)
+    try:
+        _report(tracking, chosen, RESUME_EVENT)
+        experiment_service._verify(
+            chosen, worktree, elog, github_work_tracking=verify_tracking,
+            snapshot_sha=snapshot, verification_base_sha=base, snapshot_test_path=str(files),
         )
-        # Recorded failure with today's behaviour: interrupted, the attempt counts.
+    except Exception as exc:
+        logger.warning("resume verification of %s failed: %s", chosen, exc)
         experiment_service._transition(
-            chosen, STATUS_VERIFYING, STATUS_INTERRUPTED,
-            ended_at=_utcnow_iso(),
-            error=f"{_INTERRUPTED_BY_RESTART_ERROR}; resume stopped before verification: {reason}"[:2000],
+            chosen, STATUS_VERIFYING, STATUS_NEEDS_REVIEW, ended_at=_utcnow_iso(),
+            error=f"resume verification error: {type(exc).__name__}: {sanitized_reason(str(exc))}",
         )
-        detail = f"stopped before verification: {reason}"
     finally:
-        summary["status"] = _finish(experiment_service, chosen, token, detail)
-    logger.info(
-        "experiment %s resumed after restart without a new paid start: %s",
-        chosen, summary["status"],
-    )
+        summary["status"] = _finish(experiment_service, chosen, token, "verification ended")
+
+    from .service_parts.implementation import _final_issue_progress
+
+    for state, progress in _final_issue_progress(experiment_service.get_experiment(chosen)):
+        _report(tracking, chosen, state, progress)
     return summary
 
 

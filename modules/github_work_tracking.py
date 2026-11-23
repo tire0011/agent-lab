@@ -829,15 +829,25 @@ class GitHubWorkTrackingService:
             self._persist_experiment(ref)
         return ref
 
-    def checkpoint_experiment(self, experiment_id: str, worktree_path: str) -> GitHubWorkRef:
+    def checkpoint_experiment(
+        self, experiment_id: str, worktree_path: str, *, snapshot_sha: str | None = None,
+    ) -> GitHubWorkRef:
         """Publish intended worktree changes without changing its HEAD or index."""
         ref = self.ensure_for_experiment(experiment_id)
+        if snapshot_sha is not None:
+            remote_sha = self._remote_branch_sha(ref.branch_name)
+            checkpoint_sha, paths = self._resume_checkpoint(worktree_path, remote_sha, snapshot_sha)
+            return self._publish_checkpoint(
+                ref, experiment_id, worktree_path, remote_sha, checkpoint_sha, paths,
+                require_remote_match=True,
+            )
         status = self._git(
             ["status", "--porcelain=v1", "-z", "--untracked-files=all"],
             cwd=worktree_path,
         ).stdout
         changed_paths = self._status_paths(status)
         publishable = [path for path in changed_paths if self._publishable_path(path)]
+        excluded = sorted(set(changed_paths) - set(publishable))
 
         remote_sha = self._remote_branch_sha(ref.branch_name)
         worktree_head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
@@ -849,7 +859,6 @@ class GitHubWorkTrackingService:
             check=False,
         ).returncode == 0
         if not publishable and not head_ahead:
-            excluded = sorted(set(changed_paths) - set(publishable))
             detail = f"; excluded runtime paths: {', '.join(excluded[:10])}" if excluded else ""
             raise GitHubWorkTrackingError(
                 "implementation produced no publishable source/test/documentation changes" + detail
@@ -884,7 +893,16 @@ class GitHubWorkTrackingService:
             env["GIT_INDEX_FILE"] = str(Path(temp_dir) / "index")
             self._git(["read-tree", checkpoint_base], cwd=worktree_path, env=env)
             if publishable:
-                self._git(["add", "-A", "--", *publishable], cwd=worktree_path, env=env)
+                self._git(
+                    ["add", "-A", "--", *self._publication_pathspecs(publishable, excluded)],
+                    cwd=worktree_path, env=env,
+                )
+            paths = self._git(
+                ["diff", "--cached", "--name-only", "-z", "--no-renames", checkpoint_base, "--"],
+                cwd=worktree_path, env=env,
+            ).stdout
+            if any(not self._publishable_path(path) for path in paths.split("\0") if path):
+                raise GitHubWorkTrackingError("Checkpoint staged excluded publication paths")
             tree_sha = self._git(["write-tree"], cwd=worktree_path, env=env).stdout.strip()
         base_tree = self._git(
             ["rev-parse", f"{checkpoint_base}^{{tree}}"], cwd=worktree_path
@@ -909,9 +927,49 @@ class GitHubWorkTrackingService:
                 ],
                 cwd=worktree_path,
             ).stdout.strip()
+        return self._publish_checkpoint(ref, experiment_id, worktree_path, remote_sha, checkpoint_sha, publishable)
+
+    def _resume_checkpoint(
+        self, worktree_path: str, remote_sha: str, snapshot_sha: str,
+    ) -> tuple[str, list[str]]:
+        if self._git(
+            ["merge-base", "--is-ancestor", remote_sha, snapshot_sha],
+            cwd=worktree_path, check=False,
+        ).returncode != 0:
+            # The initial verifier may already have published the same content.
+            # Reuse it only if its ancestry contains the live implementation HEAD.
+            head = self._git(["rev-parse", "HEAD"], cwd=worktree_path).stdout.strip()
+            same_tree = self._git(
+                ["diff", "--quiet", remote_sha, snapshot_sha, "--"], cwd=worktree_path, check=False,
+            ).returncode == 0
+            if same_tree and self._git(
+                ["merge-base", "--is-ancestor", head, remote_sha], cwd=worktree_path, check=False,
+            ).returncode == 0:
+                return remote_sha, []
+            raise GitHubWorkTrackingError("Issue branch diverged from the resume snapshot")
+        # Compare each newly reachable commit, including merges and paths later
+        # deleted. A tree-only check could miss an excluded blob in history.
+        raw = self._git(
+            ["log", "--full-history", "-m", "--format=", "--name-only", "--no-renames",
+             "-z", f"{remote_sha}..{snapshot_sha}", "--"],
+            cwd=worktree_path,
+        ).stdout
+        paths = list(dict.fromkeys(path for path in raw.split("\0") if path))
+        if any(not self._publishable_path(path) for path in paths):
+            raise GitHubWorkTrackingError("Resume snapshot history contains excluded publication paths")
+        return snapshot_sha, paths
+
+    def _publish_checkpoint(
+        self, ref: GitHubWorkRef, experiment_id: str, worktree_path: str,
+        remote_sha: str, checkpoint_sha: str, publishable: list[str], *,
+        require_remote_match: bool = False,
+    ) -> GitHubWorkRef:
         if checkpoint_sha != remote_sha:
+            branch = f"refs/heads/{ref.branch_name}"
+            # Snapshot ancestry and history were checked against this exact tip.
+            lease = [f"--force-with-lease={branch}:{remote_sha}"] if require_remote_match else []
             self._git(
-                ["push", "origin", f"{checkpoint_sha}:refs/heads/{ref.branch_name}"],
+                ["push", *lease, "origin", f"{checkpoint_sha}:{branch}"],
                 cwd=worktree_path,
             )
         ref.checkpoint_sha = checkpoint_sha
@@ -1651,6 +1709,14 @@ class GitHubWorkTrackingService:
                     paths.append(parts[index])
                 index += 1
         return list(dict.fromkeys(paths))
+
+    @staticmethod
+    def _publication_pathspecs(paths: list[str], excluded: list[str]) -> list[str]:
+        """Stage literal paths and exclude blocked children of replaced files."""
+        return [
+            *(f":(top,literal){path}" for path in paths),
+            *(f":(top,literal,exclude){path}" for path in excluded),
+        ]
 
     @staticmethod
     def _publishable_path(path: str) -> bool:

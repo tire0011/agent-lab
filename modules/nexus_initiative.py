@@ -409,7 +409,7 @@ class NexusInitiativeService:
             ]
             # No readable timestamp counts as active: skipping a tick is cheap,
             # starting work beside a real run is not.
-            if not stamps or max(stamps) >= cutoff:
+            if ("resume_owner" in keys and row["resume_owner"]) or not stamps or max(stamps) >= cutoff:
                 active += 1
             else:
                 abandoned += 1
@@ -619,13 +619,15 @@ class NexusInitiativeService:
         """Experiments that succeeded but were never integrated; highest priority on purpose."""
         placeholders = ",".join("?" for _ in _UNFINISHED_ADOPTION_STATUSES)
         try:
+            columns = {row[1] for row in self._conn.execute("PRAGMA table_info(experiments)")}
+            resume_finalized = "AND e.resume_owner IS NULL" if "resume_owner" in columns else ""
             rows = self._conn.execute(
                 f"""
                 SELECT e.id AS experiment_id, e.goal AS goal,
                        COALESCE(a.status, 'not_started') AS adoption_status
                 FROM experiments e
                 LEFT JOIN experiment_adoptions a ON a.experiment_id = e.id
-                WHERE e.status = 'succeeded'
+                WHERE e.status = 'succeeded' {resume_finalized}
                   AND COALESCE(a.status, 'not_started') IN ({placeholders})
                 ORDER BY e.ended_at ASC
                 """,
@@ -1513,18 +1515,21 @@ class NexusInitiativeService:
                 ).fetchone()
             except sqlite3.OperationalError:
                 continue
-            if row is None:
-                continue
-            try:
-                number = int(row["issue_number"])
-            except (TypeError, ValueError):
-                return None
-            approval = issue_approvals.get_approval(self._conn, self._repository, number)
-            if approval is not None and approval.status in (
-                issue_approvals.STATUS_REVOKED, issue_approvals.STATUS_REJECTED
-            ):
-                return f"issue #{number} approval is {approval.status}"
+            if row is not None and row["issue_number"] is not None:
+                issue_number = row["issue_number"]
+                break
+        else:
+            experiment = self.experiment_service.get_experiment(experiment_id)
+            issue_number = experiment.source_id if experiment.source_type == "issue" else None
+        try:
+            number = int(issue_number)
+        except (TypeError, ValueError):
             return None
+        approval = issue_approvals.get_approval(self._conn, self._repository, number)
+        if approval is not None and approval.status in (
+            issue_approvals.STATUS_REVOKED, issue_approvals.STATUS_REJECTED
+        ):
+            return f"issue #{number} approval is {approval.status}"
         return None
 
     def _resume_interrupted(self) -> bool:

@@ -301,9 +301,12 @@ before planning. The resume never calls a coding provider:
 - The uncommitted publishable diff is committed to
   `refs/nexus/resume/<experiment id>` with the checkpoint exclusions, so no
   `.env`, keys, `state/` or `logs/` files are included. This ref is never pushed.
-  Committed work ahead of the base is verified as the full `base..HEAD` change.
-- `_verify` runs in the same worktree, with GitHub tracking for linked
-  experiments: checkpoint, exact-commit CI and PR diagnostics. A pass is adopted
+  The original branch, index and files are preserved. If a file is partially
+  staged, verification uses its staged version. The full snapshot delta is
+  checked against the implementation baseline recorded after merging main.
+- `_verify` uses the original worktree for Git operations and a temporary
+  checkout of the snapshot for local tests. For linked experiments it uses
+  GitHub tracking: checkpoint, exact-commit CI and PR diagnostics. A pass is adopted
   by the normal integration scheduler. A failure keeps the normal result and
   counts as an attempt. A run is resumed at most once (`resume_count`).
 - The Issue gets the comment `resumed after restart, no new paid start`. The
@@ -314,7 +317,8 @@ before planning. The resume never calls a coding provider:
 - `resume_owner` names the process running a resume. Startup leaves a live
   resume alone. If the owner died before verification started, the run is
   parked again (at most 3 claims). If it died during verification, the run
-  ends `interrupted`.
+  ends `interrupted`. If a verdict was already persisted, the next tick records
+  that outcome and releases ownership.
 - `NEXUS_RESUME_INTERRUPTED=0` disables the resume.
 
 The tick logs each start-to-start interval and the maximum interval ending in

@@ -166,6 +166,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             worktree_path TEXT NULL,
             branch_name TEXT NULL,
             base_commit_sha TEXT NULL,
+            implementation_base_sha TEXT NULL,
+            resume_snapshot_sha TEXT NULL,
             selection_task_id TEXT NULL,
             reformat_retry_task_id TEXT NULL,
             reformat_retry_runtime_ms INTEGER NULL,
@@ -432,6 +434,8 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     ("cancelled_at", "TEXT"),
     ("cancelled_by", "TEXT"),
     ("base_commit_sha", "TEXT"),
+    ("implementation_base_sha", "TEXT"),
+    ("resume_snapshot_sha", "TEXT"),
     # Process group of the live worker, so the stall sweep (#400) can stop it
     # from another process; NULL while no worker runs.
     ("worker_pgid", "INTEGER"),

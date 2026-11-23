@@ -288,6 +288,7 @@ class ImplementationMixin:
             worktree_path=worktree_path,
             branch_name=branch_name,
             base_commit_sha=base_commit_sha,
+            implementation_base_sha=base_commit_sha,
         )
 
         elog.info(
@@ -297,6 +298,15 @@ class ImplementationMixin:
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
         if github_work_tracking is not None:
             implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
+            implementation_base = _run_git(
+                ["rev-parse", "HEAD"], cwd=worktree_path, timeout=30,
+                elog=elog, phase="implementation",
+            )
+            if implementation_base.returncode == 0:
+                self._force_status(
+                    experiment_id, STATUS_IMPLEMENTING,
+                    implementation_base_sha=implementation_base.stdout.strip(),
+                )
         implementation_task_id = uuid.uuid4().hex
         use_local = (
             experiment.complexity == "small"

@@ -780,7 +780,10 @@ class RecordsMixin:
         return json.dumps(usage) if usage else None
 
 
-    def _transition(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:
+    def _transition(
+        self, experiment_id: str, from_status: str, to_status: str, *,
+        require_unowned: bool = False, **fields: Any,
+    ) -> bool:
         """Atomically move ``from_status`` -> ``to_status`` iff still ``from_status``.
 
         Returns True if the transition happened; extra ``fields`` are set in the same
@@ -796,7 +799,7 @@ class RecordsMixin:
         with self._lock, self._conn:
             cursor = self._conn.execute(
                 f"UPDATE experiments SET {', '.join(set_clauses)} "
-                "WHERE id = ? AND status = ?",
+                "WHERE id = ? AND status = ?" + (" AND resume_owner IS NULL" if require_unowned else ""),
                 values,
             )
             moved = cursor.rowcount == 1
@@ -961,7 +964,7 @@ class RecordsMixin:
                 and self._has_finished_implementation_work(row)
             ):
                 fields["resume_pending"] = 1
-            if self._transition(row["id"], row["status"], terminal_status, **fields):
+            if self._transition(row["id"], row["status"], terminal_status, require_unowned=True, **fields):
                 # Clearing the registry also makes in-process startup reconciliation safe and prevents
                 # stale cancellation targets.
                 with self._process_lock:

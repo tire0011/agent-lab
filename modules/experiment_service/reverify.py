@@ -178,6 +178,7 @@ def parked_candidates(service: Any, main_commit_sha: str, limit: int = 3) -> lis
         rows = service._conn.execute(
             """SELECT e.id FROM experiments e
                WHERE e.status=? AND e.error LIKE 'timing check failed closed%'
+                 AND e.resume_count = 0
                  AND NOT EXISTS (
                    SELECT 1 FROM reverifications r
                    WHERE r.experiment_id=e.id AND r.main_commit_sha=?
@@ -207,8 +208,9 @@ def reverify_parked(
     """
     isolated = outcome_path is not None
     experiment = service.get_experiment(experiment_id)
-    if experiment.status != STATUS_NEEDS_REVIEW or not str(experiment.error or "").startswith(
-        _ALLOWED_ERROR_PREFIXES
+    if (
+        experiment.resume_count or experiment.status != STATUS_NEEDS_REVIEW
+        or not str(experiment.error or "").startswith(_ALLOWED_ERROR_PREFIXES)
     ):
         return None
     repo = str(service.repo_root)

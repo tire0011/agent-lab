@@ -148,14 +148,17 @@ class StallSweepMixin:
 
         Returns the ids of the experiments marked stalled.
         """
+        from ..resume import recover_orphaned_resumes
+
         now = now or datetime.now(timezone.utc)
         if now.tzinfo is None:
             now = now.replace(tzinfo=timezone.utc)
+        recover_orphaned_resumes(self, now)
         grace = stall_grace_seconds()
         placeholders = ", ".join("?" * len(_STALL_SWEEP_STATUSES))
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT * FROM experiments WHERE status IN ({placeholders})",
+                f"SELECT * FROM experiments WHERE status IN ({placeholders}) AND resume_owner IS NULL",
                 _STALL_SWEEP_STATUSES,
             ).fetchall()
         stalled: list[str] = []
@@ -173,7 +176,7 @@ class StallSweepMixin:
             # alone, and once failed the woken pipeline thread cannot overwrite the verdict.
             if not self._transition(
                 experiment_id, phase, STATUS_FAILED,
-                ended_at=now.isoformat(), error=error, worker_pgid=None,
+                ended_at=now.isoformat(), error=error, worker_pgid=None, require_unowned=True,
             ):
                 continue
             worker = self._stop_stalled_worker(experiment_id, row["worker_pgid"])

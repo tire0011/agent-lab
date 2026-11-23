@@ -174,6 +174,8 @@ class Experiment:
     resume_pending: int = 0
     resume_count: int = 0
     resume_owner: str | None = None
+    implementation_base_sha: str | None = None
+    resume_snapshot_sha: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -272,6 +274,8 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         plan=_json_or_none(row["plan_json"]),
         worktree_path=row["worktree_path"],
         branch_name=row["branch_name"],
+        implementation_base_sha=row["implementation_base_sha"] if "implementation_base_sha" in row.keys() else None,
+        resume_snapshot_sha=row["resume_snapshot_sha"] if "resume_snapshot_sha" in row.keys() else None,
         base_commit_sha=row["base_commit_sha"] if "base_commit_sha" in row.keys() else None,
         research_task_id=row["research_task_id"],
         research_started_at=row["research_started_at"],

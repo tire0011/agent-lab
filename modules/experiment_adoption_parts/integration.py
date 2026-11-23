@@ -43,6 +43,8 @@ class IntegrationMixin:
             raise ExperimentAdoptionError("Der Experiment-Worktree ist nicht mehr verfügbar.")
 
         elog = self.experiment_service.get_experiment_logger(experiment_id)
+        if experiment.resume_snapshot_sha:
+            return self._validate_resumed_snapshot(experiment, worktree_path, elog, persist_review=persist_review)
         snapshot = self._capture_snapshot(worktree_path, elog, phase="adoption")
         current_status = (snapshot["git_status"] or "").strip()
         stored_status = (experiment.git_status or "").strip()
@@ -106,6 +108,55 @@ class IntegrationMixin:
             "expected_files": expected_files,
             "snapshot": snapshot,
             "committed_commit_sha": committed_commit_sha,
+        }
+
+
+    def _validate_resumed_snapshot(
+        self, experiment: Any, worktree_path: str, elog: Any, *, persist_review: bool,
+    ) -> dict[str, Any]:
+        experiment_id = experiment.id
+        if experiment.resume_owner:
+            raise ExperimentAdoptionError("Resume verification is still being finalized.")
+        commit = experiment.resume_snapshot_sha
+        tree = self._tree_sha_of(worktree_path, commit, elog, phase="adoption")
+        with self._lock:
+            verification = self._conn.execute(
+                "SELECT commit_sha FROM verification_runs WHERE experiment_id = ? "
+                "AND status = ? ORDER BY iteration DESC LIMIT 1",
+                (experiment_id, STATUS_SUCCEEDED),
+            ).fetchone()
+        verified_sha = verification[0] if verification else None
+        checkpoint = self._verified_checkpoint_sha(experiment_id, experiment)
+        if (
+            not tree or not verified_sha
+            or tree != self._tree_sha_of(worktree_path, verified_sha, elog, phase="adoption")
+            or (checkpoint and checkpoint != verified_sha)
+            or (not checkpoint and verified_sha != commit)
+        ):
+            raise ExperimentAdoptionError("Resume snapshot differs from the verified checkpoint.")
+        changed = _run_git(
+            ["diff", "--name-only", "--no-renames", "-z", experiment.implementation_base_sha, commit, "--"],
+            cwd=worktree_path, elog=elog, phase="adoption",
+        )
+        if changed.returncode != 0:
+            raise ExperimentAdoptionError("Could not inspect the verified resume snapshot.")
+        actual_files = [path for path in changed.stdout.split("\0") if path]
+        if not actual_files:
+            raise ExperimentAdoptionError("Keine Änderungen zur Übernahme vorhanden.")
+        expected_files = _safe_list(experiment.quality_evaluation.get("changed_files") or actual_files)
+        review_reason = self._review_reason(actual_files, expected_files)
+        if review_reason is not None:
+            if persist_review:
+                self._update_review_state(
+                    experiment_id, review_reason, actual_files=actual_files, expected_files=expected_files,
+                )
+            raise ExperimentAdoptionError(review_reason)
+        return {
+            "experiment": experiment,
+            "actual_files": actual_files,
+            "expected_files": expected_files,
+            "snapshot": {"diff_stat": experiment.diff_stat},
+            "committed_commit_sha": commit,
         }
 
 
