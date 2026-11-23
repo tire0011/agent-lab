@@ -169,9 +169,11 @@ class Experiment:
     baseline_test_classifications: dict[str, str] | None = None
     # Free resume of an interrupted run whose paid implementation finished (#783):
     # resume_pending=1 while the nexus tick has not picked it up yet; resume_count
-    # caps the resumes at one per experiment.
+    # counts resumes whose verification started (at most one per experiment);
+    # resume_owner names the process that runs a claimed resume.
     resume_pending: int = 0
     resume_count: int = 0
+    resume_owner: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -234,6 +236,7 @@ class Experiment:
             "baseline_test_classifications": self.baseline_test_classifications,
             "resume_pending": self.resume_pending,
             "resume_count": self.resume_count,
+            "resume_owner": self.resume_owner,
         }
 
 
@@ -315,6 +318,10 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
         ),
         resume_count=(
             int(row["resume_count"] or 0) if "resume_count" in row.keys() else 0
+        ),
+        resume_owner=(
+            (str(row["resume_owner"]) if row["resume_owner"] else None)
+            if "resume_owner" in row.keys() else None
         ),
     )
 

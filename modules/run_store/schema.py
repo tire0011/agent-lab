@@ -197,7 +197,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             -- An interrupted run whose paid implementation already finished is
             -- parked for a free resume instead of a new paid start (#783).
             resume_pending INTEGER NOT NULL DEFAULT 0,
-            resume_count INTEGER NOT NULL DEFAULT 0
+            resume_count INTEGER NOT NULL DEFAULT 0,
+            resume_owner TEXT NULL
         );
 
         CREATE TABLE IF NOT EXISTS experiment_reflections (
@@ -441,10 +442,13 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
     # Free resume of an interrupted run whose implementation already finished
-    # (#783): resume_pending=1 parks it for the nexus tick, resume_count caps
-    # the resumes at one per experiment.
+    # (#783): resume_pending=1 parks it for the nexus tick, resume_count counts
+    # resumes whose verification started (at most one per experiment), and
+    # resume_owner names the process running a claimed resume, so startup
+    # reconciliation only touches orphaned ones.
     ("resume_pending", "INTEGER NOT NULL DEFAULT 0"),
     ("resume_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("resume_owner", "TEXT"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

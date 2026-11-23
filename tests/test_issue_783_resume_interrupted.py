@@ -3,39 +3,78 @@
 A service restart used to mark such a run terminal, so the next try was a new
 paid start even though the coding agent had already finished. Now startup parks
 the run with ``resume_pending=1`` (when the worktree still holds the finished
-work) and the nexus tick resumes it: the uncommitted diff is committed and the
-existing ``_verify`` plus the adoption path run in the same worktree, without
-calling a coding provider.
+work) and the nexus tick resumes it with the existing verifier in the same
+worktree, without calling a coding provider.
+
+These tests use a temp git repo and a temp SQLite store, worker factories that
+raise if called, the real verifier and the real quality evaluator. The tracked
+cases use the real ``GitHubWorkTrackingService`` checkpoint code against a local
+bare ``origin``; only the GitHub REST transport is emulated.
 """
 
 from __future__ import annotations
 
+import os
+import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from modules.experiment_evaluation import EvaluationResult
+from modules import issue_approvals
+from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import (
     STATUS_FAILED,
     STATUS_INTERRUPTED,
+    STATUS_NEEDS_REVIEW,
     STATUS_SUCCEEDED,
     STATUS_VERIFYING,
+    ExperimentAlreadyActiveError,
     ExperimentService,
 )
+from modules.experiment_service import resume as resume_module
 from modules.experiment_service.resume import (
     RESUME_EVENT,
+    RESUME_FINISHED_EVENT,
     RESUME_MESSAGE,
+    RESUME_RECOVERED_EVENT,
+    RESUME_REF_PREFIX,
+    RESUME_SKIPPED_EVENT,
+    ResumeStepError,
+    owner_alive,
+    owner_token,
     resume_interrupted,
+    resume_stats,
 )
-from modules.github_work_tracking import _PROGRESS_MESSAGES
+from modules.github_work_tracking import (
+    _PROGRESS_MESSAGES,
+    GitHubCIVerification,
+    GitHubWorkRef,
+    GitHubWorkTrackingError,
+    GitHubWorkTrackingService,
+)
+from modules.measurement_health import check_pipelines, health_summary
 from modules.nexus_initiative import NexusInitiativeService
+from modules.nexus_status_issue import render as render_status
 
 NOW = datetime(2026, 11, 23, 12, 0, 0, tzinfo=timezone.utc)
+ISSUE_BRANCH = "nexus/issue-783"
+REPOSITORY = "owner/repo"
+
+FEATURE = "def answer():\n    return 42\n"
+FEATURE_TEST = (
+    "import unittest\n"
+    "from app.feature import answer\n"
+    "class FeatureTest(unittest.TestCase):\n"
+    "    def test_answer(self):\n"
+    "        self.assertEqual(answer(), 42)\n"
+)
+BROKEN_FEATURE_TEST = FEATURE_TEST.replace("42)", "41)")
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -45,20 +84,80 @@ def _git(repo: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def _raising_worker_factory():
-    def factory(_worktree_path):
-        raise AssertionError("a coding provider was called during a free resume")
+def _raising_factory(kind: str):
+    def factory(*_args, **_kwargs):
+        raise AssertionError(f"a {kind} was called during a free resume")
 
     return factory
 
 
-class ResumeInterruptedTestBase(unittest.TestCase):
+def _dead_owner_token() -> str:
+    """The owner token of a process that has already exited."""
+    proc = subprocess.Popen([sys.executable, "-c", "pass"])
+    proc.wait()
+    return f"{socket.gethostname()}:{proc.pid}:"
+
+
+class _FakeGitHub:
+    """The few GitHub REST calls the checkpoint and progress code makes."""
+
+    def __init__(self, bare: Path) -> None:
+        self.bare = bare
+        self.prs: list[dict] = []
+        self.pr_posts = 0
+        self.comments: list[str] = []
+
+    def branch_sha(self, branch: str) -> str | None:
+        proc = subprocess.run(
+            ["git", "--git-dir", str(self.bare), "rev-parse", "--verify", f"refs/heads/{branch}"],
+            text=True, capture_output=True,
+        )
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    def __call__(self, method: str, path: str, payload=None):
+        if method == "GET" and "/git/ref/heads/" in path:
+            branch = urllib.parse.unquote(path.split("/git/ref/heads/", 1)[1])
+            sha = self.branch_sha(branch)
+            if sha is None:
+                raise GitHubWorkTrackingError("HTTP 404: Not Found")
+            return {"object": {"sha": sha}}
+        if method == "GET" and "/pulls?" in path:
+            return list(self.prs)
+        if method == "POST" and path.endswith("/pulls"):
+            self.pr_posts += 1
+            pr = {"number": 7}
+            self.prs.append(pr)
+            return pr
+        if method == "PATCH" and "/pulls/" in path:
+            return {}
+        if method == "POST" and path.endswith("/comments"):
+            self.comments.append(str(payload["body"]))
+            return {}
+        raise AssertionError(f"unexpected GitHub call {method} {path}")
+
+
+class _Tracking(GitHubWorkTrackingService):
+    """Real checkpoint/progress code; CI is unavailable, so tests run locally."""
+
+    def wait_for_ci(self, experiment_id, **_kwargs):
+        ref = self.for_experiment(experiment_id)
+        return GitHubCIVerification(
+            status="unavailable", commit_sha=(ref.checkpoint_sha or "") if ref else "",
+            reason="no CI in tests",
+        )
+
+
+class ResumeTestBase(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
+        self.root = root
         self.repo = root / "repo"
         (self.repo / "tests").mkdir(parents=True)
+        (self.repo / "app").mkdir()
+        (self.repo / "app" / "__init__.py").write_text("", encoding="utf-8")
+        (self.repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
         (self.repo / "tests" / "test_base.py").write_text(
             "import unittest\n"
             "class T(unittest.TestCase):\n"
@@ -66,7 +165,7 @@ class ResumeInterruptedTestBase(unittest.TestCase):
             "        pass\n",
             encoding="utf-8",
         )
-        (self.repo / "README.md").write_text("base\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text("__pycache__/\n", encoding="utf-8")
         _git(self.repo, "init", "-q", "-b", "main")
         _git(self.repo, "config", "user.email", "test@example.com")
         _git(self.repo, "config", "user.name", "Test")
@@ -75,50 +174,51 @@ class ResumeInterruptedTestBase(unittest.TestCase):
         self.base_sha = _git(self.repo, "rev-parse", "HEAD")
         self.worktrees = root / "worktrees"
         self.worktrees.mkdir()
+        self.db_path = str(root / "agent.db")
         self.service = ExperimentService(
-            selection_worker=MagicMock(),
-            worker_factory=_raising_worker_factory(),
-            local_worker_factory=lambda _path: (_ for _ in ()).throw(
-                AssertionError("local worker called during a free resume")
-            ),
-            plan_worker_factory=lambda _path: (_ for _ in ()).throw(
-                AssertionError("plan worker called during a free resume")
-            ),
-            db_path=str(root / "agent.db"),
+            selection_worker=MagicMock(side_effect=AssertionError("selection worker called")),
+            worker_factory=_raising_factory("coding provider"),
+            local_worker_factory=_raising_factory("local worker"),
+            plan_worker_factory=_raising_factory("plan worker"),
+            db_path=self.db_path,
             repo_root=str(self.repo),
             worktrees_root=str(self.worktrees),
             test_python_executable=sys.executable,
             experiment_log_dir=str(root / "logs"),
         )
         self.addCleanup(self.service.close)
-        # Keep the deterministic quality gate out of the way of the resume tests.
-        quality = patch(
-            "modules.experiment_service.evaluate_implementation",
-            return_value=EvaluationResult(outcome="pass", reason="ok"),
-        )
-        quality.start()
-        self.addCleanup(quality.stop)
+        env = patch.dict(os.environ, {"NEXUS_TIMING_CHECK": "0"})
+        env.start()
+        self.addCleanup(env.stop)
 
-    def _make_worktree(self, branch: str, *, commit_change: bool) -> Path:
-        worktree = self.worktrees / branch
-        _git(self.repo, "worktree", "add", "-q", "-b", branch, str(worktree), self.base_sha)
-        if commit_change:
-            (worktree / "feature.txt").write_text("implemented\n", encoding="utf-8")
-            _git(worktree, "add", "feature.txt")
-            _git(worktree, "commit", "-q", "-m", "implemented change")
-        return worktree
+    # -- fixtures ---------------------------------------------------------------
 
-    def _add_experiment(
+    def _interrupted_run(
         self,
         *,
+        committed: bool = False,
         status: str = STATUS_VERIFYING,
         implementation_ended: bool = True,
-        worktree: Path | None = None,
-        branch: str = "exp-branch",
-        base: str | None = None,
         goal: str = "GitHub Issue #783: resume interrupted experiments",
-    ) -> str:
+        feature_test: str = FEATURE_TEST,
+        extra_files: dict[str, str] | None = None,
+        with_change: bool = True,
+    ) -> tuple[str, Path]:
+        """A run whose coder finished (or not) when the restart hit it."""
         experiment = self.service.create_experiment(goal)
+        branch = f"experiment/{experiment.id}"
+        worktree = self.worktrees / experiment.id
+        _git(self.repo, "worktree", "add", "-q", "-b", branch, str(worktree), self.base_sha)
+        if with_change:
+            (worktree / "app" / "feature.py").write_text(FEATURE, encoding="utf-8")
+            (worktree / "tests" / "test_feature.py").write_text(feature_test, encoding="utf-8")
+        for name, text in (extra_files or {}).items():
+            path = worktree / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        if committed:
+            _git(worktree, "add", "app/feature.py", "tests/test_feature.py")
+            _git(worktree, "commit", "-q", "-m", "implemented change")
         with self.service._conn:
             self.service._conn.execute(
                 """
@@ -127,33 +227,41 @@ class ResumeInterruptedTestBase(unittest.TestCase):
                 WHERE id = ?
                 """,
                 (
-                    status,
-                    NOW.isoformat() if implementation_ended else None,
-                    str(worktree) if worktree is not None else None,
-                    branch,
-                    base if base is not None else self.base_sha,
-                    experiment.id,
+                    status, NOW.isoformat() if implementation_ended else None,
+                    str(worktree), branch, self.base_sha, experiment.id,
                 ),
             )
-        return experiment.id
+        return experiment.id, worktree
 
-    def _fake_verify(self, status: str):
-        calls: list[tuple] = []
+    def _events(self, experiment_id: str, event: str) -> list[dict]:
+        return [
+            entry for entry in self.service.list_activity(limit=500, experiment_id=experiment_id)
+            if entry.get("event") == event
+        ]
 
-        def verify(experiment_id, worktree_path, elog=None, **kwargs):
-            calls.append((experiment_id, worktree_path, kwargs))
-            self.service._force_status(
-                experiment_id, status, ended_at=NOW.isoformat(), error=None,
-            )
-            return self.service.get_experiment(experiment_id)
+    def _link_issue(self, experiment_id: str, issue: int = 783) -> None:
+        tracking = GitHubWorkTrackingService(
+            db_path=self.db_path, repo_root=str(self.repo), repository=REPOSITORY,
+            transport=lambda *_a: {},
+        )
+        self.addCleanup(tracking.close)
+        tracking.bind_experiment(
+            GitHubWorkRef(issue_number=issue, issue_title="issue", branch_name=ISSUE_BRANCH),
+            experiment_id,
+        )
 
-        return verify, calls
+    def _initiative(self, **kwargs) -> NexusInitiativeService:
+        initiative = NexusInitiativeService(
+            db_path=self.db_path, experiment_service=self.service,
+            daily_budget=5, reflection_sweep=lambda **_kw: None, **kwargs,
+        )
+        self.addCleanup(initiative.close)
+        return initiative
 
 
-class MarkInterruptedClassificationTests(ResumeInterruptedTestBase):
+class MarkInterruptedClassificationTests(ResumeTestBase):
     def test_finished_implementation_with_commit_is_parked_for_resume(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(worktree=worktree)
+        experiment_id, _ = self._interrupted_run(committed=True)
 
         marked = self.service.mark_interrupted_experiments_failed()
 
@@ -165,30 +273,22 @@ class MarkInterruptedClassificationTests(ResumeInterruptedTestBase):
         self.assertEqual(experiment.resume_count, 0)
 
     def test_uncommitted_diff_alone_also_parks_the_run(self):
-        worktree = self._make_worktree("exp-branch", commit_change=False)
-        (worktree / "feature.txt").write_text("uncommitted\n", encoding="utf-8")
-        experiment_id = self._add_experiment(worktree=worktree)
-
+        experiment_id, _ = self._interrupted_run()
         self.service.mark_interrupted_experiments_failed()
-
         self.assertEqual(self.service.get_experiment(experiment_id).resume_pending, 1)
 
     def test_interrupted_during_implementation_is_not_parked(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(
-            status="implementing", implementation_ended=False, worktree=worktree,
+        experiment_id, _ = self._interrupted_run(
+            committed=True, status="implementing", implementation_ended=False,
         )
-
         self.service.mark_interrupted_experiments_failed()
-
         experiment = self.service.get_experiment(experiment_id)
         self.assertEqual(experiment.status, STATUS_INTERRUPTED)
         self.assertEqual(experiment.resume_pending, 0)
 
     def test_missing_worktree_keeps_todays_behaviour(self):
-        experiment_id = self._add_experiment(
-            worktree=self.worktrees / "gone", branch="gone-branch",
-        )
+        experiment_id, worktree = self._interrupted_run(committed=True)
+        shutil.rmtree(worktree)
 
         marked = self.service.mark_interrupted_experiments_failed()
 
@@ -198,227 +298,620 @@ class MarkInterruptedClassificationTests(ResumeInterruptedTestBase):
         self.assertEqual(experiment.resume_pending, 0)
 
     def test_clean_worktree_without_commits_is_not_parked(self):
-        worktree = self._make_worktree("exp-branch", commit_change=False)
-        experiment_id = self._add_experiment(worktree=worktree)
-
+        experiment_id, _ = self._interrupted_run(with_change=False)
         self.service.mark_interrupted_experiments_failed()
-
         self.assertEqual(self.service.get_experiment(experiment_id).resume_pending, 0)
 
+    def test_startup_leaves_a_live_tick_owned_resume_alone(self):
+        # The API restarts while the nexus tick (another live process) verifies.
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        self.assertTrue(resume_module._claim(self.service, experiment_id, owner_token(), NOW.isoformat()))
 
-class ResumeInterruptedTests(ResumeInterruptedTestBase):
-    def test_finished_implementation_is_resumed_and_verified_without_worker_calls(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(worktree=worktree)
+        self.assertEqual(self.service.mark_interrupted_experiments_failed(), [])
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_VERIFYING)
+        self.assertEqual(experiment.resume_owner, owner_token())
+
+    def test_startup_reparks_an_orphaned_resume_that_never_verified(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        dead = _dead_owner_token()
+        self.assertFalse(owner_alive(dead))
+        self.assertTrue(resume_module._claim(self.service, experiment_id, dead, NOW.isoformat()))
+
+        self.assertEqual(self.service.mark_interrupted_experiments_failed(), [experiment_id])
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_INTERRUPTED)
+        self.assertEqual(experiment.resume_pending, 1)
+        self.assertEqual(experiment.resume_count, 0)
+        self.assertIsNone(experiment.resume_owner)
+        self.assertEqual(len(self._events(experiment_id, RESUME_RECOVERED_EVENT)), 1)
+
+    def test_startup_spends_an_orphaned_resume_that_was_verifying(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        dead = _dead_owner_token()
+        resume_module._claim(self.service, experiment_id, dead, NOW.isoformat())
+        self.assertTrue(resume_module._start_verification(self.service, experiment_id, dead))
+
+        self.assertEqual(self.service.mark_interrupted_experiments_failed(), [experiment_id])
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_INTERRUPTED)
+        self.assertEqual(experiment.resume_pending, 0)
+        self.assertEqual(experiment.resume_count, 1)
+        self.assertIn("during verification", experiment.error)
+        finished = self._events(experiment_id, RESUME_FINISHED_EVENT)
+        self.assertEqual([e["to_status"] for e in finished], [STATUS_INTERRUPTED])
+        # Spent: never resumed again.
+        self.assertIsNone(resume_interrupted(self.service, NOW))
+
+
+class ResumeInterruptedTests(ResumeTestBase):
+    def test_committed_work_is_verified_as_the_full_delta_without_worker_calls(self):
+        experiment_id, worktree = self._interrupted_run(committed=True)
+        committed_head = _git(worktree, "rev-parse", "HEAD")
         self.service.mark_interrupted_experiments_failed()
 
-        with patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "0"}):
-            summary = resume_interrupted(self.service, NOW)
+        summary = resume_interrupted(self.service, NOW)
 
-        self.assertIsNotNone(summary)
+        self.assertTrue(summary["resumed"])
         self.assertEqual(summary["experiment_id"], experiment_id)
         experiment = self.service.get_experiment(experiment_id)
-        # The real verifier ran the suite in the same worktree and passed.
+        # Real verifier and real quality evaluator; the raising worker factories
+        # were never touched: zero provider calls.
         self.assertEqual(experiment.status, STATUS_SUCCEEDED, experiment.error)
         self.assertEqual(experiment.test_exit_code, 0)
+        self.assertEqual(experiment.quality_evaluation["outcome"], "pass")
+        self.assertIn("app/feature.py", experiment.quality_evaluation["changed_files"])
+        self.assertIn("app/feature.py", experiment.diff_text)
+        # The committed work is the change relative to the recorded base ...
+        self.assertEqual(_git(worktree, "rev-parse", "HEAD"), self.base_sha)
+        self.assertEqual((worktree / "app" / "feature.py").read_text(), FEATURE)
+        # Nothing was uncommitted, so no resume commit; the commit stays in the reflog.
+        self.assertIsNone(summary["resume_commit_sha"])
+        self.assertTrue(summary["head_reset_to_base"])
+        self.assertIn(committed_head, _git(worktree, "reflog", "--format=%H"))
         self.assertEqual(experiment.resume_count, 1)
         self.assertEqual(experiment.resume_pending, 0)
-        # The raising worker factories were never touched: zero provider calls.
-        events = [
-            entry for entry in self.service.list_activity(experiment_id=experiment_id)
-            if entry.get("event") == RESUME_EVENT
-        ]
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["message"], RESUME_MESSAGE)
-        self.assertEqual(events[0]["from_status"], STATUS_INTERRUPTED)
+        self.assertIsNone(experiment.resume_owner)
+        started = self._events(experiment_id, RESUME_EVENT)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["message"], RESUME_MESSAGE)
+        self.assertEqual(started[0]["from_status"], STATUS_INTERRUPTED)
+        finished = self._events(experiment_id, RESUME_FINISHED_EVENT)
+        self.assertEqual([e["to_status"] for e in finished], [STATUS_SUCCEEDED])
         self.assertEqual(RESUME_MESSAGE, "resumed after restart, no new paid start")
 
-    def test_resume_commits_the_uncommitted_diff_before_verifying(self):
-        worktree = self._make_worktree("exp-branch", commit_change=False)
-        (worktree / "feature.txt").write_text("uncommitted\n", encoding="utf-8")
-        experiment_id = self._add_experiment(worktree=worktree)
-        self.service.mark_interrupted_experiments_failed()
+    def test_uncommitted_diff_is_committed_without_secrets_and_verified_in_full(self):
+        experiment_id, worktree = self._interrupted_run(
+            extra_files={".env": "TOKEN=do-not-publish\n", "state/run.json": "{}\n"},
+        )
         head_before = _git(worktree, "rev-parse", "HEAD")
+        self.service.mark_interrupted_experiments_failed()
 
-        verify, calls = self._fake_verify(STATUS_SUCCEEDED)
-        with patch.object(self.service, "_verify", verify):
-            summary = resume_interrupted(self.service, NOW)
+        summary = resume_interrupted(self.service, NOW)
 
-        self.assertEqual(summary["status"], STATUS_SUCCEEDED)
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(calls[0][0], experiment_id)
-        self.assertEqual(calls[0][1], str(worktree))
-        # The uncommitted diff was committed, not lost.
-        self.assertEqual(_git(worktree, "status", "--porcelain"), "")
-        self.assertNotEqual(_git(worktree, "rev-parse", "HEAD"), head_before)
-        self.assertIn("feature.txt", _git(worktree, "show", "--name-only", "--format=", "HEAD"))
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_SUCCEEDED, experiment.error)
+        self.assertIn("app/feature.py", experiment.quality_evaluation["changed_files"])
+        commit = summary["resume_commit_sha"]
+        self.assertEqual(_git(worktree, "rev-parse", f"{RESUME_REF_PREFIX}{experiment_id}"), commit)
+        files = _git(worktree, "show", "--name-only", "--format=", commit).splitlines()
+        self.assertIn("app/feature.py", files)
+        self.assertIn("tests/test_feature.py", files)
+        self.assertNotIn(".env", files)
+        self.assertNotIn("state/run.json", files)
+        # HEAD and the worktree files are untouched; nothing was lost.
+        self.assertEqual(_git(worktree, "rev-parse", "HEAD"), head_before)
+        self.assertTrue((worktree / ".env").exists())
 
     def test_interrupted_during_implementation_is_not_resumed(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(
-            status="implementing", implementation_ended=False, worktree=worktree,
+        experiment_id, _ = self._interrupted_run(
+            committed=True, status="implementing", implementation_ended=False,
         )
         self.service.mark_interrupted_experiments_failed()
 
-        verify, calls = self._fake_verify(STATUS_SUCCEEDED)
-        with patch.object(self.service, "_verify", verify):
-            summary = resume_interrupted(self.service, NOW)
+        with patch.object(self.service, "_verify") as verify:
+            self.assertIsNone(resume_interrupted(self.service, NOW))
 
-        self.assertIsNone(summary)
-        self.assertEqual(calls, [])
+        verify.assert_not_called()
         self.assertEqual(self.service.get_experiment(experiment_id).status, STATUS_INTERRUPTED)
+        self.assertEqual(self._events(experiment_id, RESUME_EVENT), [])
 
-    def test_failed_resume_is_not_resumed_a_second_time(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(worktree=worktree)
+    def test_failed_resume_is_not_resumed_a_second_time_and_then_counts(self):
+        experiment_id, _ = self._interrupted_run(feature_test=BROKEN_FEATURE_TEST)
         self.service.mark_interrupted_experiments_failed()
+        self._link_issue(experiment_id)
+        initiative = self._initiative()
+        blocked, _ = initiative._issue_attempts()
+        self.assertIn(783, blocked)  # reserved while pending
 
-        verify, calls = self._fake_verify(STATUS_FAILED)
-        with patch.object(self.service, "_verify", verify):
-            first = resume_interrupted(self.service, NOW)
+        first = resume_interrupted(self.service, NOW)
+        with patch.object(self.service, "_verify") as verify:
             second = resume_interrupted(self.service, NOW)
 
         self.assertEqual(first["status"], STATUS_FAILED)
         self.assertIsNone(second)
-        self.assertEqual(len(calls), 1)
+        verify.assert_not_called()
         experiment = self.service.get_experiment(experiment_id)
         self.assertEqual(experiment.status, STATUS_FAILED)
         self.assertEqual(experiment.resume_count, 1)
-        self.assertEqual(experiment.resume_pending, 0)
-
-    def test_missing_worktree_falls_back_and_is_not_resumed(self):
-        experiment_id = self._add_experiment(
-            worktree=self.worktrees / "gone", branch="gone-branch",
+        # Now the attempt counts: the issue is free for a retry, one attempt used.
+        blocked, exhausted = initiative._issue_attempts()
+        self.assertNotIn(783, blocked)
+        self.assertNotIn(783, exhausted)
+        self.assertEqual(
+            [e["to_status"] for e in self._events(experiment_id, RESUME_FINISHED_EVENT)],
+            [STATUS_FAILED],
         )
+
+    def test_missing_worktree_at_resume_time_falls_back_truthfully(self):
+        experiment_id, worktree = self._interrupted_run(committed=True)
         self.service.mark_interrupted_experiments_failed()
+        self.assertEqual(self.service.get_experiment(experiment_id).resume_pending, 1)
+        shutil.rmtree(worktree)
+        tracking = MagicMock()
 
-        verify, calls = self._fake_verify(STATUS_SUCCEEDED)
-        with patch.object(self.service, "_verify", verify):
-            summary = resume_interrupted(self.service, NOW)
+        with patch.object(self.service, "_verify") as verify:
+            summary = resume_interrupted(self.service, NOW, github_work_tracking=tracking)
 
-        self.assertIsNone(summary)
-        self.assertEqual(calls, [])
+        verify.assert_not_called()
+        tracking.post_progress.assert_not_called()
+        self.assertFalse(summary["resumed"])
+        self.assertEqual(summary["skipped"][0]["reason"], "worktree missing")
         experiment = self.service.get_experiment(experiment_id)
         self.assertEqual(experiment.status, STATUS_INTERRUPTED)
         self.assertEqual(experiment.resume_pending, 0)
+        # No resume is reported for a run that was not resumed.
+        self.assertEqual(self._events(experiment_id, RESUME_EVENT), [])
+        self.assertEqual(len(self._events(experiment_id, RESUME_SKIPPED_EVENT)), 1)
+        self.assertIsNone(resume_interrupted(self.service, NOW))
 
     def test_at_most_one_resume_per_call(self):
-        first_worktree = self._make_worktree("branch-one", commit_change=True)
-        second_worktree = self._make_worktree("branch-two", commit_change=True)
-        first_id = self._add_experiment(worktree=first_worktree, branch="branch-one", goal="one")
-        second_id = self._add_experiment(worktree=second_worktree, branch="branch-two", goal="two")
+        first_id, _ = self._interrupted_run(goal="GitHub Issue #901: one")
+        second_id, _ = self._interrupted_run(goal="GitHub Issue #902: two")
         self.service.mark_interrupted_experiments_failed()
 
-        verify, calls = self._fake_verify(STATUS_SUCCEEDED)
-        with patch.object(self.service, "_verify", verify):
-            first = resume_interrupted(self.service, NOW)
-            second = resume_interrupted(self.service, NOW)
-            third = resume_interrupted(self.service, NOW)
+        first = resume_interrupted(self.service, NOW)
+        self.assertEqual(self.service.get_experiment(second_id).resume_pending, 1)
+        second = resume_interrupted(self.service, NOW)
+        third = resume_interrupted(self.service, NOW)
 
         self.assertEqual(first["experiment_id"], first_id)
         self.assertEqual(second["experiment_id"], second_id)
         self.assertIsNone(third)
-        self.assertEqual(len(calls), 2)
 
-    def test_passing_resume_queues_the_normal_adoption_and_posts_the_comment(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(worktree=worktree)
+    def test_failed_commit_stops_the_resume_with_a_recorded_failure(self):
+        experiment_id, worktree = self._interrupted_run()
         self.service.mark_interrupted_experiments_failed()
+        real = resume_module._git_or_raise
 
-        adoption = SimpleNamespace(start_adoption=MagicMock())
-        tracking = SimpleNamespace(post_progress=MagicMock(return_value=True))
-        wrapper = SimpleNamespace(
-            experiment_service=self.service, adoption_service=adoption,
-            github_work_tracking=tracking,
+        def failing(args, *rest, **kwargs):
+            if args[0] == "commit-tree":
+                raise ResumeStepError("could not commit the resume snapshot: disk full")
+            return real(args, *rest, **kwargs)
+
+        with patch.object(resume_module, "_git_or_raise", failing), \
+                patch.object(self.service, "_verify") as verify:
+            summary = resume_interrupted(self.service, NOW)
+
+        verify.assert_not_called()
+        self.assertEqual(summary["status"], STATUS_INTERRUPTED)
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_INTERRUPTED)
+        self.assertIn("resume stopped before verification", experiment.error)
+        self.assertIn("disk full", experiment.error)
+        self.assertEqual(experiment.resume_pending, 0)
+        self.assertIsNone(experiment.resume_owner)
+        finished = self._events(experiment_id, RESUME_FINISHED_EVENT)
+        self.assertEqual([e["to_status"] for e in finished], [STATUS_INTERRUPTED])
+        self.assertIn("stopped before verification", finished[0]["message"])
+        # Nothing was committed and the worktree still holds the work.
+        self.assertTrue((worktree / "app" / "feature.py").exists())
+        self.assertIsNone(resume_interrupted(self.service, NOW))
+
+    def test_revoked_issue_is_not_resumed_and_its_worktree_is_untouched(self):
+        experiment_id, worktree = self._interrupted_run(committed=True)
+        self.service.mark_interrupted_experiments_failed()
+        self._link_issue(experiment_id)
+        initiative = self._initiative(repository=REPOSITORY)
+        issue_approvals.record_decision(
+            initiative._conn, repository=REPOSITORY, issue_number=783,
+            status=issue_approvals.STATUS_REVOKED,
         )
-        verify, calls = self._fake_verify(STATUS_SUCCEEDED)
-        with patch.object(self.service, "_verify", verify):
-            summary = resume_interrupted(wrapper, NOW)
+        initiative._conn.commit()
+        head_before = _git(worktree, "rev-parse", "HEAD")
 
+        with patch.object(self.service, "_verify") as verify:
+            summary = resume_interrupted(
+                self.service, NOW, approval_block=initiative._resume_approval_block,
+            )
+
+        verify.assert_not_called()
+        self.assertFalse(summary["resumed"])
+        self.assertIn("revoked", summary["skipped"][0]["reason"])
+        self.assertEqual(_git(worktree, "rev-parse", "HEAD"), head_before)
+        missing = subprocess.run(
+            ["git", "rev-parse", "--verify", f"{RESUME_REF_PREFIX}{experiment_id}"],
+            cwd=worktree, capture_output=True,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertEqual(self.service.get_experiment(experiment_id).resume_pending, 0)
+
+    def test_failed_activity_write_rolls_the_claim_back(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        real = resume_module.insert_activity
+
+        def failing(conn, **kwargs):
+            if kwargs.get("event") == RESUME_EVENT:
+                raise RuntimeError("disk I/O error")
+            return real(conn, **kwargs)
+
+        with patch.object(resume_module, "insert_activity", failing):
+            with self.assertRaises(RuntimeError):
+                resume_interrupted(self.service, NOW)
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_INTERRUPTED)
+        self.assertEqual(experiment.resume_pending, 1)
+        self.assertEqual(experiment.resume_count, 0)
+        self.assertIsNone(experiment.resume_owner)
+        # The next tick resumes it normally.
+        self.assertEqual(resume_interrupted(self.service, NOW)["status"], STATUS_SUCCEEDED)
+
+    def test_process_exit_between_claim_and_verification_is_recovered(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        # A tick claimed it and was killed before verification started.
+        self.assertTrue(
+            resume_module._claim(self.service, experiment_id, _dead_owner_token(), NOW.isoformat())
+        )
+        self.assertEqual(self.service.get_experiment(experiment_id).status, STATUS_VERIFYING)
+
+        summary = resume_interrupted(self.service, NOW)
+
+        self.assertEqual(summary["experiment_id"], experiment_id)
         self.assertEqual(summary["status"], STATUS_SUCCEEDED)
-        self.assertEqual(summary.get("adoption"), "queued")
-        adoption.start_adoption.assert_called_once_with(experiment_id)
-        tracking.post_progress.assert_called_once_with(experiment_id, RESUME_EVENT)
-        self.assertEqual(
-            _PROGRESS_MESSAGES[RESUME_EVENT], "resumed after restart, no new paid start",
-        )
-        # A second tick must not resume (or adopt) the same run again.
-        with patch.object(self.service, "_verify", verify):
-            self.assertIsNone(resume_interrupted(wrapper, NOW))
-        adoption.start_adoption.assert_called_once_with(experiment_id)
+        self.assertEqual(len(self._events(experiment_id, RESUME_RECOVERED_EVENT)), 1)
+        self.assertEqual(len(self._events(experiment_id, RESUME_EVENT)), 2)
+        stats = resume_stats(self.service._conn, datetime.now(timezone.utc))
+        self.assertEqual(stats["resumed"], 1)
+        self.assertEqual(stats["saved_paid_starts"], 1)
 
-    def test_failing_resume_does_not_queue_adoption(self):
-        worktree = self._make_worktree("exp-branch", commit_change=True)
-        experiment_id = self._add_experiment(worktree=worktree)
+    def test_a_resume_that_keeps_dying_before_verification_stops(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        for _ in range(resume_module._MAX_RESUME_CLAIMS):
+            self.assertTrue(resume_module._claim(
+                self.service, experiment_id, _dead_owner_token(), NOW.isoformat(),
+            ))
+            resume_module.recover_orphaned_resumes(self.service, NOW)
+
+        with patch.object(self.service, "_verify") as verify:
+            resume_interrupted(self.service, NOW)
+
+        verify.assert_not_called()
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(experiment.status, STATUS_INTERRUPTED)
+        self.assertEqual(experiment.resume_pending, 0)
+
+    def test_concurrent_claim_runs_only_once(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        self.assertTrue(resume_module._claim(self.service, experiment_id, owner_token(), NOW.isoformat()))
+
+        # A second tick while the first one (alive) still verifies.
+        self.assertFalse(resume_module._claim(self.service, experiment_id, owner_token(), NOW.isoformat()))
+        with patch.object(self.service, "_verify") as verify:
+            self.assertIsNone(resume_interrupted(self.service, NOW))
+        verify.assert_not_called()
+
+    def test_crashed_verifier_goes_to_review(self):
+        experiment_id, _ = self._interrupted_run()
         self.service.mark_interrupted_experiments_failed()
 
-        adoption = SimpleNamespace(start_adoption=MagicMock())
-        wrapper = SimpleNamespace(experiment_service=self.service, adoption_service=adoption)
-        verify, _calls = self._fake_verify(STATUS_FAILED)
-        with patch.object(self.service, "_verify", verify):
-            summary = resume_interrupted(wrapper, NOW)
+        with patch.object(self.service, "_verify", side_effect=RuntimeError("boom")):
+            summary = resume_interrupted(self.service, NOW)
 
-        self.assertEqual(summary["status"], STATUS_FAILED)
+        self.assertEqual(summary["status"], STATUS_NEEDS_REVIEW)
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertIn("resume verification error", experiment.error)
+        self.assertIsNone(experiment.resume_owner)
+        self.assertIsNone(resume_interrupted(self.service, NOW))
+
+    def test_passing_resume_is_left_to_the_integration_scheduler(self):
+        experiment_id, _ = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        adoption = MagicMock()
+
+        resume_interrupted(self.service, NOW)
+
         adoption.start_adoption.assert_not_called()
+        initiative = self._initiative(adoption_service=adoption)
+        refs = [c.ref for c in initiative._integration_candidates()]
+        self.assertEqual(refs, [experiment_id])
 
 
-class PendingResumeAttemptAccountingTests(ResumeInterruptedTestBase):
-    def _link_issue(self, experiment_id: str, issue: int = 783) -> None:
-        with self.service._conn:
-            self.service._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS github_experiment_links (
-                    experiment_id TEXT PRIMARY KEY,
-                    issue_number INTEGER NOT NULL,
-                    issue_title TEXT NOT NULL,
-                    branch_name TEXT NOT NULL,
-                    pr_number INTEGER,
-                    checkpoint_sha TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self.service._conn.execute(
-                """
-                INSERT INTO github_experiment_links
-                    (experiment_id, issue_number, issue_title, branch_name,
-                     created_at, updated_at)
-                VALUES (?, ?, 'issue', 'branch', ?, ?)
-                """,
-                (experiment_id, issue, NOW.isoformat(), NOW.isoformat()),
-            )
+class TrackedResumeTests(ResumeTestBase):
+    """The normal GitHub checkpoint, diagnostics and adoption validation."""
 
-    def test_pending_resume_does_not_count_as_a_used_attempt(self):
+    def setUp(self) -> None:
+        super().setUp()
+        self.bare = self.root / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(self.bare)], check=True)
+        _git(self.repo, "remote", "add", "origin", str(self.bare))
+        _git(self.repo, "push", "-q", "origin", "main", f"main:refs/heads/{ISSUE_BRANCH}")
+        _git(self.repo, "fetch", "-q", "origin")
+        self.github = _FakeGitHub(self.bare)
+        self.tracking = _Tracking(
+            db_path=self.db_path, repo_root=str(self.repo), repository=REPOSITORY,
+            transport=self.github,
+        )
+        self.addCleanup(self.tracking.close)
+        self.adoption = ExperimentAdoptionService(
+            experiment_service=self.service, db_path=self.db_path, repo_root=str(self.repo),
+            worktrees_root=str(self.worktrees), lock_path=str(self.root / "adoption.lock"),
+            github_work_tracking=self.tracking,
+        )
+        self.addCleanup(self.adoption.close)
+
+    def _tracked_run(self, **kwargs) -> tuple[str, Path]:
+        experiment_id, worktree = self._interrupted_run(**kwargs)
+        self.tracking.bind_experiment(
+            GitHubWorkRef(issue_number=783, issue_title="Resume", branch_name=ISSUE_BRANCH),
+            experiment_id,
+        )
+        return experiment_id, worktree
+
+    def _assert_adoptable(self, experiment_id: str) -> None:
+        validation = self.adoption._validate_startable(experiment_id, persist_review=False)
+        self.assertIn("app/feature.py", validation["actual_files"])
+
+    def test_resume_publishes_the_checkpoint_and_passes_adoption_validation(self):
+        experiment_id, _ = self._tracked_run(extra_files={"state/run.json": "{}\n"})
+        self.service.mark_interrupted_experiments_failed()
+
+        summary = resume_interrupted(self.service, NOW, github_work_tracking=self.tracking)
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(summary["status"], STATUS_SUCCEEDED, experiment.error)
+        checkpoint = self.tracking.for_experiment(experiment_id).checkpoint_sha
+        self.assertEqual(self.github.branch_sha(ISSUE_BRANCH), checkpoint)
+        published = _git(self.repo, "--git-dir", str(self.bare), "show", "--name-only",
+                         "--format=", checkpoint).splitlines()
+        self.assertIn("app/feature.py", published)
+        self.assertNotIn("state/run.json", published)
+        self.assertEqual(self.github.pr_posts, 1)
+        self.assertTrue(any(RESUME_MESSAGE in body for body in self.github.comments))
+        self.assertEqual(_PROGRESS_MESSAGES[RESUME_EVENT], RESUME_MESSAGE)
+        self._assert_adoptable(experiment_id)
+
+    def test_root_secret_files_never_reach_the_checkpoint(self):
+        experiment_id, _ = self._tracked_run(
+            extra_files={".env": "TOKEN=do-not-publish\n", ".venv/lib.py": "x = 1\n"},
+        )
+        self.service.mark_interrupted_experiments_failed()
+
+        resume_interrupted(self.service, NOW, github_work_tracking=self.tracking)
+
+        checkpoint = self.tracking.for_experiment(experiment_id).checkpoint_sha
+        published = _git(self.repo, "--git-dir", str(self.bare), "ls-tree", "-r",
+                         "--name-only", checkpoint).splitlines()
+        self.assertIn("app/feature.py", published)
+        self.assertNotIn(".env", published)
+        self.assertNotIn(".venv/lib.py", published)
+
+    def test_checkpoint_published_before_the_restart_is_reused(self):
+        experiment_id, worktree = self._tracked_run()
+        before = self.tracking.checkpoint_experiment(experiment_id, str(worktree)).checkpoint_sha
+        self.assertEqual(self.github.pr_posts, 1)
+        self.service.mark_interrupted_experiments_failed()
+
+        summary = resume_interrupted(self.service, NOW, github_work_tracking=self.tracking)
+
+        self.assertEqual(summary["status"], STATUS_SUCCEEDED,
+                         self.service.get_experiment(experiment_id).error)
+        # Same checkpoint, same PR: no duplicate.
+        self.assertEqual(self.tracking.for_experiment(experiment_id).checkpoint_sha, before)
+        self.assertEqual(self.github.branch_sha(ISSUE_BRANCH), before)
+        self.assertEqual(self.github.pr_posts, 1)
+        self._assert_adoptable(experiment_id)
+
+    def test_committed_work_is_checkpointed_and_adoptable(self):
+        experiment_id, _ = self._tracked_run(committed=True)
+        self.service.mark_interrupted_experiments_failed()
+
+        summary = resume_interrupted(self.service, NOW, github_work_tracking=self.tracking)
+
+        experiment = self.service.get_experiment(experiment_id)
+        self.assertEqual(summary["status"], STATUS_SUCCEEDED, experiment.error)
+        self.assertIn("app/feature.py", experiment.quality_evaluation["changed_files"])
+        checkpoint = self.tracking.for_experiment(experiment_id).checkpoint_sha
+        self.assertEqual(self.github.branch_sha(ISSUE_BRANCH), checkpoint)
+        self._assert_adoptable(experiment_id)
+
+    def test_resume_comment_is_posted_once_even_when_recovered(self):
+        experiment_id, _ = self._tracked_run()
+        self.service.mark_interrupted_experiments_failed()
+        resume_module._claim(self.service, experiment_id, _dead_owner_token(), NOW.isoformat())
+        self.tracking.post_progress(experiment_id, RESUME_EVENT)
+
+        resume_interrupted(self.service, NOW, github_work_tracking=self.tracking)
+
+        self.assertEqual(sum(RESUME_MESSAGE in body for body in self.github.comments), 1)
+
+
+class PublicationExclusionTests(unittest.TestCase):
+    def test_root_dotfiles_are_matched_by_the_exclusions(self):
+        # lstrip("./") used to turn ".env" into "env", so root secrets passed.
+        publishable = GitHubWorkTrackingService._publishable_path
+        for path in (".env", "./.env", ".env.local", ".venv/lib.py", "state/x.json", "id.pem"):
+            self.assertFalse(publishable(path), path)
+        for path in ("app/x.py", "./app/x.py", ".github/workflows/tests.yml", ".gitignore"):
+            self.assertTrue(publishable(path), path)
+
+
+class PendingResumeAccountingTests(ResumeTestBase):
+    def test_pending_resume_reserves_the_issue_without_counting_as_an_attempt(self):
         ids = []
-        for index in range(3):  # over _MAX_ISSUE_ATTEMPTS once the resumes are spent
-            worktree = self._make_worktree(f"branch-{index}", commit_change=True)
-            ids.append(self._add_experiment(
-                worktree=worktree, branch=f"branch-{index}", goal=f"GitHub Issue #783 part {index}",
-            ))
+        for index in range(3):  # more than _MAX_ISSUE_ATTEMPTS once spent
+            experiment_id, _ = self._interrupted_run(goal=f"GitHub Issue #783 part {index}")
+            ids.append(experiment_id)
         self.service.mark_interrupted_experiments_failed()
         for experiment_id in ids:
             self.assertEqual(self.service.get_experiment(experiment_id).resume_pending, 1)
             self._link_issue(experiment_id)
+        initiative = self._initiative()
 
-        initiative = NexusInitiativeService(
-            db_path=self.service.db_path, experiment_service=self.service,
-            daily_budget=5, reflection_sweep=lambda **kwargs: None,
-        )
-        self.addCleanup(initiative.close)
         blocked, exhausted = initiative._issue_attempts()
 
-        # While the resumes are still pending, none of them is a used attempt.
-        self.assertNotIn(783, blocked)
+        # Reserved against a replacement start, but no attempt is used up.
+        self.assertIn(783, blocked)
         self.assertNotIn(783, exhausted)
 
-        # Once the resumes are spent (resume_pending cleared), the interrupted
-        # runs count again and exhaust the issue's attempts.
+        # Once the resumes are spent, the interrupted runs count again.
         with self.service._conn:
             self.service._conn.execute("UPDATE experiments SET resume_pending = 0")
         blocked, exhausted = initiative._issue_attempts()
         self.assertIn(783, exhausted)
         self.assertEqual(sorted(exhausted[783]["experiment_ids"]), sorted(ids))
+
+    def test_one_failed_resume_keeps_the_issue_reserved_for_the_other_pending_one(self):
+        failing_id, _ = self._interrupted_run(
+            goal="GitHub Issue #783 first", feature_test=BROKEN_FEATURE_TEST,
+        )
+        waiting_id, _ = self._interrupted_run(goal="GitHub Issue #783 second")
+        self.service.mark_interrupted_experiments_failed()
+        self._link_issue(failing_id)
+        self._link_issue(waiting_id)
+
+        self.assertEqual(resume_interrupted(self.service, NOW)["status"], STATUS_FAILED)
+
+        blocked, _ = self._initiative()._issue_attempts()
+        self.assertIn(783, blocked)
+        self.assertEqual(self.service.get_experiment(waiting_id).resume_pending, 1)
+
+    def test_create_experiment_does_not_replace_a_pending_resume(self):
+        experiment_id, worktree = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+
+        with self.assertRaises(ExperimentAlreadyActiveError) as raised:
+            self.service.create_experiment("GitHub Issue #783: resume interrupted experiments")
+        self.assertEqual(raised.exception.experiment_id, experiment_id)
+
+        shutil.rmtree(worktree)
+        resume_interrupted(self.service, NOW)  # falls back: no longer pending
+        self.service.create_experiment("GitHub Issue #783: resume interrupted experiments")
+
+    def test_retention_cleanup_keeps_a_pending_worktree(self):
+        experiment_id, worktree = self._interrupted_run()
+        self.service.mark_interrupted_experiments_failed()
+        later = datetime.now(timezone.utc) + timedelta(days=30)
+
+        self.assertEqual(self.service.cleanup_expired_worktrees(1, now=later).removed, [])
+        self.assertTrue(worktree.is_dir())
+
+        with self.service._conn:
+            self.service._conn.execute(
+                "UPDATE experiments SET resume_pending = 0 WHERE id = ?", (experiment_id,),
+            )
+        self.assertEqual(self.service.cleanup_expired_worktrees(1, now=later).removed, [experiment_id])
+
+
+class InitiativeGuardTests(ResumeTestBase):
+    def test_tick_runs_the_resume_behind_the_guards(self):
+        resumer = MagicMock(return_value=None)
+        launcher = MagicMock()
+        initiative = self._initiative(
+            interrupted_resumer=resumer, reverification_launcher=launcher,
+        )
+
+        # Paused by the owner: no resume.
+        with initiative._conn:
+            initiative._conn.execute(
+                "INSERT INTO service_settings (key, value, updated_at) VALUES ('nexus.paused', '1', ?)",
+                (NOW.isoformat(),),
+            )
+        initiative.tick()
+        resumer.assert_not_called()
+
+        # Busy: no resume.
+        with initiative._conn:
+            initiative._conn.execute("DELETE FROM service_settings WHERE key = 'nexus.paused'")
+        running = self.service.create_experiment("busy experiment")
+        with self.service._conn:
+            self.service._conn.execute(
+                "UPDATE experiments SET status = 'verifying', ended_at = ? WHERE id = ?",
+                (datetime.now(timezone.utc).isoformat(), running.id),
+            )
+        self.assertEqual(initiative.tick().decision, "busy")
+        resumer.assert_not_called()
+
+        # Free: exactly one call, with the approval check, before planning.
+        with self.service._conn:
+            self.service._conn.execute("UPDATE experiments SET status = 'failed' WHERE id = ?", (running.id,))
+        initiative.tick()
+        resumer.assert_called_once()
+        self.assertEqual(
+            resumer.call_args.kwargs["approval_block"], initiative._resume_approval_block,
+        )
+        launcher.assert_called_once()
+
+    def test_a_tick_that_resumed_defers_the_parked_reverification(self):
+        launcher = MagicMock()
+        initiative = self._initiative(
+            interrupted_resumer=MagicMock(return_value={"resumed": True, "status": "succeeded"}),
+            reverification_launcher=launcher,
+        )
+        initiative.tick()
+        launcher.assert_not_called()
+
+    def test_a_broken_resumer_does_not_break_the_tick(self):
+        initiative = self._initiative(interrupted_resumer=MagicMock(side_effect=RuntimeError("x")))
+        self.assertNotEqual(initiative.tick().decision, "error")
+
+
+class ResumeMeasurementTests(ResumeTestBase):
+    def test_status_and_measurement_health_count_resumes_and_saved_starts(self):
+        passing_id, _ = self._interrupted_run(goal="GitHub Issue #901: pass")
+        failing_id, _ = self._interrupted_run(
+            goal="GitHub Issue #902: fail", feature_test=BROKEN_FEATURE_TEST,
+        )
+        self.service.mark_interrupted_experiments_failed()
+        resume_interrupted(self.service, NOW)
+        resume_interrupted(self.service, NOW)
+        # An old resume outside the 14-day window does not count.
+        with self.service._conn:
+            self.service._conn.execute(
+                "INSERT INTO activity_log (timestamp, entity_type, entity_id, event, message) "
+                "VALUES (?, 'experiment', 'old', ?, ?)",
+                ((datetime.now(timezone.utc) - timedelta(days=20)).isoformat(),
+                 RESUME_EVENT, RESUME_MESSAGE),
+            )
+        now = datetime.now(timezone.utc)
+
+        stats = resume_stats(self.service._conn, now)
+        self.assertEqual(stats["resumed"], 2)
+        self.assertEqual(stats["saved_paid_starts"], 1)
+        self.assertEqual(stats["outcomes"], {STATUS_FAILED: 1, STATUS_SUCCEEDED: 1})
+
+        health = check_pipelines(self.service._conn, now)["interrupted_resumes"]
+        self.assertEqual(health["status"], "ok")
+        self.assertNotIn("count", health)  # never read as a stuck streak
+        self.assertEqual(health["saved_paid_starts"], 1)
+        summary = health_summary("interrupted_resumes", health)
+        self.assertIn("2 interrupted run(s) resumed in the last 14 days", summary)
+        self.assertIn("1 passed verification (saved paid starts)", summary)
+
+        body = render_status(self.service._conn, now=now, budget=1, spent=0, paused=False, busy=None)
+        self.assertIn("**Free resumes:** 2 interrupted run(s) resumed", body)
+        self.assertIn(passing_id[:8], body)
+        self.assertIn(failing_id[:8], body)
 
 
 if __name__ == "__main__":

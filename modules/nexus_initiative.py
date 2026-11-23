@@ -273,6 +273,7 @@ class NexusInitiativeService:
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
         reverification_launcher: Callable[[], None] | None = None,
+        interrupted_resumer: Callable[..., Any] | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.experiment_service = experiment_service
@@ -280,6 +281,9 @@ class NexusInitiativeService:
         self.controller = controller
         self._issue_lister = issue_lister
         self._reverification_launcher = reverification_launcher
+        # Free resume of interrupted runs whose paid implementation finished (#783);
+        # called as ``interrupted_resumer(approval_block=...)``.
+        self._interrupted_resumer = interrupted_resumer
         self._idea_lister = idea_lister
         # Planning step (#354): which open issue is the most useful next one.
         self._planner = planner
@@ -1061,8 +1065,10 @@ class NexusInitiativeService:
                     continue
                 # A pending free resume (#783) is not a used attempt yet: the run's
                 # paid implementation finished, and the resume either succeeds or
-                # only then counts.
+                # only then counts. It still reserves the issue, so no replacement
+                # paid start is planned while the finished work waits.
                 if int(row["resume_pending"] or 0):
+                    blocked.add(number)
                     continue
                 # A goal-policy rejection is neither an attempt nor a block
                 # (#408): the preflight in _issue_candidates judges the text.
@@ -1491,6 +1497,50 @@ class NexusInitiativeService:
             except Exception as exc:
                 logger.warning("initiative: could not schedule parked re-verification: %s", exc)
 
+    def _resume_approval_block(self, experiment_id: str) -> str | None:
+        """Why a pending resume's issue must not run: an explicit revoke/reject.
+
+        The same rule as :meth:`enforce_issue_approvals`: only an explicit
+        ``revoked``/``rejected`` record stops already-started work.
+        """
+        if not self._repository:
+            return None
+        for table in ("github_experiment_links", "github_work_links"):
+            try:
+                row = self._conn.execute(
+                    f"SELECT issue_number FROM {table} WHERE experiment_id = ? LIMIT 1",
+                    (experiment_id,),
+                ).fetchone()
+            except sqlite3.OperationalError:
+                continue
+            if row is None:
+                continue
+            try:
+                number = int(row["issue_number"])
+            except (TypeError, ValueError):
+                return None
+            approval = issue_approvals.get_approval(self._conn, self._repository, number)
+            if approval is not None and approval.status in (
+                issue_approvals.STATUS_REVOKED, issue_approvals.STATUS_REJECTED
+            ):
+                return f"issue #{number} approval is {approval.status}"
+            return None
+        return None
+
+    def _resume_interrupted(self) -> bool:
+        """Best-effort free resume of one interrupted run (#783); True when one ran."""
+        if self._interrupted_resumer is None or (
+            os.environ.get("NEXUS_RESUME_INTERRUPTED", "1").strip().lower()
+            in {"0", "false", "off", "no"}
+        ):
+            return False
+        try:
+            summary = self._interrupted_resumer(approval_block=self._resume_approval_block)
+        except Exception as exc:  # noqa: BLE001 - a broken resume must not break a tick
+            logger.warning("initiative: could not resume an interrupted experiment: %s", exc)
+            return False
+        return bool(summary and summary.get("resumed"))
+
     def _planned_issue(self, issues: list[Candidate], *, act: bool = True) -> list[Candidate]:
         """The one issue the planner picks as next, or none (#354).
 
@@ -1767,7 +1817,12 @@ class NexusInitiativeService:
 
         # Hand off maintenance after the busy and stale-service guards.
         # A completed pass can enter the normal adoption path on a later tick.
-        self._reverify_parked()
+        # A free resume (#783) runs first, behind the same guards and before
+        # planning; its pass is adopted by the normal integration scheduler
+        # below. It verifies in this process, so the parked re-verification
+        # waits for the next tick instead of loading the host at the same time.
+        if not self._resume_interrupted():
+            self._reverify_parked()
 
         cooling = self._providers_cooling_down()
         if cooling is not None:

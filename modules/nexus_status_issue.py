@@ -43,6 +43,13 @@ def render(conn: sqlite3.Connection, *, now: datetime, budget: int, spent: int,
         state = "idle, waiting for the next tick (every 15 min)"
     lines.append(f"**State:** {state}")
     lines.append(f"**Budget:** {spent} of {budget or 'unlimited'} paid starts used in the last 24h")
+    try:
+        from modules.experiment_service.resume import resume_stats, resume_stats_summary
+
+        # #783: interrupted runs resumed for free, and the paid starts that saved.
+        lines.append(f"**Free resumes:** {resume_stats_summary(resume_stats(conn, now))}")
+    except Exception as exc:  # noqa: BLE001 - the status must never fail a tick
+        logger.info("status issue: resume counts unavailable: %s", exc)
     lines += ["", "**Recent experiments**", ""]
     try:
         rows = conn.execute(

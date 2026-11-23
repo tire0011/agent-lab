@@ -386,6 +386,11 @@ def _build_service(args) -> NexusInitiativeService:
         controller=controller,
         issue_lister=(lambda: _list_open_issues(args.repo_root)) if controller else None,
         reverification_launcher=_launch_parked_reverification if use_api_reverification else None,
+        # No free resume in --integration-only mode, which never starts work (#783).
+        interrupted_resumer=(
+            _interrupted_resumer(experiment_service, controller.github_work_tracking)
+            if controller is not None else None
+        ),
         planner=_planner(args.repo_root, args.db_path) if controller else None,
         issue_commenter=lambda number, text: _comment_on_issue(args.repo_root, number, text),
         proposal_creator=lambda title, body: _open_proposal(args.repo_root, title, body),
@@ -530,34 +535,34 @@ def _sweep_stalled_experiments(service) -> None:
         logger.warning("experiment %s stalled and was marked failed", experiment_id)
 
 
-def _resume_interrupted_after_restart(service, tick_start) -> None:
-    """Resume at most one interrupted experiment whose paid implementation finished (#783).
+def _interrupted_resumer(experiment_service, tracking):
+    """The free resume of interrupted runs (#783) for the initiative service.
 
-    Runs before planning and never fails the tick: the resume commits the leftover
-    worktree diff and re-verifies the already paid work for free, without calling a
-    coding provider. Skipped while another experiment or adoption is still running -
-    the next tick picks the pending resume up.
+    The initiative calls it inside ``tick()`` - behind the owner pause, the
+    issue-approval sweep, the busy and the stale-service guards, before
+    planning - with its ``approval_block`` check. The resume verifies the
+    already paid work in this process without a coding provider; a pass is
+    adopted by the normal integration scheduler.
     """
     from modules.experiment_service.resume import resume_interrupted
 
-    try:
-        if service.busy_reason() is not None:
-            return
-        tracking = getattr(getattr(service, "controller", None), "github_work_tracking", None)
-        summary = resume_interrupted(service, tick_start, github_work_tracking=tracking)
-    except Exception as exc:  # noqa: BLE001 - a broken resume must not break a tick
-        logger.warning("could not resume an interrupted experiment: %s", exc)
-        return
-    if summary:
-        logger.info(
-            "resumed interrupted experiment %s after restart (no new paid start): %s",
-            summary.get("experiment_id"),
-            summary.get("status") or summary.get("reason"),
+    def resume(**kwargs):
+        summary = resume_interrupted(
+            experiment_service, datetime.now(timezone.utc),
+            github_work_tracking=tracking, **kwargs,
         )
-        _events.append(
-            f"Resumed experiment {str(summary.get('experiment_id'))[:8]} after a service "
-            "restart, no new paid start"
-        )
+        if summary and summary.get("resumed"):
+            logger.info(
+                "resumed interrupted experiment %s after restart (no new paid start): %s",
+                summary.get("experiment_id"), summary.get("status"),
+            )
+            _events.append(
+                f"Resumed experiment {str(summary.get('experiment_id'))[:8]} after a service "
+                f"restart, no new paid start: verification ended {summary.get('status')}"
+            )
+        return summary
+
+    return resume
 
 
 def _wait_for_experiments(service=None) -> None:
@@ -846,10 +851,6 @@ def main(argv: list[str] | None = None) -> int:
                 chosen.kind, chosen.ref, chosen.reason, len(candidates),
             )
             return 0
-
-        # Before planning: re-verify work whose paid implementation already
-        # finished when a restart interrupted it (#783) - free, no provider call.
-        _resume_interrupted_after_restart(service, tick_start)
 
         decision = service.tick()
         if decision.acted and decision.candidate is not None:

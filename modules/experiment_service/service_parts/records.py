@@ -25,7 +25,6 @@ from modules.coding_provider import (
 from modules.redaction import sanitized_reason
 from modules.run_store import DEFAULT_DB_PATH, init_db, insert_activity, list_activity
 
-from ..git_utils import _run_git
 from ..models import (
     Experiment,
     ExperimentAlreadyActiveError,
@@ -307,13 +306,16 @@ class RecordsMixin:
             try:
                 if issue_number is not None:
                     placeholders = ", ".join("?" for _ in _TERMINAL_STATUSES)
+                    # An interrupted run parked for a free resume (#783) still owns
+                    # its issue: a replacement start would pay for finished work.
                     active_rows = self._conn.execute(
                         f"""
                         SELECT id, status, goal FROM experiments
                         WHERE status NOT IN ({placeholders})
+                           OR (status = ? AND COALESCE(resume_pending, 0) = 1)
                         ORDER BY created_at ASC
                         """,
-                        _TERMINAL_STATUSES,
+                        (*_TERMINAL_STATUSES, STATUS_INTERRUPTED),
                     ).fetchall()
                     active = next(
                         (
@@ -899,34 +901,11 @@ class RecordsMixin:
         commit, or there is an uncommitted diff. Any git failure counts as "no work" -
         a resumable verdict is never guessed.
         """
+        from ..resume import worktree_has_work
+
         if not row["implementation_ended_at"]:
             return False
-        worktree = str(row["worktree_path"] or "").strip()
-        if not worktree or not Path(worktree).is_dir():
-            return False
-        try:
-            base = str(row["base_commit_sha"] or "").strip()
-            if base:
-                ahead = _run_git(
-                    ["rev-list", "--count", f"{base}..HEAD"], cwd=worktree, timeout=30,
-                )
-                if ahead.returncode == 0:
-                    try:
-                        if int(ahead.stdout.strip() or "0") >= 1:
-                            return True
-                    except ValueError:
-                        pass
-            status = _run_git(
-                ["status", "--porcelain", "--untracked-files=all"], cwd=worktree, timeout=30,
-            )
-            if status.returncode == 0 and status.stdout.strip():
-                return True
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.warning(
-                "experiment %s: could not inspect worktree %s for a resume: %s",
-                row["id"], worktree, exc,
-            )
-        return False
+        return worktree_has_work(str(row["worktree_path"] or "").strip(), row["base_commit_sha"])
 
 
     def mark_interrupted_experiments_failed(self) -> list[str]:
@@ -943,20 +922,29 @@ class RecordsMixin:
         worktree still holds that work (a commit ahead of its base, or an uncommitted
         diff) is additionally parked with ``resume_pending=1`` for a free resume by the
         nexus tick, and does not count as a used attempt while the resume is pending.
+        A resume the nexus tick is running (``resume_owner`` set) belongs to that
+        process: a live one is left alone, an orphaned one is reconciled by
+        :func:`modules.experiment_service.resume.recover_orphaned_resumes`.
 
         Returns the list of reconciled experiment ids.
         """
+        from ..resume import recover_orphaned_resumes
+
+        marked: list[str] = list(recover_orphaned_resumes(self))
         with self._lock:
             rows = self._conn.execute(
                 """
                 SELECT id, status, implementation_ended_at, worktree_path,
-                       branch_name, base_commit_sha, COALESCE(resume_count, 0) AS resume_count
+                       branch_name, base_commit_sha, COALESCE(resume_count, 0) AS resume_count,
+                       resume_owner
                 FROM experiments WHERE status IN (?, ?, ?)
                 """,
                 (STATUS_SELECTING, STATUS_IMPLEMENTING, STATUS_VERIFYING),
             ).fetchall()
-        marked: list[str] = []
         for row in rows:
+            if row["resume_owner"]:
+                # Still owned by a live resume process (orphans were handled above).
+                continue
             # Conditional per row: a status that moved on in between is left alone.
             terminal_status = (
                 STATUS_FAILED if row["status"] == STATUS_SELECTING else STATUS_INTERRUPTED

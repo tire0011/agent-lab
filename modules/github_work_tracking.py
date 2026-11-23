@@ -1654,7 +1654,13 @@ class GitHubWorkTrackingService:
 
     @staticmethod
     def _publishable_path(path: str) -> bool:
-        normalized = path.replace("\\", "/").lstrip("./")
+        # Strip a leading "./" or "/" prefix, not the characters "." and "/":
+        # lstrip("./") turned ".env" into "env" and ".venv/" into "venv/", so a
+        # root secret file passed this check (#783 review).
+        normalized = path.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        normalized = normalized.lstrip("/")
         blocked = (
             "communication/",
             "state/",
