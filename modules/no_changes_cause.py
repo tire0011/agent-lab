@@ -19,7 +19,17 @@ changes". This module gives every such run a durable, countable cause:
 The cause is recorded per experiment in three places so the weekly review can
 count it: the ``experiments.no_changes_cause`` column, a ``no_changes_cause``
 event in the experiment's JSONL log, and a ``no_changes_cause=...`` token in the
-``error`` text.
+``error`` text. Recording is idempotent: the first recorded cause wins, repeated
+backfills (service restarts, manual CLI runs, repaired/resumed experiments)
+never append a second event and never recreate a cleaned-up log file.
+
+A run counts as a "no-change run" only when its ``error`` carries the
+checkpoint's explicit "no publishable" marker - the same signal #807's 20/73
+counted, so the weekly no-change share stays comparable week over week. An
+empty/NULL ``diff_text`` alone never qualifies: ``diff_text`` is only written at
+the end of verification, so worker crashes, service-restart interruptions,
+cancellations and runs without GitHub tracking would otherwise be counted as
+no-change runs and inflate the share.
 
 ``classify_recent_no_change_runs`` (also runnable as
 ``python -m modules.no_changes_cause <db> [--log-dir DIR] [--limit 20]``)
@@ -61,6 +71,15 @@ EVENT = "no_changes_cause"
 
 #: Matches the checkpoint error text of ``checkpoint_experiment``.
 NO_PUBLISHABLE_MARKER = "no publishable"
+
+#: SQL condition that identifies a no-change run: only the checkpoint's
+#: explicit "no publishable changes" error qualifies. ``diff_text`` is written
+#: at the END of verification (verification.py), so ``COALESCE(diff_text,'')=''``
+#: alone also matches worker crashes, restart interruptions, cancellations and
+#: runs without GitHub tracking - those are not "produced no publishable
+#: changes" runs and would inflate the weekly no-change share beyond
+#: comparability with #807's 20/73 (review of f0195c70, blocking problem 2).
+NO_CHANGE_RUN_SQL = f"COALESCE(error, '') LIKE '%{NO_PUBLISHABLE_MARKER}%'"
 
 #: Statuses whose runs can end without publishable changes (policy rejections
 #: are excluded: they never started work, #408).
@@ -195,7 +214,12 @@ def classify_no_changes_cause(
         return CAUSE_OTHER
 
     def col(key: str, index: int) -> Any:
-        return row[index] if isinstance(row, tuple) else row[key]
+        if isinstance(row, tuple):
+            return row[index]
+        try:
+            return row[key]
+        except (IndexError, KeyError):
+            return None  # pre-#811 fallback row selected NULL under another name
 
     status, error, recorded = col("status", 0), col("error", 1), col("no_changes_cause", 2)
     if use_recorded and recorded in ALL_CAUSES:
@@ -235,17 +259,24 @@ def classify_no_changes_cause(
     return CAUSE_OTHER
 
 
-def set_no_changes_cause(conn: sqlite3.Connection, experiment_id: str, cause: str) -> None:
-    """Persist *cause* on the experiment row; a pre-#811 database without the
-    column is tolerated (the log event and error token still record it)."""
+def set_no_changes_cause(conn: sqlite3.Connection, experiment_id: str, cause: str) -> bool:
+    """Persist *cause* on the experiment row; the first recorded cause wins.
+
+    Returns True when the column was NULL and has now been set, False when a
+    cause was already recorded (idempotent re-runs must not re-log or overwrite).
+    A pre-#811 database without the column is tolerated: True is returned there
+    because the write cannot be tracked on such a schema.
+    """
     try:
         with conn:
-            conn.execute(
-                "UPDATE experiments SET no_changes_cause = ? WHERE id = ?",
+            cursor = conn.execute(
+                "UPDATE experiments SET no_changes_cause = ? "
+                "WHERE id = ? AND no_changes_cause IS NULL",
                 (cause, experiment_id),
             )
+        return bool(cursor.rowcount)
     except sqlite3.OperationalError:
-        pass
+        return True
 
 
 def record_no_changes_cause(
@@ -255,9 +286,14 @@ def record_no_changes_cause(
     elog: Any | None = None,
     phase: str = "verifying",
 ) -> str:
-    """Record *cause* on the row AND as a ``no_changes_cause`` log event."""
-    set_no_changes_cause(conn, experiment_id, cause)
-    if elog is not None:
+    """Record *cause* on the row AND as a ``no_changes_cause`` log event.
+
+    Idempotent: when the row already carries a cause (a repaired or resumed run
+    classifying again), the column is left untouched and no second log event is
+    appended, so counting events never yields inflated numbers.
+    """
+    first_write = set_no_changes_cause(conn, experiment_id, cause)
+    if elog is not None and first_write:
         try:
             elog.warning(
                 phase, EVENT,
@@ -273,13 +309,20 @@ def record_no_changes_cause(
 def find_no_change_runs(
     conn: sqlite3.Connection, limit: int = 20
 ) -> list[sqlite3.Row]:
-    """The most recent experiments that ended without publishable changes."""
+    """The most recent experiments that ended without publishable changes.
+
+    A run qualifies only through the explicit "no publishable" checkpoint error
+    (:data:`NO_CHANGE_RUN_SQL`), never through an empty ``diff_text`` alone -
+    ``diff_text`` is written only at the end of verification, so pre-verification
+    failures (crashes, interruptions, cancellations, untracked runs) have an
+    empty diff without being no-change runs.
+    """
     placeholders = ",".join("?" for _ in NO_CHANGE_STATUSES)
     sql = f"""
         SELECT id, status, error, diff_text, no_changes_cause, created_at
         FROM experiments
         WHERE status IN ({placeholders})
-          AND (COALESCE(diff_text, '') = '' OR COALESCE(error, '') LIKE '%{NO_PUBLISHABLE_MARKER}%')
+          AND {NO_CHANGE_RUN_SQL}
         ORDER BY created_at DESC
         LIMIT ?
         """
@@ -289,6 +332,35 @@ def find_no_change_runs(
     except sqlite3.OperationalError:
         # Pre-#811 database without the column.
         return conn.execute(sql.replace("no_changes_cause", "NULL"), args).fetchall()
+
+
+def _append_backfill_event(
+    log_dir: str | Path | None, experiment_id: str, cause: str
+) -> None:
+    """Append the backfill ``no_changes_cause`` event to an experiment's log.
+
+    Only ever appends to a log file that already exists (a cleaned-up log is
+    never recreated) and only when no cause event is recorded yet, so repeated
+    backfills - service restarts, manual CLI runs - cannot pile up duplicate
+    events per experiment (review of f0195c70, blocking problem 3).
+    """
+    if not log_dir:
+        return
+    path = Path(log_dir) / f"{experiment_id}.jsonl"
+    try:
+        if not path.exists():
+            return
+        if any(entry.get("event") == EVENT
+               for entry in read_log_entries(path, limit=_LOG_SCAN_LIMIT)):
+            return
+        ExperimentLogger(experiment_id, log_dir=log_dir).warning(
+            "review", EVENT,
+            f"Backfilled no-change cause for experiment {experiment_id}: {cause}",
+            no_changes_cause=cause,
+            experiment_id=experiment_id,
+        )
+    except Exception:  # noqa: BLE001 - best effort backfill
+        pass
 
 
 def classify_recent_no_change_runs(
@@ -301,8 +373,13 @@ def classify_recent_no_change_runs(
     """Classify the last *limit* no-change runs of the database at *db_path*.
 
     With ``apply`` the cause is written to ``experiments.no_changes_cause`` and
-    appended to the experiment's JSONL log (when *log_dir* is given). Returns
-    the counts per cause, e.g. ``{"answered_without_edits": 12, ...}``.
+    appended to the experiment's JSONL log (when *log_dir* is given and the log
+    file still exists). Idempotent: rows that already carry a cause are only
+    counted, never rewritten or re-logged, so running this on every startup (or
+    twice by hand) yields exactly one cause event per experiment. One broken
+    row (unreadable log, odd schema) degrades to ``other`` and never aborts the
+    remaining rows. Returns the counts per cause, e.g.
+    ``{"answered_without_edits": 12, ...}``.
     """
     conn = sqlite3.connect(db_path, timeout=30)
     conn.row_factory = sqlite3.Row
@@ -310,20 +387,23 @@ def classify_recent_no_change_runs(
         counts: Counter[str] = Counter()
         for row in find_no_change_runs(conn, limit=limit):
             experiment_id = row["id"]
-            cause = classify_no_changes_cause(conn, experiment_id, log_dir)
+            recorded = row["no_changes_cause"] if "no_changes_cause" in row.keys() else None
+            if recorded in ALL_CAUSES:
+                # Already classified (earlier backfill, a restart, or the
+                # pipeline itself): count it, write nothing.
+                counts[recorded] += 1
+                continue
+            try:
+                cause = classify_no_changes_cause(conn, experiment_id, log_dir)
+            except Exception:  # noqa: BLE001 - one bad row must not abort the backfill
+                cause = CAUSE_OTHER
             counts[cause] += 1
             if apply:
-                set_no_changes_cause(conn, experiment_id, cause)
-                if log_dir:
-                    try:
-                        ExperimentLogger(experiment_id, log_dir=log_dir).warning(
-                            "review", EVENT,
-                            f"Backfilled no-change cause for experiment {experiment_id}: {cause}",
-                            no_changes_cause=cause,
-                            experiment_id=experiment_id,
-                        )
-                    except Exception:  # noqa: BLE001 - best effort backfill
-                        pass
+                try:
+                    set_no_changes_cause(conn, experiment_id, cause)
+                except sqlite3.Error:
+                    pass  # the log event below still records the cause
+                _append_backfill_event(log_dir, experiment_id, cause)
         return dict(counts)
     finally:
         conn.close()
@@ -331,7 +411,9 @@ def classify_recent_no_change_runs(
 
 def no_change_cause_counts(conn: sqlite3.Connection, since: str) -> list[tuple[str, int]]:
     """Recorded causes of no-change runs created at/after *since*, for the
-    weekly review. Requires the ``no_changes_cause`` column (#811)."""
+    weekly review. Requires the ``no_changes_cause`` column (#811). Only runs
+    with the explicit "no publishable" error count (:data:`NO_CHANGE_RUN_SQL`).
+    """
     placeholders = ",".join("?" for _ in NO_CHANGE_STATUSES)
     return [
         (str(row[0]), int(row[1]))
@@ -341,7 +423,7 @@ def no_change_cause_counts(conn: sqlite3.Connection, since: str) -> list[tuple[s
             FROM experiments
             WHERE created_at >= ?
               AND status IN ({placeholders})
-              AND (COALESCE(diff_text, '') = '' OR COALESCE(error, '') LIKE '%{NO_PUBLISHABLE_MARKER}%')
+              AND {NO_CHANGE_RUN_SQL}
             GROUP BY 1 ORDER BY 2 DESC
             """,
             (since, *NO_CHANGE_STATUSES),
@@ -350,14 +432,20 @@ def no_change_cause_counts(conn: sqlite3.Connection, since: str) -> list[tuple[s
 
 
 def no_change_share(conn: sqlite3.Connection, since: str) -> tuple[int, int, float] | None:
-    """(no-change runs, all ended runs, percent) created at/after *since*."""
+    """(no-change runs, all ended runs, percent) created at/after *since*.
+
+    A run counts as no-change only through the explicit "no publishable"
+    checkpoint error (:data:`NO_CHANGE_RUN_SQL`), so the share stays comparable
+    with #807's 20/73: pre-verification crashes, interruptions and cancellations
+    (empty ``diff_text``, no marker) are not no-change runs.
+    """
     ended = ",".join("?" for _ in ENDED_STATUSES)
     no_change = ",".join("?" for _ in NO_CHANGE_STATUSES)
     row = conn.execute(
         f"""
         SELECT
           SUM(CASE WHEN status IN ({no_change})
-                    AND (COALESCE(diff_text, '') = '' OR COALESCE(error, '') LIKE '%{NO_PUBLISHABLE_MARKER}%')
+                    AND {NO_CHANGE_RUN_SQL}
                    THEN 1 ELSE 0 END),
           COUNT(*)
         FROM experiments

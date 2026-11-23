@@ -7,15 +7,17 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from modules import no_changes_cause as ncc
+from modules.central_logging import ExperimentLogger
 from modules.checkout_guard import EVENT as OUTSIDE_EVENT
 from modules.codex_worker import CodexResult
 from modules.experiment_service import (
@@ -198,19 +200,29 @@ class BackfillTests(unittest.TestCase):
         self.log_dir = Path(self.tmp.name) / "logs"
 
     def test_the_last_no_change_runs_are_classified_with_counts_and_written_back(self):
+        marker = ("implementation produced no publishable source/test/documentation changes")
         rows = [
-            ("a1", "needs_review", "GitHub checkpoint failed before verification: implementation "
-                                   "produced no publishable source/test/documentation changes", None),
-            ("a2", "needs_review", "GitHub checkpoint failed before verification: implementation "
-                                   "produced no publishable source/test/documentation changes", None),
-            ("t1", "timed_out", "implementation phase timed out", None),
-            ("o1", "failed", "coding agent mistral wrote outside its worktree into /agent: x.py", None),
+            ("a1", "needs_review", "GitHub checkpoint failed before verification: " + marker, None),
+            ("a2", "needs_review", "GitHub checkpoint failed before verification: " + marker, None),
+            ("t1", "timed_out", "implementation phase timed out (Vibe stalled: no output for "
+                                "1800s); GitHub checkpoint failed: " + marker, None),
+            ("o1", "failed", "coding agent mistral wrote outside its worktree into /agent: x.py; "
+                             "GitHub checkpoint failed: " + marker, None),
             ("r1", "rejected", "goal rejected by policy: ...", None),  # policy rejection: not a no-change run
             ("s1", "succeeded", None, "diff --git a/x b/x"),
+            # Runs that stopped before the checkpoint/verification must NOT count as
+            # no-change runs: diff_text is only written at the end of _verify, so an
+            # empty diff alone would wrongly include them (review of f0195c70).
+            ("c1", "failed", "unhandled exception in experiment pipeline: boom", None),
+            ("i1", "interrupted", "experiment interrupted by service restart", None),
+            ("x1", "cancelled", None, None),
+            ("u1", "failed", "Claude produced no parseable result object", None),  # no GitHub tracking
+            ("g1", "needs_review", "no safe test command could be determined for this worktree", ""),
         ]
         for exp_id, status, error, diff in rows:
             _add_experiment(self.conn, exp_id, status=status, error=error, diff_text=diff)
         _write_log(self.log_dir, "o1", [{"event": OUTSIDE_EVENT, "message": "wrote outside"}])
+        _write_log(self.log_dir, "a1", [{"event": "vibe_call_completed", "message": "done"}])
 
         counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir, limit=20)
 
@@ -226,14 +238,47 @@ class BackfillTests(unittest.TestCase):
         self.assertEqual(causes["a2"], ncc.CAUSE_NO_EDITS)
         self.assertEqual(causes["t1"], ncc.CAUSE_LIMIT_OR_TIMEOUT)
         self.assertEqual(causes["o1"], ncc.CAUSE_OUTSIDE_WORKTREE)
-        self.assertIsNone(causes["r1"])   # policy rejections are never classified
-        self.assertIsNone(causes["s1"])   # succeeded runs have changes
+        for not_a_no_change_run in ("r1", "s1", "c1", "i1", "x1", "u1", "g1"):
+            self.assertIsNone(causes[not_a_no_change_run])
         # The cause is also an event in the experiment log.
         entries = ncc._log_entries(self.log_dir, "a1")
         self.assertTrue(any(e.get("event") == ncc.EVENT for e in entries))
         self.assertEqual(
             [e for e in entries if e.get("event") == ncc.EVENT][0]["no_changes_cause"],
             ncc.CAUSE_NO_EDITS,
+        )
+
+    def test_find_no_change_runs_requires_the_explicit_no_publishable_marker(self):
+        marker = "implementation produced no publishable source/test/documentation changes"
+        _add_experiment(self.conn, "yes1", status="needs_review", error=marker)
+        _add_experiment(self.conn, "yes2", status="failed",
+                        error="worker exploded; GitHub checkpoint failed: " + marker)
+        # Empty diff_text without the marker is not a no-change run.
+        _add_experiment(self.conn, "no1", status="failed", error="pipeline crash", diff_text=None)
+        _add_experiment(self.conn, "no2", status="interrupted", error="restart", diff_text=None)
+        _add_experiment(self.conn, "no3", status="cancelled", diff_text=None)
+        _add_experiment(self.conn, "no4", status="needs_review",
+                        error="no safe test command could be determined", diff_text="")
+        _add_experiment(self.conn, "no5", status="succeeded", diff_text="")
+        self.conn.row_factory = sqlite3.Row
+        found = {row["id"] for row in ncc.find_no_change_runs(self.conn)}
+        self.assertEqual(found, {"yes1", "yes2"})
+
+    def test_pre_verification_failures_do_not_inflate_the_no_change_share(self):
+        marker = "implementation produced no publishable source/test/documentation changes"
+        _add_experiment(self.conn, "n1", status="needs_review", error=marker)
+        _add_experiment(self.conn, "c1", status="failed",
+                        error="unhandled exception in experiment pipeline: boom", diff_text=None)
+        _add_experiment(self.conn, "i1", status="interrupted", error="restart", diff_text=None)
+        _add_experiment(self.conn, "x1", status="cancelled", diff_text=None)
+        _add_experiment(self.conn, "s1", status="succeeded", diff_text="diff --git a/x b/x")
+        # 1 no-change run of 5 ended runs - the crash/interruption/cancellation
+        # are ended runs but not no-change runs (#807 comparability).
+        self.assertEqual(ncc.no_change_share(self.conn, "2026-11-01T00:00:00+00:00"),
+                         (1, 5, 20.0))
+        self.assertEqual(
+            ncc.no_change_cause_counts(self.conn, "2026-11-01T00:00:00+00:00"),
+            [("(unclassified)", 1)],
         )
 
     def test_limit_selects_the_most_recent_runs(self):
@@ -255,6 +300,168 @@ class BackfillTests(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("no-change runs classified: 1", text)
         self.assertIn(f"{ncc.CAUSE_NO_EDITS}: 1", text)
+
+
+class BackfillRobustnessTests(unittest.TestCase):
+    """Review of f0195c70, blocking problem 3: the startup backfill must be
+    idempotent (restarts must not pile up duplicate cause events), must never
+    recreate cleaned-up log files, and must survive broken rows/logs/databases
+    without aborting the remaining runs."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = str(Path(self.tmp.name) / "agent.db")
+        self.conn = init_db(self.db_path)
+        self.addCleanup(self.conn.close)
+        self.log_dir = Path(self.tmp.name) / "logs"
+        self.log_dir.mkdir()
+
+    def _marker_row(self, exp_id, *, cause=None, created_at=NOW):
+        _add_experiment(
+            self.conn, exp_id, status="needs_review", created_at=created_at,
+            error="GitHub checkpoint failed before verification: implementation produced "
+                  "no publishable source/test/documentation changes",
+            cause=cause,
+        )
+
+    def _cause_events(self, exp_id):
+        return [e for e in ncc._log_entries(self.log_dir, exp_id)
+                if e.get("event") == ncc.EVENT]
+
+    def test_running_the_backfill_twice_adds_no_duplicate_events(self):
+        self._marker_row("a1")
+        self._marker_row("a2")
+        # Both experiments still have their (cleaned-up-but-present) log files.
+        for exp_id in ("a1", "a2"):
+            _write_log(self.log_dir, exp_id, [{"event": "worker_done", "message": "x"}])
+        first = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        second = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        third = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(first, second)
+        self.assertEqual(second, third)
+        self.assertEqual(first, {ncc.CAUSE_NO_EDITS: 2})
+        for exp_id in ("a1", "a2"):
+            self.assertEqual(len(self._cause_events(exp_id)), 1)
+        self.conn.row_factory = None
+        causes = dict(self.conn.execute(
+            "SELECT id, no_changes_cause FROM experiments").fetchall())
+        self.assertEqual(causes, {"a1": ncc.CAUSE_NO_EDITS, "a2": ncc.CAUSE_NO_EDITS})
+
+    def test_the_backfill_never_creates_a_log_file_for_a_cleaned_up_experiment(self):
+        self._marker_row("gone1")  # no log file exists for this experiment
+        counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_NO_EDITS: 1})
+        self.assertFalse((self.log_dir / "gone1.jsonl").exists())
+        # The cause is still durably recorded on the row.
+        self.conn.row_factory = None
+        row = self.conn.execute(
+            "SELECT no_changes_cause FROM experiments WHERE id = 'gone1'").fetchone()
+        self.assertEqual(row[0], ncc.CAUSE_NO_EDITS)
+
+    def test_rows_that_already_carry_a_cause_are_counted_but_never_rewritten(self):
+        self._marker_row("done1", cause=ncc.CAUSE_LIMIT_OR_TIMEOUT)
+        _write_log(self.log_dir, "done1", [{"event": "unrelated", "message": "no cause event yet"}])
+        counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_LIMIT_OR_TIMEOUT: 1})
+        self.assertEqual(self._cause_events("done1"), [])  # no event appended
+        self.conn.row_factory = None
+        row = self.conn.execute(
+            "SELECT no_changes_cause FROM experiments WHERE id = 'done1'").fetchone()
+        self.assertEqual(row[0], ncc.CAUSE_LIMIT_OR_TIMEOUT)
+
+    def test_an_event_the_pipeline_already_wrote_is_not_duplicated(self):
+        self._marker_row("pipe1")  # column NULL, but the log already has the event
+        _write_log(self.log_dir, "pipe1", [
+            {"event": ncc.EVENT, "message": "classified by the pipeline",
+             "no_changes_cause": ncc.CAUSE_NO_EDITS},
+        ])
+        counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_NO_EDITS: 1})
+        self.assertEqual(len(self._cause_events("pipe1")), 1)
+
+    def test_one_broken_row_does_not_abort_the_backfill(self):
+        self._marker_row("good1")
+        self._marker_row("bad1")
+        _write_log(self.log_dir, "good1", [{"event": "worker_done", "message": "x"}])
+        real_classify = ncc.classify_no_changes_cause
+
+        def flaky(conn, experiment_id, log_dir=None, **kwargs):
+            if experiment_id == "bad1":
+                raise RuntimeError("simulated worker crash while classifying")
+            return real_classify(conn, experiment_id, log_dir, **kwargs)
+
+        with patch.object(ncc, "classify_no_changes_cause", side_effect=flaky):
+            counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_NO_EDITS: 1, ncc.CAUSE_OTHER: 1})
+        self.conn.row_factory = None
+        causes = dict(self.conn.execute(
+            "SELECT id, no_changes_cause FROM experiments").fetchall())
+        self.assertEqual(causes["good1"], ncc.CAUSE_NO_EDITS)
+        self.assertEqual(causes["bad1"], ncc.CAUSE_OTHER)
+        # The surviving row still got its log event.
+        self.assertEqual(len(self._cause_events("good1")), 1)
+
+    def test_a_malformed_log_line_does_not_break_classification_or_backfill(self):
+        self._marker_row("messy1")
+        path = self.log_dir / "messy1.jsonl"
+        path.write_text("this is not json\n" + json.dumps({
+            "timestamp": NOW, "level": "INFO", "logger": "t", "phase": "implementation",
+            "event": "vibe_call_completed", "experiment_id": "messy1",
+            "stdout": "already implemented on main, nothing to do",
+        }) + "\n", encoding="utf-8")
+        counts = ncc.classify_recent_no_change_runs(self.db_path, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_ALREADY_ON_MAIN: 1})
+        self.assertEqual(len(self._cause_events("messy1")), 1)  # appended, file existed
+
+    def test_a_pre_811_database_without_the_cause_column_is_tolerated(self):
+        old_db = str(Path(self.tmp.name) / "old.db")
+        old = sqlite3.connect(old_db)
+        old.execute(
+            "CREATE TABLE experiments (id TEXT PRIMARY KEY, goal TEXT, status TEXT, "
+            "created_at TEXT, error TEXT, diff_text TEXT)"
+        )
+        old.execute(
+            "INSERT INTO experiments VALUES ('old1', 'g', 'needs_review', ?, "
+            "'implementation produced no publishable source/test/documentation changes', NULL)",
+            (NOW,),
+        )
+        old.commit()
+        old.close()
+        # find_no_change_runs falls back to NULL for the missing column.
+        conn = sqlite3.connect(old_db)
+        conn.row_factory = sqlite3.Row
+        self.assertEqual([r["id"] for r in ncc.find_no_change_runs(conn)], ["old1"])
+        conn.close()
+        # The full backfill neither crashes nor creates a log file.
+        counts = ncc.classify_recent_no_change_runs(old_db, log_dir=self.log_dir)
+        self.assertEqual(counts, {ncc.CAUSE_NO_EDITS: 1})
+        self.assertFalse((self.log_dir / "old1.jsonl").exists())
+        self.assertTrue(ncc.set_no_changes_cause(sqlite3.connect(old_db), "old1", "other"))
+
+    def test_record_no_changes_cause_twice_logs_exactly_one_event(self):
+        # A repaired or resumed experiment classifies again: the second call
+        # must not append a second no_changes_cause event.
+        self._marker_row("twice1")
+        elog = ExperimentLogger("twice1", log_dir=self.log_dir)
+        ncc.record_no_changes_cause(self.conn, "twice1", ncc.CAUSE_NO_EDITS, elog)
+        ncc.record_no_changes_cause(self.conn, "twice1", ncc.CAUSE_LIMIT_OR_TIMEOUT, elog)
+        events = self._cause_events("twice1")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["no_changes_cause"], ncc.CAUSE_NO_EDITS)  # first wins
+        self.conn.row_factory = None
+        row = self.conn.execute(
+            "SELECT no_changes_cause FROM experiments WHERE id = 'twice1'").fetchone()
+        self.assertEqual(row[0], ncc.CAUSE_NO_EDITS)
+
+    def test_set_no_changes_cause_reports_first_write_only(self):
+        self._marker_row("fw1")
+        self.assertTrue(ncc.set_no_changes_cause(self.conn, "fw1", ncc.CAUSE_OTHER))
+        self.assertFalse(ncc.set_no_changes_cause(self.conn, "fw1", ncc.CAUSE_NO_EDITS))
+        self.conn.row_factory = None
+        row = self.conn.execute(
+            "SELECT no_changes_cause FROM experiments WHERE id = 'fw1'").fetchone()
+        self.assertEqual(row[0], ncc.CAUSE_OTHER)
 
 
 class PipelineRecordingTests(unittest.TestCase):
@@ -373,10 +580,16 @@ class WeeklyReviewPackTests(unittest.TestCase):
                               "produced no publishable source/test/documentation changes",
                         cause=ncc.CAUSE_NO_EDITS)
         _add_experiment(conn, "n2", status="timed_out", created_at=recent,
-                        error="implementation phase timed out", cause=ncc.CAUSE_LIMIT_OR_TIMEOUT)
+                        error="implementation phase timed out; GitHub checkpoint failed: "
+                              "implementation produced no publishable source/test/documentation "
+                              "changes", cause=ncc.CAUSE_LIMIT_OR_TIMEOUT)
         _add_experiment(conn, "n3", status="needs_review", created_at=recent,
                         error="GitHub checkpoint failed before verification: implementation "
                               "produced no publishable changes", cause=None)
+        # A pre-verification crash: an ended run, but NOT a no-change run (an empty
+        # diff_text alone must not count - review of f0195c70, blocking problem 2).
+        _add_experiment(conn, "c1", status="failed", created_at=recent,
+                        error="unhandled exception in experiment pipeline: boom", diff_text=None)
         _add_experiment(conn, "s1", status="succeeded", created_at=recent,
                         diff_text="diff --git a/x b/x")
         conn.close()
@@ -387,8 +600,8 @@ class WeeklyReviewPackTests(unittest.TestCase):
         self.assertIn(f"{ncc.CAUSE_LIMIT_OR_TIMEOUT} | 1", pack)
         self.assertIn("(unclassified) | 1", pack)
         self.assertIn("no-change share of ended experiments (#811)", pack)
-        # 3 of 4 ended experiments produced no changes.
-        self.assertIn("no-change: 3 | 4 | 75.0%", pack)
+        # 3 of 5 ended experiments produced no changes; the crash is not counted.
+        self.assertIn("no-change: 3 | 5 | 60.0%", pack)
 
 
 if __name__ == "__main__":

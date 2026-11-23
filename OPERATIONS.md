@@ -400,10 +400,21 @@ python -m modules.no_changes_cause "$AGENT_DB_PATH" --log-dir state/experiment-l
 # add --dry-run to only print the counts
 ```
 
+A run counts as a no-change run only through the explicit "no publishable"
+checkpoint error in `experiments.error` - never through an empty `diff_text`
+alone, because `diff_text` is written only at the end of verification, so worker
+crashes, restart interruptions and cancellations would otherwise inflate the
+weekly share beyond comparability with #807's 20/73. Recording is idempotent:
+the first recorded cause wins, and a backfill never appends a second
+`no_changes_cause` event nor recreates a log file that was already cleaned up,
+so restarts cannot pile up duplicate events.
+
 The most frequent cause so far was the agent editing the deployed checkout
 instead of its worktree; `modules/checkout_guard.py` now also scrubs the
-checkout's absolute path out of the implementation prompt, so the agent never
-sees the path that documentation quotes.
+checkout's absolute path out of the implementation prompt (only where it is a
+complete path component, so the agent's own `~/agent-worktrees/<id>` worktree
+path and names like `tire0011/agent-lab` or `foo/agent.py` stay intact), so the
+agent never sees the path that documentation quotes.
 
 ## Local shadow replay (#637)
 
