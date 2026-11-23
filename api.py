@@ -450,6 +450,20 @@ async def lifespan(app: FastAPI):
                 )
         except Exception as _exc:  # noqa: BLE001 - recovery must not block startup
             _logger.error("could not mark interrupted experiments: %s", _exc)
+        # #811: backfill the classified cause of the most recent no-change runs
+        # (bounded to 20) so the weekly review can count them even for runs
+        # that ended before the cause column existed.
+        try:
+            from modules.no_changes_cause import classify_recent_no_change_runs
+
+            _svc = _resolve_experiment_service()
+            _counts = classify_recent_no_change_runs(
+                _svc.db_path, log_dir=_svc.experiment_log_dir, limit=20,
+            )
+            if _counts:
+                _logger.info("no-change experiment causes (#811): %s", _counts)
+        except Exception as _exc:  # noqa: BLE001 - backfill must not block startup
+            _logger.error("could not backfill no-change causes: %s", _exc)
         # Terminal experiments keep their worktree for inspection; past the retention
         # window it is removed so finished runs cannot fill the disk (#376). Runs after
         # the reconciliation above, which stamps just-interrupted runs with a fresh ended_at.

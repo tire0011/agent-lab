@@ -10,7 +10,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from modules.checkout_guard import EVENT, GuardedWorker
+from modules.checkout_guard import (
+    EVENT,
+    GuardedWorker,
+    count_repo_root_mentions,
+    scrub_repo_root,
+)
 from modules.coding_worker import WorkerResult
 from modules.experiment_resume import resume_experiment
 from modules.experiment_service import ExperimentNotRunnableError
@@ -44,6 +49,80 @@ class FakeWorker:
         return _result(task=task, working_dir=working_dir)
 
 
+class ScrubRepoRootTests(unittest.TestCase):
+    """Review of f0195c70, blocking problem 1: scrub_repo_root used plain
+    substring replacement, so with deployed checkout /agent it corrupted the
+    agent's own worktree path /home/agent/agent-worktrees/<id> into
+    /home<deployed-checkout>/agent-worktrees/<id>, plus tire0011/agent-lab,
+    /agent-worktrees, foo/agent.py and any other text containing '/agent' as a
+    substring. Only complete path components may be replaced.
+
+    Path.resolve is patched to identity so these pure-string tests never touch
+    the real deployed checkout /agent.
+    """
+
+    def scrub(self, task, root="/agent", working_dir=None):
+        with mock.patch.object(Path, "resolve", lambda self: self):
+            return scrub_repo_root(task, root, working_dir)
+
+    def test_the_worktree_path_under_home_agent_worktrees_is_untouched(self):
+        task = ("Work in /home/agent/agent-worktrees/f0195c70abc and read "
+                "/home/agent/agent-worktrees/f0195c70abc/README.md.")
+        self.assertEqual(self.scrub(task), task)
+
+    def test_repo_slug_sibling_dirs_and_file_names_are_untouched(self):
+        task = ("See tire0011/agent-lab, /agent-worktrees, foo/agent.py, "
+                "/home/agent and the redacted token [PATH].")
+        self.assertEqual(self.scrub(task), task)
+
+    def test_plain_deployed_checkout_paths_are_still_scrubbed(self):
+        task = ("Read /agent/OPERATIONS.md and /agent/modules/nexus_tick.py; "
+                "the checkout is /agent.")
+        self.assertEqual(
+            self.scrub(task),
+            "Read <deployed-checkout>/OPERATIONS.md and "
+            "<deployed-checkout>/modules/nexus_tick.py; the checkout is <deployed-checkout>.",
+        )
+
+    def test_bare_quoted_parenthesized_and_assigned_mentions_are_scrubbed(self):
+        task = '"/agent" (/agent), path=/agent, list: /agent; end /agent'
+        self.assertEqual(
+            self.scrub(task),
+            '"<deployed-checkout>" (<deployed-checkout>), path=<deployed-checkout>, '
+            "list: <deployed-checkout>; end <deployed-checkout>",
+        )
+
+    def test_a_word_containing_the_root_is_untouched(self):
+        self.assertEqual(self.scrub("use /agentx and /agent_y and agent"), 
+                         "use /agentx and /agent_y and agent")
+
+    def test_scrubbing_is_idempotent(self):
+        task = "See /agent/x.py and /home/agent/agent-worktrees/w and tire0011/agent-lab."
+        once = self.scrub(task)
+        self.assertEqual(self.scrub(once), once)
+        self.assertIn("<deployed-checkout>/x.py", once)
+        self.assertIn("/home/agent/agent-worktrees/w", once)
+        self.assertIn("tire0011/agent-lab", once)
+
+    def test_a_worktree_inside_the_checkout_keeps_all_paths(self):
+        task = "Edit /agent/worktrees/wt1/x.py"
+        self.assertEqual(
+            self.scrub(task, "/agent", working_dir="/agent/worktrees/wt1"), task)
+
+    def test_mention_counting_is_boundary_aware(self):
+        with mock.patch.object(Path, "resolve", lambda self: self):
+            self.assertEqual(count_repo_root_mentions("/agent/a and /agent", "/agent"), 2)
+            self.assertEqual(count_repo_root_mentions("at /agent.", "/agent"), 1)
+            self.assertEqual(
+                count_repo_root_mentions(
+                    "/home/agent/agent-worktrees/x tire0011/agent-lab foo/agent.py "
+                    "/agent-worktrees [PATH] /home/agent",
+                    "/agent",
+                ),
+                0,
+            )
+
+
 class GuardTests(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -66,8 +145,27 @@ class GuardTests(unittest.TestCase):
         worker = FakeWorker()
         result = self.run_guarded(worker)
         self.assertTrue(result.success)
-        self.assertIn(f"The deployed checkout {self.repo} is off-limits", worker.task)
+        # #811: the hint forbids the deployed checkout but must not name its
+        # absolute path - a path named in the prompt is a path the agent can
+        # write to (run 1b9c8642/#797 wrote into the checkout the docs named).
+        self.assertIn(f"Work only inside your working directory {self.wt}", worker.task)
+        self.assertIn("off-limits", worker.task)
+        self.assertNotIn(str(self.repo), worker.task)
         self.elog.error.assert_not_called()
+
+    def test_absolute_paths_of_the_deployed_checkout_are_scrubbed_from_the_prompt(self):
+        worker = FakeWorker()
+        task = (
+            f"Fix the bug described in {self.repo}/OPERATIONS.md; see also "
+            f"{self.repo}/modules/nexus_tick.py and the checkout at {self.repo}."
+        )
+        result = GuardedWorker(worker, str(self.repo)).run(
+            task, str(self.wt), experiment_logger=self.elog, phase="implementation")
+        self.assertTrue(result.success)
+        self.assertNotIn(str(self.repo), worker.task)
+        self.assertIn("<deployed-checkout>/OPERATIONS.md", worker.task)
+        self.assertIn("<deployed-checkout>/modules/nexus_tick.py", worker.task)
+        self.assertIn("the checkout at <deployed-checkout>.", worker.task)
 
     def test_writing_into_the_deployed_checkout_fails_the_run_and_is_stashed(self):
         result = self.run_guarded(FakeWorker(write_to=self.repo))
@@ -83,6 +181,38 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(kwargs["provider"], "mistral")
         self.assertEqual(kwargs["files"], ["nexus_tick.py"])
         self.assertFalse(kwargs["prompt_mentions_repo_root"])
+        # #811: the event carries the recordable cause so the weekly review can
+        # count these runs without re-deriving them from the message text.
+        self.assertEqual(kwargs["no_changes_cause"], "wrote_outside_worktree")
+
+    def test_a_prompt_that_named_the_checkout_is_recorded_when_the_guard_fires(self):
+        worker = FakeWorker(write_to=self.repo)
+        task = f"As documented in {self.repo}/README.md, edit {self.repo}/nexus_tick.py."
+        GuardedWorker(worker, str(self.repo)).run(
+            task, str(self.wt), experiment_logger=self.elog, phase="implementation")
+        args, kwargs = self.elog.error.call_args
+        self.assertTrue(kwargs["prompt_mentions_repo_root"])
+        self.assertGreater(kwargs["repo_root_mentions_scrubbed"], 0)
+        self.assertNotIn(str(self.repo), worker.task)
+
+    def test_a_worktree_sibling_mention_is_not_a_checkout_mention(self):
+        # Production layout: deployed checkout <tmp>/agent, worktrees under
+        # <tmp>/agent-worktrees/<id> - the worktree path contains the checkout
+        # path as a plain substring but is NOT a mention of the checkout.
+        sibling = Path(self.repo.parent) / "agent-worktrees" / "wt1"
+        task = f"Your worktree is {sibling}. Fix the module."
+        worker = FakeWorker(write_to=self.repo)
+        result = GuardedWorker(worker, str(self.repo)).run(
+            task, str(self.wt), experiment_logger=self.elog, phase="implementation")
+        self.assertFalse(result.success)
+        # The worktree path survives in the prompt; the checkout itself does not
+        # appear as a complete path component anywhere in the prompt.
+        self.assertIn(str(sibling), worker.task)
+        self.assertEqual(count_repo_root_mentions(worker.task, str(self.repo)), 0)
+        args, kwargs = self.elog.error.call_args
+        self.assertEqual(args[1], EVENT)
+        self.assertFalse(kwargs["prompt_mentions_repo_root"])
+        self.assertEqual(kwargs["repo_root_mentions_scrubbed"], 0)
 
     def test_attributes_pass_through_to_the_wrapped_worker(self):
         self.assertEqual(GuardedWorker(FakeWorker(), str(self.repo)).provider, "mistral")

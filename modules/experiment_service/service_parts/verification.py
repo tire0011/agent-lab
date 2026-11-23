@@ -14,6 +14,11 @@ from typing import Any
 from modules.central_logging import ExperimentLogger, sanitize_command
 from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
+from modules.no_changes_cause import (
+    classify_no_changes_cause,
+    is_no_changes_error,
+    record_no_changes_cause,
+)
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
 from modules import timing_check as timing_check_module
@@ -423,6 +428,7 @@ class VerificationMixin:
         repair_iteration: int = 0,
         soft_findings_to_reviewer: bool | None = None,
         abort_on_test_stall: bool = False,
+        implementation_error: str | None = None,
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
@@ -441,11 +447,33 @@ class VerificationMixin:
                     "Verification blocked because the implementation checkpoint is not visible in GitHub",
                     exc=exc,
                 )
+                error_text = f"GitHub checkpoint failed before verification: {str(exc)[:2000]}"
+                cause = None
+                if is_no_changes_error(exc):
+                    # #811: record WHY nothing came out, so the weekly review can
+                    # count it (column + log event + error token).
+                    cause = record_no_changes_cause(
+                        self._conn, experiment_id,
+                        classify_no_changes_cause(
+                            self._conn, experiment_id, self.experiment_log_dir,
+                            extra_error=implementation_error,
+                        ),
+                        elog, phase="verifying",
+                    )
+                    error_text = (
+                        f"GitHub checkpoint failed before verification: {str(exc)[:1900]}"
+                        f"; no_changes_cause={cause}"
+                    )
+                fields: dict[str, Any] = {
+                    "ended_at": _utcnow_iso(),
+                    "error": error_text,
+                }
+                if cause is not None:
+                    fields["no_changes_cause"] = cause
                 self._force_status(
                     experiment_id,
                     STATUS_NEEDS_REVIEW,
-                    ended_at=_utcnow_iso(),
-                    error=f"GitHub checkpoint failed before verification: {str(exc)[:2000]}",
+                    **fields,
                 )
                 return self.get_experiment(experiment_id)
 

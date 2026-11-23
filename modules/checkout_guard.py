@@ -7,22 +7,80 @@ CLI has a file sandbox, so every run is guarded the same way, whatever the
 provider:
 
 - the prompt names the working directory and forbids the deployed checkout;
+- absolute mentions of the deployed checkout are scrubbed from the prompt
+  first (#811): documentation inside the task otherwise hands the agent the
+  exact path it then wrote to (run 1b9c8642/#797), and the guard hint itself
+  no longer repeats the path;
 - the deployed checkout's ``git status`` is compared before and after the run;
 - new changes fail the run, are moved into a git stash (recoverable, so the
   running code is the reviewed code again) and are recorded with what is
-  needed to narrow down the cause: provider, files, and whether the prompt
-  itself mentioned the checkout path.
+  needed to narrow down the cause: provider, files, whether the original
+  prompt mentioned the checkout path, and the #811 cause
+  ``wrote_outside_worktree`` (``no_changes_cause``), so the weekly review can
+  count these runs.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from modules.no_changes_cause import CAUSE_OUTSIDE_WORKTREE
+
 EVENT = "agent_wrote_outside_worktree"
+
+#: Placeholder that replaces absolute paths of the deployed checkout in prompts.
+SCRUB_PLACEHOLDER = "<deployed-checkout>"
+
+
+def _root_regex(root: str) -> re.Pattern[str]:
+    """Match *root* only where it is a complete path component, never inside
+    another path or word.
+
+    #811 review of f0195c70: plain ``str.replace`` corrupted every text that
+    merely contains the root as a substring. In production the deployed
+    checkout is ``/agent`` and the worktrees live under
+    ``~/agent-worktrees/<id>``, so ``/home/agent/agent-worktrees/<id>`` turned
+    into ``/home<deployed-checkout>/agent-worktrees/<id>``;
+    ``tire0011/agent-lab`` became ``tire0011<deployed-checkout>-lab`` and
+    ``foo/agent.py`` / ``/agent-worktrees`` broke the same way.
+
+    - the lookbehind rejects a preceding word character, ``.``, ``/`` or ``-``,
+      so ``/agent`` inside ``/home/agent`` (preceded by ``e``), inside
+      ``tire0011/agent-lab`` (preceded by ``1``) or inside ``foo/agent.py``
+      (preceded by ``o``) never matches;
+    - the lookahead requires ``/``, end of string, or a character that cannot
+      continue a path token, so ``/agent/modules/x.py`` and the sentence-final
+      ``at /agent.`` still match (and are scrubbed), while ``/agent-worktrees``
+      (followed by ``-``) does not.
+    """
+    return re.compile(r"(?<![\w./-])" + re.escape(root) + r"(?=$|/|[^\w/-])")
+
+
+def _repo_roots(repo_root: str) -> set[str]:
+    """*repo_root* and its resolved form, without empty or root ``/`` entries."""
+    roots = {str(repo_root).rstrip("/")}
+    try:
+        resolved = str(Path(repo_root).resolve()).rstrip("/")
+        if resolved:
+            roots.add(resolved)
+    except OSError:
+        pass
+    return {root for root in roots if root and root != "/"}
+
+
+def count_repo_root_mentions(task: str, repo_root: str) -> int:
+    """How often *repo_root* occurs in *task* as a complete path component.
+
+    Boundary-aware on purpose: a task that names the agent's own worktree
+    (``/home/agent/agent-worktrees/<id>`` with deployed checkout ``/agent``)
+    does NOT count as a mention of the deployed checkout.
+    """
+    return sum(len(_root_regex(root).findall(task)) for root in _repo_roots(repo_root))
 
 
 def _porcelain(repo_root: str) -> set[str] | None:
@@ -55,12 +113,52 @@ def _stash(repo_root: str, message: str) -> str | None:
         return None
 
 
-def hint(working_dir: str, repo_root: str) -> str:
+def hint(working_dir: str) -> str:
+    """The appended work-only-inside hint.
+
+    Deliberately does NOT name the deployed checkout's absolute path (#811):
+    the hint is part of the prompt, and a path named there is a path the agent
+    can write to. Absolute mentions in the task itself are scrubbed by
+    :func:`scrub_repo_root` before this hint is appended.
+    """
     return (
-        f"Work only inside your working directory {working_dir}. The deployed "
-        f"checkout {repo_root} is off-limits: never read from or write to it, even "
-        "where documentation names paths below it."
+        f"Work only inside your working directory {working_dir}. Any other "
+        "checkout of this repository on this machine - for example the deployed "
+        "one - is off-limits: never read from or write to it, even where "
+        "documentation names paths below it."
     )
+
+
+def scrub_repo_root(task: str, repo_root: str, working_dir: str | None = None) -> str:
+    """Replace absolute mentions of *repo_root* in *task* with a placeholder.
+
+    #811/1b9c8642: the implementation prompt quotes documentation that names
+    paths below the deployed checkout, and the agent then wrote exactly there.
+    The agent cannot write to a path it never sees, so every occurrence of the
+    checkout's absolute path is replaced. When the worktree itself lives under
+    *repo_root*, nothing is scrubbed (the working directory must stay visible).
+
+    Only complete path components are replaced (see :func:`_root_regex`): the
+    root as a mere substring of another path or word - the agent's own
+    ``~/agent-worktrees/<id>`` worktree, ``tire0011/agent-lab``,
+    ``foo/agent.py``, ``/agent-worktrees`` - is left untouched.
+    """
+    roots = _repo_roots(repo_root)
+    if not roots:
+        return task
+    if working_dir:
+        try:
+            work = Path(working_dir).resolve()
+            for root in roots:
+                root_path = Path(root)
+                if work == root_path or root_path in work.parents:
+                    return task  # the worktree is inside the checkout: keep paths
+        except OSError:
+            pass
+    scrubbed = task
+    for root in sorted(roots, key=len, reverse=True):
+        scrubbed = _root_regex(root).sub(SCRUB_PLACEHOLDER, scrubbed)
+    return scrubbed
 
 
 class GuardedWorker:
@@ -81,8 +179,15 @@ class GuardedWorker:
             same = False
         if same or not (root / ".git").exists():
             return self._worker.run(task=task, working_dir=working_dir, **kwargs)
-        prompt_mentions_root = self._repo_root in task
-        guarded_task = task.rstrip() + "\n\n" + hint(working_dir, self._repo_root)
+        # Boundary-aware: a task naming the agent's own worktree
+        # (~/agent-worktrees/<id>) is not a mention of the deployed checkout.
+        mentions = count_repo_root_mentions(task, self._repo_root)
+        prompt_mentions_root = mentions > 0
+        guarded_task = (
+            scrub_repo_root(task, self._repo_root, working_dir).rstrip()
+            + "\n\n" + hint(working_dir)
+        )
+        scrubbed_mentions = mentions
         before = _porcelain(self._repo_root)
         result = self._worker.run(task=guarded_task, working_dir=working_dir, **kwargs)
         after = _porcelain(self._repo_root)
@@ -109,6 +214,8 @@ class GuardedWorker:
                     kwargs.get("phase") or "implementation", EVENT, message,
                     provider=str(provider), files=files, stash=stash or "",
                     prompt_mentions_repo_root=prompt_mentions_root,
+                    repo_root_mentions_scrubbed=scrubbed_mentions,
+                    no_changes_cause=CAUSE_OUTSIDE_WORKTREE,
                     working_dir=str(working_dir),
                 )
             except Exception:  # noqa: BLE001 - logging must not hide the failure
