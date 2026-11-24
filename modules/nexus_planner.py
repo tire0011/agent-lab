@@ -630,10 +630,10 @@ class IssuePlanner:
                     # #799: a shadow callable that knows the server timings
                     # returns {"content": ..., "cached_prompt_tokens": ...}.
                     content = raw.get("content", "")
-                    cached = raw.get("cached_prompt_tokens")
-                    if (isinstance(cached, (int, float)) and not isinstance(cached, bool)
-                            and math.isfinite(cached) and cached >= 0):
-                        cached_prompt_tokens = int(cached)
+                    # Malformed or out-of-range telemetry becomes None; it
+                    # never invalidates the answer or blocks the insert.
+                    from modules.planner_shadow import cached_token_count
+                    cached_prompt_tokens = cached_token_count(raw.get("cached_prompt_tokens"))
                 text = content if isinstance(content, str) else ("" if content is None else str(content))
                 # #798: kept even though the shadow's json_schema enum now
                 # constrains the wire format - the monitor still validates

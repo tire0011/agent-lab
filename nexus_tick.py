@@ -337,10 +337,10 @@ def _planner(repo_root: str, db_path: str | None = None):
         # timings.cache_n (#685), normalized to tokens_cached on last_timings,
         # so the planner_shadow row can store them as cached_prompt_tokens.
         timings = client.last_timings or {}
-        cached = timings.get("tokens_cached")
-        cached_prompt_tokens = (int(cached)
-                                if isinstance(cached, (int, float))
-                                and not isinstance(cached, bool) else None)
+        # cached_token_count never raises: NaN, infinity, negative or
+        # out-of-range counts become None and the answer stays usable.
+        from modules.planner_shadow import cached_token_count
+        cached_prompt_tokens = cached_token_count(timings.get("tokens_cached"))
         return {"content": content, "cached_prompt_tokens": cached_prompt_tokens}
 
     return IssuePlanner(
