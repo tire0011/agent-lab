@@ -56,7 +56,7 @@ class ReviewerTests(unittest.TestCase):
             conn.execute("CREATE TABLE IF NOT EXISTS github_experiment_links (issue_number INTEGER, experiment_id TEXT)")
             conn.execute("INSERT INTO github_experiment_links VALUES (?, ?)", (issue, experiment_id))
 
-    def test_a_retry_goes_back_to_the_reviewer_that_blocked_it(self):
+    def test_a_retry_goes_to_another_reviewer_with_the_earlier_findings(self):
         prompts = {}
 
         def runner(name, answer):
@@ -74,16 +74,15 @@ class ReviewerTests(unittest.TestCase):
         self._link(511, "second")
         self._link(999, "other")
         self.assertTrue(reviewer.review(experiment_id="first", goal="g", worktree_path=".", base_sha="").blocks)
-        # Another issue moves the rotation on; the retry still returns to claude.
-        reviewer.review(experiment_id="other", goal="g", worktree_path=".", base_sha="")
+        # 2026-11-23: the blocking reviewer found a new problem in every round, so
+        # the retry goes to the next one in turn, which checks the old findings.
         self.calls.clear()
         reviewer.review(experiment_id="second", goal="g", worktree_path=".", base_sha="")
-        self.assertEqual(self.calls, ["claude"])
-        self.assertIn("FOLLOW-UP REVIEW", prompts["claude"])
-        self.assertIn("link is stored too late", prompts["claude"])
-        self.assertNotIn("FOLLOW-UP REVIEW", prompts["codex"])
+        self.assertEqual(self.calls, ["codex"])
+        self.assertIn("FOLLOW-UP REVIEW", prompts["codex"])
+        self.assertIn("link is stored too late", prompts["codex"])
 
-    def test_a_stand_in_for_the_blocking_reviewer_gets_the_same_findings(self):
+    def test_the_blocking_reviewer_only_stands_in_and_gets_the_same_findings(self):
         prompts = {}
 
         def runner(name, answer):
@@ -99,11 +98,12 @@ class ReviewerTests(unittest.TestCase):
         self._link(642, "first")
         self._link(642, "second")
         reviewer.review(experiment_id="first", goal="g", worktree_path=".", base_sha="")
-        reviewer._runners["claude"] = runner("claude", "not json")
+        for name in ("codex", "azure"):
+            reviewer._runners[name] = runner(name, "not json")
         result = reviewer.review(experiment_id="second", goal="g", worktree_path=".", base_sha="")
-        self.assertEqual(result.reviewer, "codex")
-        self.assertIn("FOLLOW-UP REVIEW", prompts["codex"])
-        self.assertIn("timeout error is empty", prompts["codex"])
+        self.assertEqual(result.reviewer, "claude")
+        self.assertIn("FOLLOW-UP REVIEW", prompts["claude"])
+        self.assertIn("timeout error is empty", prompts["claude"])
 
     def test_without_an_earlier_block_the_rotation_is_unchanged(self):
         reviewer = NexusReviewer(db_path=self.db, runners={n: self._runner(n) for n in ("claude", "codex", "azure")})

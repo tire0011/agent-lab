@@ -67,6 +67,20 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(second.verdict, "approve")
         self.assertEqual(second.deferred, [("edge_case", "a late worker start can outrun the deadline")])
 
+    def test_from_the_third_attempt_new_bugs_must_be_named_in_the_task(self):
+        prompts = []
+        answer = _answer(("bug", "concurrent push publishes a pending job"))
+        reviewer = NexusReviewer(db_path=self.db, runners={
+            n: (lambda p, w, n=n: prompts.append((n, p)) or answer) for n in ("codex", "claude")})
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("INSERT INTO github_experiment_links VALUES (797, 'e3')")
+        with mock.patch.object(nexus_reviewer, "REVIEWERS", ("codex", "claude")):
+            for exp in ("e1", "e2", "e3"):
+                reviewer.review(experiment_id=exp, goal="g", worktree_path=".", base_sha="")
+        self.assertNotIn("STRICT SCOPE", prompts[1][1])
+        self.assertIn("STRICT SCOPE: this task has been blocked 2 times already", prompts[2][1])
+        self.assertEqual([name for name, _ in prompts], ["codex", "claude", "codex"])
+
     def test_the_prompt_asks_for_problem_kinds(self):
         prompt = nexus_reviewer.review_prompt("g", "d", can_read_files=True)
         for kind in ("task", "bug", "regression", "edge_case", "elsewhere"):
