@@ -43,6 +43,10 @@ _AGENT_STALL_SECONDS = 300
 PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere")
 BLOCKING_KINDS = ("task", "bug", "regression")
 CONVERGE_AFTER_BLOCKS = 1
+# From the third attempt (two earlier blocks) a new bug blocks only when it
+# breaks a case the task names (2026-11-23: Codex blocked five adoptions in a
+# row, each retry with a new finding).
+STRICT_AFTER_BLOCKS = 2
 
 
 @dataclass(slots=True)
@@ -59,7 +63,8 @@ class ReviewResult:
 
 
 def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "",
-                  earlier_findings: str = "", model_written_tests: str = "") -> str:
+                  earlier_findings: str = "", model_written_tests: str = "",
+                  earlier_blocks: int = 0) -> str:
     look = (
         "You are in the repository with the change applied and may read any file "
         "to check the change in context.\n\n"
@@ -98,14 +103,22 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
             if gate_findings else ""
         )
         + (
-            "FOLLOW-UP REVIEW: you blocked an earlier attempt at this task with "
-            f"these findings:\n{earlier_findings[:4000]}\n"
+            "FOLLOW-UP REVIEW: an earlier review blocked a previous attempt at this "
+            f"task with these findings:\n{earlier_findings[:4000]}\n"
             "First check each of them against this new attempt. Block again if "
             "one of them is not fixed. Block for a NEW problem only when it is "
             "serious: it breaks existing behaviour, loses data, weakens a "
             "security, safety or budget check, or can loop. Mention smaller new "
             "findings in the summary without blocking.\n\n"
             if earlier_findings else ""
+        )
+        + (
+            f"STRICT SCOPE: this task has been blocked {earlier_blocks} times already. "
+            "A new problem counts as \"bug\" only when it breaks a case the TASK text "
+            "explicitly names; any other new problem is an \"edge_case\", however "
+            "serious it seems, unless it is a \"regression\". An earlier finding that "
+            "is still not fixed keeps its kind.\n\n"
+            if earlier_blocks >= STRICT_AFTER_BLOCKS else ""
         )
         + f"TASK:\n{goal[:8000]}\n\n"
         + (
@@ -272,9 +285,13 @@ class NexusReviewer:
         earlier = earlier_review or self._earlier_block(experiment_id)
         order = [earlier_review[0]] if earlier_review else self._order()
         if earlier is not None and earlier_review is None:
-            # A retry goes back to the reviewer that blocked it: a new reviewer
-            # each time found new edge cases until the attempts ran out.
-            order = [earlier[0], *[name for name in order if name != earlier[0]]]
+            # A retry goes to another reviewer, which checks the earlier findings
+            # first; the blocking one only stands in. Sending retries back to it
+            # (#642) let one reviewer find a new problem in every round
+            # (2026-11-23: five Codex blocks in a row). The strict scope from the
+            # third attempt stops new edge cases from blocking.
+            order = [*[name for name in order if name != earlier[0]], earlier[0]]
+        earlier_blocks = self._earlier_block_count(experiment_id) if earlier_review is None else 0
         for name in order:
             runner = self._runners.get(name)
             if runner is None:
@@ -285,6 +302,7 @@ class NexusReviewer:
                 # gave no verdict, and codex reviewed the retry from scratch).
                 earlier_findings=earlier[1] if earlier is not None else "",
                 model_written_tests=model_written_tests,
+                earlier_blocks=earlier_blocks,
             )
             try:
                 raw = runner(prompt, worktree_path)
@@ -295,8 +313,7 @@ class NexusReviewer:
             if parsed is None:
                 logger.warning("review: %s gave no usable verdict", name)
                 continue
-            verdict, summary, deferred = converge(
-                *parsed, parse_problems(raw), self._earlier_block_count(experiment_id))
+            verdict, summary, deferred = converge(*parsed, parse_problems(raw), earlier_blocks)
             result = ReviewResult(name, verdict, summary, deferred)
             break
         if result is None:
