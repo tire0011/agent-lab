@@ -167,26 +167,41 @@ class MistralWorker:
             return None
         return coding_model(pool)
 
-    def _audit(self, result: WorkerResult, spec: model_registry.ModelSpec | None, timestamp: str) -> None:
+    def _audit(
+        self, result: WorkerResult, spec: model_registry.ModelSpec | None, timestamp: str,
+        phase: str = PROVIDER,
+    ) -> None:
         if self._db_path is None:
             return
         try:
-            from modules.run_store import init_db, insert_run
+            from modules.run_store import init_db, insert_run, resolve_run_cost
             conn = init_db(self._db_path)
             usage = result.usage or {}
+            model = spec.model if spec is not None else "mistral"
+            # #810: the API worker is priced from the recorded usage and the
+            # price table (free-tier rows price it at 0, which is real).
+            cost = resolve_run_cost(
+                conn,
+                provider=PROVIDER,
+                model=model,
+                timestamp=timestamp,
+                usage=result.usage,
+            )
             insert_run(
                 conn,
                 timestamp=timestamp,
                 provider=PROVIDER,
-                model=spec.model if spec is not None else "mistral",
+                model=model,
                 input_description=result.task[:500],
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 total_tokens=usage.get("total_tokens", 0),
                 runtime_ms=result.runtime_ms,
-                estimated_cost=None,
-                actual_cost=None,
-                cost_status="unknown",
+                estimated_cost=cost["estimated_cost"],
+                actual_cost=cost["actual_cost"],
+                cost_status=cost["cost_status"],
+                cost_currency=cost["cost_currency"],
+                run_kind=phase,
                 success=result.success,
                 error=result.error,
             )
@@ -265,7 +280,7 @@ class MistralWorker:
                 error=error,
                 provider=PROVIDER,
             )
-            self._audit(result, spec, timestamp)
+            self._audit(result, spec, timestamp, phase)
             return result
 
         try:

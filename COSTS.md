@@ -15,6 +15,9 @@
 - Estimated LLM cost is computed from token usage and `model_prices` rows valid at run time.
 - If no matching model price exists, run execution continues and estimated cost is stored as unknown/null.
 - Actual Azure cost reconciliation is deferred to **V2.1**.
+- #810: `init_db()` seeds built-in list-price rows into `model_prices` (operator rows win), so coding-agent runs are priced even without hand-inserted prices.
+- Every coding-agent run (implementation, repair, review, weekly review) records its cost in `runs`: Codex/Claude/Mistral-API from usage x price table (`cost_status='estimated'`), tool-reported amounts as `actual` (Claude `total_cost_usd`, Vibe `export.json cost_usd`), and subscription runs (Claude Code login, Vibe Code) as `cost_status='subscription'` with no fake price. Cache-read input tokens are not billed at full input price.
+- `modules.run_store.weekly_cost_by_provider()` is the one query for cost per provider per week; `run_cost_completeness()` gives the 7-day share of runs with a cost value or subscription mark (target > 90 %).
 
 ## Unknowns
 

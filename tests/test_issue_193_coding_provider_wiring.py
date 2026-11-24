@@ -124,7 +124,9 @@ class TaskProviderTests(unittest.TestCase):
         ) as build:
             finished = service.run_task(task.id)
 
-        build.assert_called_once_with(PROVIDER_CLAUDE)
+        # #810: the service db_path is passed on so the worker audits the run
+        # (with its cost) into ``runs``.
+        build.assert_called_once_with(PROVIDER_CLAUDE, db_path=service.db_path)
         self.assertEqual(finished.status, STATUS_SUCCEEDED)
         self.assertEqual(finished.provider, PROVIDER_CLAUDE)
 

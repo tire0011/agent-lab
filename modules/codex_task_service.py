@@ -250,10 +250,14 @@ class CodexTaskService:
         return choose_provider(self.rng, db_path=self.db_path)
 
     def _worker_for(self, task: CodexTask) -> Any:
-        """The worker that runs *task*: the injected one, or the task's own."""
+        """The worker that runs *task*: the injected one, or the task's own.
+
+        The service's db_path is passed on so the worker audits the run (with
+        its cost) into ``runs`` (#810); without it task runs left no trace there.
+        """
         if self.worker is not None:
             return self.worker
-        return build_worker(task.provider)
+        return build_worker(task.provider, db_path=self.db_path)
 
     # get_task / list_tasks
 
@@ -305,6 +309,7 @@ class CodexTaskService:
                 working_dir=task.working_dir,
                 sandbox=task.sandbox,
                 timeout_seconds=task.timeout_seconds,
+                phase="task",
             )
         except Exception as exc:  # noqa: BLE001 - must never leave task 'running'
             self._finalize(

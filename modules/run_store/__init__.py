@@ -10,17 +10,30 @@ import os
 import sqlite3
 
 from . import schema as _schema
+from .prices import DEFAULT_MODEL_PRICES, WILDCARD_MODEL, default_price_rows, seed_default_model_prices
 from .records import (
+    COST_STATUS_ACTUAL,
+    COST_STATUS_ESTIMATED,
+    COST_STATUS_FREE,
+    COST_STATUS_SUBSCRIPTION,
+    COST_STATUS_UNKNOWN,
+    COSTED_STATUSES,
+    WEEKLY_COST_BY_PROVIDER_SQL,
+    backfill_run_costs,
     calculate_estimated_cost,
     get_applicable_price,
+    get_effective_price,
     get_setting,
     insert_activity,
     insert_run,
     insert_tool_calls,
     list_activity,
     list_local_localizations,
+    resolve_run_cost,
+    run_cost_completeness,
     set_setting,
     upsert_local_localization,
+    weekly_cost_by_provider,
 )
 
 DEFAULT_DB_PATH = os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db")
@@ -55,11 +68,23 @@ def init_db(db_path: str | None = None) -> sqlite3.Connection:
 
 
 __all__ = [
+    "COST_STATUS_ACTUAL",
+    "COST_STATUS_ESTIMATED",
+    "COST_STATUS_FREE",
+    "COST_STATUS_SUBSCRIPTION",
+    "COST_STATUS_UNKNOWN",
+    "COSTED_STATUSES",
     "DEFAULT_DB_PATH",
+    "DEFAULT_MODEL_PRICES",
     "LEGACY_DB_PATH",
+    "WEEKLY_COST_BY_PROVIDER_SQL",
+    "WILDCARD_MODEL",
     "_connect",
+    "backfill_run_costs",
     "calculate_estimated_cost",
+    "default_price_rows",
     "get_applicable_price",
+    "get_effective_price",
     "get_setting",
     "init_db",
     "insert_activity",
@@ -67,6 +92,10 @@ __all__ = [
     "insert_tool_calls",
     "list_activity",
     "list_local_localizations",
+    "resolve_run_cost",
+    "run_cost_completeness",
+    "seed_default_model_prices",
     "set_setting",
     "upsert_local_localization",
+    "weekly_cost_by_provider",
 ]

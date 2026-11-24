@@ -69,6 +69,10 @@ class WorkerResult:
     sandbox: str
     error: str | None  # worker-level error (binary not found, invalid dir, …)
     provider: str = "codex"
+    # Money amount the tool itself reported, when it reports one (#810):
+    # Claude's total_cost_usd, Vibe's export.json cost_usd. None when the run
+    # was billed by a subscription or reported nothing.
+    cost_usd: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +87,7 @@ class WorkerResult:
             "thread_id": self.thread_id,
             "final_message": self.final_message,
             "usage": self.usage,
+            "cost_usd": self.cost_usd,
             "task": self.task,
             "working_dir": self.working_dir,
             "sandbox": self.sandbox,

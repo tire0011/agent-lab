@@ -198,9 +198,11 @@ class NexusReviewer:
         runners: dict[str, Callable[[str, str], str]] | None = None,
     ) -> None:
         self.db_path = db_path
+        # db_path is bound so review runs are audited into ``runs`` with their
+        # cost (#810); injected runners keep their own (test) signature.
         self._runners = runners if runners is not None else {
-            "claude": _run_claude,
-            "codex": _run_codex,
+            "claude": lambda prompt, root: _run_claude(prompt, root, self.db_path),
+            "codex": lambda prompt, root: _run_codex(prompt, root, self.db_path),
             "azure": _run_azure,
         }
         with self._connect() as conn:
@@ -351,10 +353,12 @@ def _diff(worktree_path: str, base_sha: str, *, exact_base: bool = False) -> str
     return proc.stdout
 
 
-def _run_claude(prompt: str, worktree_path: str) -> str:
+def _run_claude(prompt: str, worktree_path: str, db_path: str | None = None) -> str:
     from modules.claude_worker import ClaudeWorker
 
-    result = ClaudeWorker().run(
+    # db_path is passed so the review run is audited into ``runs`` with its
+    # cost (#810).
+    result = ClaudeWorker(db_path=db_path).run(
         task=prompt, working_dir=worktree_path, sandbox="read-only",
         timeout_seconds=_AGENT_TIMEOUT_SECONDS, stall_seconds=_AGENT_STALL_SECONDS, phase="review",
     )
@@ -363,10 +367,10 @@ def _run_claude(prompt: str, worktree_path: str) -> str:
     return result.final_message or ""
 
 
-def _run_codex(prompt: str, worktree_path: str) -> str:
+def _run_codex(prompt: str, worktree_path: str, db_path: str | None = None) -> str:
     from modules.codex_worker import CodexWorker
 
-    result = CodexWorker().run(
+    result = CodexWorker(db_path=db_path).run(
         task=prompt, working_dir=worktree_path, sandbox="read-only",
         timeout_seconds=_AGENT_TIMEOUT_SECONDS, stall_seconds=_AGENT_STALL_SECONDS, phase="review",
     )

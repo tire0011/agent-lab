@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,10 @@ from modules.coding_worker import (
 
 #: Same provider name as the API worker: the rotation entry stays ``mistral``.
 PROVIDER = "mistral"
+#: Provider label used in the ``runs`` audit table (#810): Vibe runs are billed
+#: to the Vibe Code subscription, which is a different bucket than the
+#: pay-per-token Mistral API worker that shares the rotation name.
+AUDIT_PROVIDER = "vibe"
 ENV_VIBE_BIN = "AGENT_VIBE_BIN"
 ENV_VIBE_MODEL = "AGENT_VIBE_MODEL"
 
@@ -141,6 +146,20 @@ def _usage(export: dict[str, Any]) -> dict[str, int] | None:
     return result or None
 
 
+def _cost_usd(export: dict[str, Any]) -> float | None:
+    """The money amount export.json reports (#810), or ``None``.
+
+    A Vibe Code subscription run reports no (or a zero) cost; only a positive
+    amount is a real per-token charge (API-key run), everything else is
+    subscription billing and must not be turned into a fake price.
+    """
+    value = export.get("cost_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if value > 0 else None
+
+
 class VibeWorker:
     """Runs a coding task non-interactively via the ``vibe`` CLI."""
 
@@ -179,10 +198,15 @@ class VibeWorker:
     ) -> WorkerResult:
         """Same signature as ``ClaudeWorker.run``; ``output_schema`` is added to
         the prompt as an instruction (the CLI has no schema flag)."""
+        timestamp = datetime.now(timezone.utc).isoformat()
         try:
             validate_worker_config(task, working_dir, sandbox)
         except WorkerConfigError as exc:
-            return self._result(task, working_dir, sandbox, error=str(exc))
+            result = self._result(task, working_dir, sandbox, error=str(exc))
+            # A rejected call never ran, but it is still a failed run and is
+            # recorded as one (#810: failed runs are audited too).
+            self._audit(result, timestamp, phase)
+            return result
 
         prompt = task
         if output_schema is not None:
@@ -217,6 +241,7 @@ class VibeWorker:
                 exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
                 timed_out=result.timed_out, level="INFO" if result.success else "ERROR",
             )
+        self._audit(result, timestamp, phase)
         return result
 
     def _build_command(
@@ -316,6 +341,7 @@ class VibeWorker:
             thread_id=str(export["session_id"]) if export.get("session_id") else None,
             final_message=_final_message(stdout_raw) if error is None else None,
             usage=_usage(export),
+            cost_usd=_cost_usd(export),
         )
 
     def _result(
@@ -323,6 +349,7 @@ class VibeWorker:
         exit_code: int | None = None, stdout: str = "", stderr: str = "",
         runtime_ms: int = 0, timed_out: bool = False, thread_id: str | None = None,
         final_message: str | None = None, usage: dict[str, int] | None = None,
+        cost_usd: float | None = None,
     ) -> WorkerResult:
         stdout_capped, stdout_truncated = truncate_output(stdout, self.max_output_bytes)
         stderr_capped, stderr_truncated = truncate_output(stderr, self.max_output_bytes)
@@ -343,4 +370,52 @@ class VibeWorker:
             sandbox=sandbox,
             error=error,
             provider=PROVIDER,
+            cost_usd=cost_usd,
         )
+
+    # ------------------------------------------------------------------
+    # Audit logging (#810: every Vibe run records its cost or subscription mark)
+    # ------------------------------------------------------------------
+
+    def _audit(self, result: WorkerResult, timestamp: str, phase: str = PROVIDER) -> None:
+        if self._db_path is None:
+            return
+        try:
+            from modules.run_store import init_db, insert_run, resolve_run_cost
+            conn = init_db(self._db_path)
+            usage = result.usage or {}
+            # export.json carries cost_usd for API-key runs; a Vibe Code
+            # subscription run reports none, and is marked subscription
+            # rather than assigned a fake per-token price.
+            model = self.model or AUDIT_PROVIDER
+            cost = resolve_run_cost(
+                conn,
+                provider=AUDIT_PROVIDER,
+                model=model,
+                timestamp=timestamp,
+                usage=result.usage,
+                actual_cost=result.cost_usd,
+                subscription=result.cost_usd is None,
+            )
+            insert_run(
+                conn,
+                timestamp=timestamp,
+                provider=AUDIT_PROVIDER,
+                model=model,
+                input_description=result.task[:500],
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                runtime_ms=result.runtime_ms,
+                estimated_cost=cost["estimated_cost"],
+                actual_cost=cost["actual_cost"],
+                cost_status=cost["cost_status"],
+                cost_currency=cost["cost_currency"],
+                run_kind=phase,
+                success=result.success,
+                error=result.error,
+            )
+            conn.close()
+        except Exception:
+            # Audit failure must never surface to the caller.
+            pass

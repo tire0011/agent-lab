@@ -156,6 +156,23 @@ def _model_from_result(result: dict[str, Any]) -> str:
     return "claude"
 
 
+def claude_subscription_active() -> bool:
+    """Whether this Claude Code CLI bills a subscription instead of an API key (#810).
+
+    ``AGENT_CLAUDE_SUBSCRIPTION`` overrides explicitly; otherwise an OAuth login
+    (``CLAUDE_CODE_OAUTH_TOKEN``, i.e. a Claude Pro/Max subscription) without an
+    ``ANTHROPIC_API_KEY`` means subscription billing, in which case the CLI
+    reports no (or a zero) ``total_cost_usd`` and the run must be marked
+    ``subscription`` rather than given a fake per-token price.
+    """
+    override = os.environ.get("AGENT_CLAUDE_SUBSCRIPTION", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    return bool(os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")) and not os.environ.get("ANTHROPIC_API_KEY")
+
+
 class _LiveUsageParser:
     """Emit each Claude API call's usage once from stream-json assistant events."""
 
@@ -304,12 +321,16 @@ class ClaudeWorker:
                     phase, "claude_call_invalid_config",
                     f"Claude call rejected before starting: {exc}",
                 )
-            return self._failed_result(
+            result = self._failed_result(
                 task=task,
                 working_dir=working_dir,
                 sandbox=sandbox,
                 error=str(exc),
             )
+            # A rejected call never ran, but it is still a failed run and is
+            # recorded as one (#810: failed runs are audited too).
+            self._audit(result, timestamp, phase)
+            return result
 
         # A progress-watched run (#327) streams events so every step shows up.
         cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
@@ -334,7 +355,7 @@ class ClaudeWorker:
         if experiment_logger is not None:
             self._log_result(experiment_logger, phase, cmd, working_dir, result)
 
-        self._audit(result, timestamp)
+        self._audit(result, timestamp, phase)
         return result
 
     @staticmethod
@@ -582,30 +603,49 @@ class ClaudeWorker:
     # Audit logging
     # ------------------------------------------------------------------
 
-    def _audit(self, result: WorkerResult, timestamp: str) -> None:
+    def _audit(self, result: WorkerResult, timestamp: str, phase: str = PROVIDER) -> None:
         if self._db_path is None:
             return
         try:
-            from modules.run_store import init_db, insert_run
+            from modules.run_store import init_db, insert_run, resolve_run_cost
 
             parsed = _parse_result(result.stdout) or {}
             cost = parsed.get("total_cost_usd")
-            actual_cost = float(cost) if isinstance(cost, (int, float)) else None
+            # #810: a positive total_cost_usd is the API-billed amount; a
+            # subscription login reports none (or 0.0), which must not become
+            # a fake price - the run is marked subscription instead.
+            actual_cost = (
+                float(cost)
+                if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost > 0
+                else None
+            )
             usage = result.usage or {}
+            model = _model_from_result(parsed)
             conn = init_db(self._db_path)
+            cost_fields = resolve_run_cost(
+                conn,
+                provider=PROVIDER,
+                model=model,
+                timestamp=timestamp,
+                usage=result.usage,
+                actual_cost=actual_cost,
+                subscription=claude_subscription_active(),
+            )
             insert_run(
                 conn,
                 timestamp=timestamp,
                 provider=PROVIDER,
-                model=_model_from_result(parsed),
+                model=model,
                 input_description=result.task[:500],
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
                 runtime_ms=result.runtime_ms,
-                estimated_cost=None,
-                actual_cost=actual_cost,
-                cost_status="actual" if actual_cost is not None else "unknown",
+                estimated_cost=cost_fields["estimated_cost"],
+                actual_cost=cost_fields["actual_cost"],
+                cost_status=cost_fields["cost_status"],
+                cost_currency=cost_fields["cost_currency"],
+                run_kind=phase,
                 success=result.success,
                 error=result.error,
             )

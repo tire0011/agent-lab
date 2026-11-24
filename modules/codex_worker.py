@@ -150,7 +150,7 @@ class CodexWorker:
                     phase, "codex_call_invalid_config",
                     f"Codex call rejected before starting: {exc}",
                 )
-            return CodexResult(
+            result = CodexResult(
                 success=False,
                 exit_code=None,
                 stdout="",
@@ -168,6 +168,10 @@ class CodexWorker:
                 error=str(exc),
                 provider=PROVIDER,
             )
+            # A rejected call never ran, but it is still a failed run and is
+            # recorded as one (#810: failed runs are audited too).
+            self._audit(result, timestamp, phase)
+            return result
 
         schema_path: str | None = None
         try:
@@ -200,7 +204,7 @@ class CodexWorker:
         if experiment_logger is not None:
             self._log_result(experiment_logger, phase, cmd, working_dir, result)
 
-        self._audit(result, timestamp)
+        self._audit(result, timestamp, phase)
         return result
 
     @staticmethod
@@ -406,26 +410,39 @@ class CodexWorker:
 
     # Audit logging
 
-    def _audit(self, result: CodexResult, timestamp: str) -> None:
+    def _audit(self, result: CodexResult, timestamp: str, phase: str = PROVIDER) -> None:
         if self._db_path is None:
             return
         try:
-            from modules.run_store import init_db, insert_run
+            from modules.run_store import init_db, insert_run, resolve_run_cost
             conn = init_db(self._db_path)
             usage = result.usage or {}
+            # #810: Codex is priced from the recorded usage and the price
+            # table (subscription logins excepted, which are not Codex's
+            # billing here); a failed run keeps whatever usage it produced.
+            model = self.model or PROVIDER
+            cost = resolve_run_cost(
+                conn,
+                provider=PROVIDER,
+                model=model,
+                timestamp=timestamp,
+                usage=result.usage,
+            )
             insert_run(
                 conn,
                 timestamp=timestamp,
                 provider=PROVIDER,
-                model="codex",
+                model=model,
                 input_description=result.task[:500],
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
                 runtime_ms=result.runtime_ms,
-                estimated_cost=None,
-                actual_cost=None,
-                cost_status="unknown",
+                estimated_cost=cost["estimated_cost"],
+                actual_cost=cost["actual_cost"],
+                cost_status=cost["cost_status"],
+                cost_currency=cost["cost_currency"],
+                run_kind=phase,
                 success=result.success,
                 error=result.error,
             )

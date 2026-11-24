@@ -3,6 +3,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
+from .prices import seed_default_model_prices
+
 DEFAULT_DB_PATH = os.environ.get("AGENT_DB_PATH", "/var/lib/nexus/agent.db")
 LEGACY_DB_PATH = "/agent/state/agent.db"
 
@@ -78,6 +80,11 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             estimated_cost REAL NULL,
             actual_cost REAL NULL,
             cost_status TEXT NOT NULL,
+            -- #810: currency of the cost columns (price rows carry their own).
+            cost_currency TEXT NULL,
+            -- #810: what kind of work this run was (implementation, repair,
+            -- review, weekly_review, ...); NULL for rows written before it existed.
+            run_kind TEXT NULL,
             success INTEGER NOT NULL CHECK (success IN (0, 1)),
             error TEXT NULL
         );
@@ -378,8 +385,60 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_runs_columns(conn)
+    # #810: built-in price rows, so token usage can be turned into a cost even
+    # when nobody inserted model_prices rows by hand. ON CONFLICT DO NOTHING
+    # keeps operator overrides and later valid_from history untouched.
+    seed_default_model_prices(conn)
+    _backfill_run_costs_once(conn)
     conn.commit()
     return conn
+
+
+def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:
+    """#810: estimate costs for pre-price-table runs, resuming after the last
+    processed run id. init_db() is on the worker audit path, so the durable
+    ``runs.cost_backfill_upto`` marker keeps each pass to the rows written
+    since the previous one; rows written afterwards already carry their cost.
+    """
+    from .records import backfill_run_costs
+
+    marker = "runs.cost_backfill_upto"
+    row = conn.execute(
+        "SELECT value FROM service_settings WHERE key = ?", (marker,)
+    ).fetchone()
+    try:
+        after_id = int(row[0]) if row is not None else 0
+    except (TypeError, ValueError):
+        after_id = 0
+    upto = backfill_run_costs(conn, after_id=after_id)
+    if upto > after_id:
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (marker, str(upto), now),
+        )
+
+
+# Columns an older ``runs`` table may lack; ``CREATE TABLE IF NOT EXISTS`` never
+# adds columns, so they are added with ``ALTER TABLE`` (#810: cost_currency and
+# run_kind).
+_RUNS_ADDITIVE_COLUMNS = [
+    ("cost_currency", "TEXT"),
+    ("run_kind", "TEXT"),
+]
+
+
+def _migrate_runs_columns(conn: sqlite3.Connection) -> None:
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+    for column_name, column_type in _RUNS_ADDITIVE_COLUMNS:
+        if column_name not in existing:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {column_name} {column_type} NULL")
 
 
 def _migrate_experiment_reflections_columns(conn: sqlite3.Connection) -> None:

@@ -105,6 +105,14 @@ def starter_pack(db_path: str, repo_root: str, now: datetime) -> str:
                 "re-verifications":
                     ("SELECT substr(verdict,1,40), COUNT(*) FROM reverifications WHERE created_at >= ? "
                      "GROUP BY 1", (since,)),
+                # #810: money per coding agent this week, not just run counts.
+                "coding-agent runs by provider (runs, with cost/subscription, subscription, cost USD)":
+                    ("SELECT provider, COUNT(*), "
+                     "SUM(actual_cost IS NOT NULL OR estimated_cost IS NOT NULL "
+                     "OR cost_status IN ('subscription','free')), "
+                     "SUM(cost_status = 'subscription'), "
+                     "ROUND(SUM(COALESCE(actual_cost, estimated_cost, 0)), 4) "
+                     "FROM runs WHERE timestamp >= ? GROUP BY 1 ORDER BY 5 DESC", (since,)),
             }
             for title, (sql, args) in sections.items():
                 lines.append(f"## {title}")
@@ -165,21 +173,25 @@ def review_prompt(pack: str, last_report: str | None, *, can_run_commands: bool,
     )
 
 
-def _run_codex(prompt: str, repo_root: str) -> str:
+def _run_codex(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.codex_worker import CodexWorker
 
-    result = CodexWorker().run(task=prompt, working_dir=repo_root, sandbox="read-only",
-                               timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
+    # db_path is passed so the review run is audited into ``runs`` with its
+    # cost (#810); without it the weekly review left no cost trace.
+    result = CodexWorker(db_path=db_path).run(
+        task=prompt, working_dir=repo_root, sandbox="read-only",
+        timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
     if not result.success:
         raise RuntimeError(result.error or "codex review failed")
     return result.final_message or ""
 
 
-def _run_claude(prompt: str, repo_root: str) -> str:
+def _run_claude(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.claude_worker import ClaudeWorker
 
-    result = ClaudeWorker().run(task=prompt, working_dir=repo_root, sandbox="read-only",
-                                timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
+    result = ClaudeWorker(db_path=db_path).run(
+        task=prompt, working_dir=repo_root, sandbox="read-only",
+        timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
     if not result.success:
         raise RuntimeError(result.error or "claude review failed")
     return result.final_message or ""
@@ -189,6 +201,15 @@ def _run_azure(prompt: str, repo_root: str) -> str:
     from modules.nexus_reviewer import _run_azure as run
 
     return run(prompt, repo_root)
+
+
+def default_runners(db_path: str) -> dict[str, Callable[[str, str], str]]:
+    """The production runners, bound to *db_path* so their runs are audited (#810)."""
+    return {
+        "codex": lambda prompt, root: _run_codex(prompt, root, db_path),
+        "claude": lambda prompt, root: _run_claude(prompt, root, db_path),
+        "azure": _run_azure,
+    }
 
 
 RUNNERS: dict[str, Callable[[str, str], str]] = {"codex": _run_codex, "claude": _run_claude, "azure": _run_azure}
@@ -203,7 +224,7 @@ def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
     now = now or datetime.now(timezone.utc)
     if not due(db_path, now):
         return None
-    runners = runners or RUNNERS
+    runners = runners if runners is not None else default_runners(db_path)
     conn = _connect(db_path)
     try:
         with conn:
