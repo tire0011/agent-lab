@@ -105,6 +105,20 @@ def starter_pack(db_path: str, repo_root: str, now: datetime) -> str:
                 "re-verifications":
                     ("SELECT substr(verdict,1,40), COUNT(*) FROM reverifications WHERE created_at >= ? "
                      "GROUP BY 1", (since,)),
+                "coding-agent runs by provider and currency (provider, currency, runs, "
+                "with cost or subscription, subscription runs, total cost)":
+                    ("""SELECT provider, cost_currency, COUNT(*),
+                         SUM(actual_cost IS NOT NULL OR estimated_cost IS NOT NULL
+                             OR cost_status = 'subscription'),
+                         SUM(cost_status = 'subscription'),
+                         ROUND(SUM(COALESCE(actual_cost, estimated_cost)), 4)
+                       FROM runs
+                       WHERE julianday(timestamp) BETWEEN julianday(?) AND julianday(?)
+                         AND ((provider IN ('codex','claude','vibe','mistral')
+                               AND run_kind IN ('implementation','implementation_repair','review','weekly_review','task'))
+                              OR (provider = 'azure_openai' AND run_kind IN ('review','weekly_review')))
+                       GROUP BY provider, cost_currency ORDER BY provider, cost_currency""",
+                     (since, now.isoformat())),
             }
             for title, (sql, args) in sections.items():
                 lines.append(f"## {title}")
@@ -165,30 +179,43 @@ def review_prompt(pack: str, last_report: str | None, *, can_run_commands: bool,
     )
 
 
-def _run_codex(prompt: str, repo_root: str) -> str:
+def _run_codex(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.codex_worker import CodexWorker
 
-    result = CodexWorker().run(task=prompt, working_dir=repo_root, sandbox="read-only",
-                               timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
+    # db_path is passed so the review run is audited into ``runs`` with its
+    # cost (#810); without it the weekly review left no cost trace.
+    result = CodexWorker(db_path=db_path).run(
+        task=prompt, working_dir=repo_root, sandbox="read-only",
+        timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
     if not result.success:
         raise RuntimeError(result.error or "codex review failed")
     return result.final_message or ""
 
 
-def _run_claude(prompt: str, repo_root: str) -> str:
+def _run_claude(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.claude_worker import ClaudeWorker
 
-    result = ClaudeWorker().run(task=prompt, working_dir=repo_root, sandbox="read-only",
-                                timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
+    result = ClaudeWorker(db_path=db_path).run(
+        task=prompt, working_dir=repo_root, sandbox="read-only",
+        timeout_seconds=TIMEOUT_SECONDS, stall_seconds=STALL_SECONDS, phase="weekly_review")
     if not result.success:
         raise RuntimeError(result.error or "claude review failed")
     return result.final_message or ""
 
 
-def _run_azure(prompt: str, repo_root: str) -> str:
+def _run_azure(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.nexus_reviewer import _run_azure as run
 
-    return run(prompt, repo_root)
+    return run(prompt, repo_root, db_path, phase="weekly_review")
+
+
+def default_runners(db_path: str) -> dict[str, Callable[[str, str], str]]:
+    """The production runners, bound to *db_path* so their runs are audited (#810)."""
+    return {
+        "codex": lambda prompt, root: _run_codex(prompt, root, db_path),
+        "claude": lambda prompt, root: _run_claude(prompt, root, db_path),
+        "azure": lambda prompt, root: _run_azure(prompt, root, db_path),
+    }
 
 
 RUNNERS: dict[str, Callable[[str, str], str]] = {"codex": _run_codex, "claude": _run_claude, "azure": _run_azure}
@@ -203,7 +230,7 @@ def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
     now = now or datetime.now(timezone.utc)
     if not due(db_path, now):
         return None
-    runners = runners or RUNNERS
+    runners = runners if runners is not None else default_runners(db_path)
     conn = _connect(db_path)
     try:
         with conn:

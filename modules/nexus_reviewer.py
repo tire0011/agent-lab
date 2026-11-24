@@ -198,10 +198,12 @@ class NexusReviewer:
         runners: dict[str, Callable[[str, str], str]] | None = None,
     ) -> None:
         self.db_path = db_path
+        # db_path is bound so review runs are audited into ``runs`` with their
+        # cost (#810); injected runners keep their own (test) signature.
         self._runners = runners if runners is not None else {
-            "claude": _run_claude,
-            "codex": _run_codex,
-            "azure": _run_azure,
+            "claude": lambda prompt, root: _run_claude(prompt, root, self.db_path),
+            "codex": lambda prompt, root: _run_codex(prompt, root, self.db_path),
+            "azure": lambda prompt, root: _run_azure(prompt, root, self.db_path),
         }
         with self._connect() as conn:
             conn.execute(
@@ -351,10 +353,12 @@ def _diff(worktree_path: str, base_sha: str, *, exact_base: bool = False) -> str
     return proc.stdout
 
 
-def _run_claude(prompt: str, worktree_path: str) -> str:
+def _run_claude(prompt: str, worktree_path: str, db_path: str | None = None) -> str:
     from modules.claude_worker import ClaudeWorker
 
-    result = ClaudeWorker().run(
+    # db_path is passed so the review run is audited into ``runs`` with its
+    # cost (#810).
+    result = ClaudeWorker(db_path=db_path).run(
         task=prompt, working_dir=worktree_path, sandbox="read-only",
         timeout_seconds=_AGENT_TIMEOUT_SECONDS, stall_seconds=_AGENT_STALL_SECONDS, phase="review",
     )
@@ -363,10 +367,10 @@ def _run_claude(prompt: str, worktree_path: str) -> str:
     return result.final_message or ""
 
 
-def _run_codex(prompt: str, worktree_path: str) -> str:
+def _run_codex(prompt: str, worktree_path: str, db_path: str | None = None) -> str:
     from modules.codex_worker import CodexWorker
 
-    result = CodexWorker().run(
+    result = CodexWorker(db_path=db_path).run(
         task=prompt, working_dir=worktree_path, sandbox="read-only",
         timeout_seconds=_AGENT_TIMEOUT_SECONDS, stall_seconds=_AGENT_STALL_SECONDS, phase="review",
     )
@@ -375,19 +379,38 @@ def _run_codex(prompt: str, worktree_path: str) -> str:
     return result.final_message or ""
 
 
-def _run_azure(prompt: str, worktree_path: str) -> str:
+def _run_azure(prompt: str, worktree_path: str, db_path: str | None = None,
+               *, phase: str = "review", max_tokens: int = 1500) -> str:
     import asyncio
+    import os
+    import time
 
     from modules.nexus_delegation import NexusDelegationService
+    from modules.worker_audit import audit_run
 
-    service = NexusDelegationService()
-    try:
-        result = asyncio.run(service.azure_chat(prompt, max_tokens=1500)).to_dict()
-    finally:
-        service.close()
-    if not result.get("success"):
-        raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
-    return str(result.get("content") or "")
+    started = time.monotonic()
+    with audit_run(db_path, "azure_openai", phase, prompt) as audit:
+        service = NexusDelegationService()
+        try:
+            result = asyncio.run(service.azure_chat(prompt, max_tokens=max_tokens))
+            metadata = result.metadata
+            raw_usage = metadata.get("usage") or {}
+            usage = {
+                target: raw_usage[key] for key, target in (
+                    ("prompt_tokens", "input_tokens"), ("completion_tokens", "output_tokens"),
+                ) if type(raw_usage.get(key)) is int
+            }
+            error = None if result.success else str(metadata.get("error") or "azure failed")
+            audit.finish(
+                model=metadata.get("deployment") or os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o"),
+                success=result.success, error=error, usage=usage,
+                runtime_ms=round((time.monotonic() - started) * 1000),
+            )
+        finally:
+            service.close()
+        if error:
+            raise RuntimeError(error)
+        return result.content[:4000]
 
 
 def review_comment(result: ReviewResult) -> str:

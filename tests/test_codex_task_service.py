@@ -155,6 +155,7 @@ class RunTaskSuccessTests(CodexTaskServiceTestCase):
             working_dir="/agent",
             sandbox="read-only",
             timeout_seconds=99,
+            phase="task",
         )
 
     def test_public_api_does_not_pass_output_schema(self):

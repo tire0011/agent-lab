@@ -69,6 +69,13 @@ class WorkerResult:
     sandbox: str
     error: str | None  # worker-level error (binary not found, invalid dir, …)
     provider: str = "codex"
+    # Money amount the tool itself reported, when it reports one (#810):
+    # Claude's total_cost_usd, Vibe's export.json cost_usd. None when the run
+    # was billed by a subscription or reported nothing.
+    cost_usd: float | None = None
+    billing_model: str | None = None
+    model_usage: dict[str, dict[str, int]] | None = None
+    subscription: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -83,6 +90,7 @@ class WorkerResult:
             "thread_id": self.thread_id,
             "final_message": self.final_message,
             "usage": self.usage,
+            "cost_usd": self.cost_usd,
             "task": self.task,
             "working_dir": self.working_dir,
             "sandbox": self.sandbox,
@@ -260,8 +268,6 @@ def run_watched(
         text=True,
         start_new_session=True,
     )
-    if on_process is not None:
-        on_process(proc)
     last_output = [time.monotonic()]
     stdout_capture = _BoundedCapture()
     stderr_capture = _BoundedCapture()
@@ -289,41 +295,47 @@ def run_watched(
     ]
     for reader in readers:
         reader.start()
-    if input_text is not None:
-        try:
-            proc.stdin.write(input_text)
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
-
-    started = time.monotonic()
-    last_heartbeat = started
     stop_reason: str | None = None
-    while proc.poll() is None:
-        now = time.monotonic()
-        if on_heartbeat is not None and now - last_heartbeat >= heartbeat_seconds:
-            last_heartbeat = now
-            try:
-                on_heartbeat(now - started, now - last_output[0])
-            except Exception:  # noqa: BLE001 - logging must not stop the watchdog
-                pass
-        if stop_requested.is_set():
-            stop_reason = STOP_REQUESTED
-        elif now - last_output[0] > stall_seconds:
-            stop_reason = STOP_STALLED
-        elif now - started > max_seconds:
-            stop_reason = STOP_MAX_RUNTIME
-        if stop_reason:
-            break
-        time.sleep(poll_seconds)
     try:
+        if on_process is not None:
+            on_process(proc)
+        if input_text is not None:
+            try:
+                proc.stdin.write(input_text)
+                proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+
+        started = time.monotonic()
+        last_heartbeat = started
+        while proc.poll() is None:
+            now = time.monotonic()
+            if on_heartbeat is not None and now - last_heartbeat >= heartbeat_seconds:
+                last_heartbeat = now
+                try:
+                    on_heartbeat(now - started, now - last_output[0])
+                except Exception:  # noqa: BLE001 - logging must not stop the watchdog
+                    pass
+            if stop_requested.is_set():
+                stop_reason = STOP_REQUESTED
+            elif now - last_output[0] > stall_seconds:
+                stop_reason = STOP_STALLED
+            elif now - started > max_seconds:
+                stop_reason = STOP_MAX_RUNTIME
+            if stop_reason:
+                break
+            time.sleep(poll_seconds)
+    finally:
         _terminate_group(proc, grace_seconds if stop_reason else 0)
         exit_code = proc.wait()
-    finally:
+        for reader in readers:
+            reader.join(timeout=5)
         if on_process is not None:
-            on_process(None)
-    for reader in readers:
-        reader.join(timeout=5)
+            try:
+                on_process(None)
+            except Exception:
+                # Cleanup observers cannot erase captured provider output.
+                pass
     return WatchedRun(
         exit_code=None if stop_reason else exit_code,
         stdout=stdout_capture.text(),

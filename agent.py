@@ -216,7 +216,8 @@ def main() -> int:
                 runtime_ms=runtime_ms,
                 estimated_cost=None,
                 actual_cost=None,
-                cost_status="estimated",
+                cost_status="unknown",
+                run_kind="agent_router",
                 success=True,
                 error=None,
             )
@@ -262,7 +263,8 @@ def main() -> int:
                 runtime_ms=runtime_ms,
                 estimated_cost=None,
                 actual_cost=None,
-                cost_status="estimated",
+                cost_status="unknown",
+                run_kind="agent_router",
                 success=False,
                 error=str(exc),
             )
@@ -339,7 +341,9 @@ def main() -> int:
             runtime_ms=runtime_ms,
             estimated_cost=estimated_cost,
             actual_cost=None,
-            cost_status="estimated",
+            cost_status="estimated" if estimated_cost is not None else "unknown",
+            cost_currency=estimated_cost_currency,
+            run_kind="agent",
             success=True,
             error=None,
         )
@@ -387,7 +391,8 @@ def main() -> int:
             runtime_ms=runtime_ms,
             estimated_cost=None,
             actual_cost=None,
-            cost_status="estimated",
+            cost_status="unknown",
+            run_kind="agent",
             success=False,
             error=str(exc),
         )

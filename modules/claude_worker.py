@@ -45,15 +45,14 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
 from typing import Any
 
+from modules.worker_audit import audit_run
 from modules.coding_worker import (
     SANDBOX_MODES,
     WorkerConfigError,
@@ -140,20 +139,62 @@ def _usage_from_result(result: dict[str, Any]) -> dict[str, int] | None:
     raw = result.get("usage")
     if not isinstance(raw, dict):
         return None
-    usage = {
-        key: int(value)
-        for key, value in raw.items()
-        if isinstance(value, (int, float)) and not isinstance(value, bool)
-    }
+    usage = {key: value for key, value in raw.items() if type(value) is int}
+    cache = raw.get("cache_creation")
+    if isinstance(cache, dict) and type(cache.get("ephemeral_1h_input_tokens")) is int:
+        usage["cache_creation_1h_input_tokens"] = cache["ephemeral_1h_input_tokens"]
     return usage or None
 
 
-def _model_from_result(result: dict[str, Any]) -> str:
-    """Best-effort model name for the audit entry."""
-    model_usage = result.get("modelUsage")
-    if isinstance(model_usage, dict) and model_usage:
-        return str(next(iter(model_usage)))
-    return "claude"
+def _usage_by_model(result: dict[str, Any]) -> dict[str, dict[str, int]] | None:
+    raw = result.get("modelUsage")
+    if not isinstance(raw, dict) or not raw:
+        return None
+    keys = {
+        "inputTokens": "input_tokens", "outputTokens": "output_tokens",
+        "cacheReadInputTokens": "cache_read_input_tokens",
+        "cacheCreationInputTokens": "cache_creation_input_tokens",
+    }
+    usage = {
+        model: {target: counters[key] for key, target in keys.items() if type(counters.get(key)) is int}
+        if isinstance(counters, dict) else {} for model, counters in raw.items()
+    }
+    if len(usage) == 1:
+        total = _usage_from_result(result) or {}
+        if "cache_creation_1h_input_tokens" in total:
+            next(iter(usage.values()))["cache_creation_1h_input_tokens"] = total["cache_creation_1h_input_tokens"]
+    elif (_usage_from_result(result) or {}).get("cache_creation_1h_input_tokens"):
+        # The aggregate cannot establish which model incurred the 1h charges.
+        return {}
+    return usage
+
+
+def claude_subscription_active(cli: str, cwd: str, env: dict[str, str]) -> bool | None:
+    """Ask the CLI for auth metadata without opening credential files."""
+    override = os.environ.get("AGENT_CLAUDE_SUBSCRIPTION", "").strip().lower()
+    if override in {"1", "true", "yes", "on"}:
+        return True
+    if override in {"0", "false", "no", "off"}:
+        return False
+    if env.get("ANTHROPIC_API_KEY") or env.get("ANTHROPIC_AUTH_TOKEN"):
+        return False
+    if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
+        return True
+    try:
+        proc = subprocess.run(
+            [cli, "auth", "status", "--json"], cwd=cwd, env=env,
+            capture_output=True, stdin=subprocess.DEVNULL, text=True, timeout=5,
+        )
+        status = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if not isinstance(status, dict) or status.get("loggedIn") is not True:
+        return None
+    if status.get("authMethod") == "claude.ai" and status.get("subscriptionType") not in (None, "", "free"):
+        return True
+    if status.get("authMethod") in {"api_key", "console"}:
+        return False
+    return None
 
 
 class _LiveUsageParser:
@@ -161,11 +202,9 @@ class _LiveUsageParser:
 
     def __init__(self, callback: Any | None) -> None:
         self.callback = callback
-        self.message_ids: set[str] = set()
+        self.messages: dict[str, tuple[str, dict[str, int]]] = {}
 
     def consume(self, line: str) -> bool:
-        if self.callback is None:
-            return False
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
@@ -177,17 +216,34 @@ class _LiveUsageParser:
             return False
         message_id = message.get("id")
         usage = message.get("usage")
-        if not isinstance(message_id, str) or not message_id or message_id in self.message_ids:
+        if not isinstance(message_id, str) or not message_id:
             return False
         if not isinstance(usage, dict):
             return False
-        flattened = {
-            key: int(value) for key, value in usage.items()
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value)
-        }
-        self.message_ids.add(message_id)
-        return bool(self.callback(flattened)) if flattened else False
+        flattened = _usage_from_result(message) or {}
+        model = message.get("model")
+        model = model if isinstance(model, str) else "unknown"
+        previous = self.messages.get(message_id)
+        if previous:
+            old_model, old_usage = previous
+            if model == "unknown":
+                model = old_model
+            flattened = {**old_usage, **flattened}
+        if flattened:
+            self.messages[message_id] = (model, flattened)
+            if self.callback and previous is None:
+                return bool(self.callback(flattened))
+        return False
+
+    def usage(self) -> tuple[dict[str, dict[str, int]], dict[str, int]]:
+        per_model: dict[str, dict[str, int]] = {}
+        total: dict[str, int] = {}
+        for model, usage in self.messages.values():
+            counters = per_model.setdefault(model, {})
+            for key, count in usage.items():
+                counters[key] = counters.get(key, 0) + count
+                total[key] = total.get(key, 0) + count
+        return per_model, total
 
 
 class ClaudeWorker:
@@ -294,48 +350,63 @@ class ClaudeWorker:
             Label used in log entries when *experiment_logger* is given
             (e.g. ``"implementation"``, ``"research"``).
         """
-        timestamp = datetime.now(timezone.utc).isoformat()
+        with audit_run(self._db_path, PROVIDER, phase, task) as audit:
 
-        try:
-            validate_worker_config(task, working_dir, sandbox)
-        except WorkerConfigError as exc:
-            if experiment_logger is not None:
-                experiment_logger.error(
-                    phase, "claude_call_invalid_config",
-                    f"Claude call rejected before starting: {exc}",
+            try:
+                validate_worker_config(task, working_dir, sandbox)
+            except WorkerConfigError as exc:
+                if experiment_logger is not None:
+                    experiment_logger.error(
+                        phase, "claude_call_invalid_config",
+                        f"Claude call rejected before starting: {exc}",
+                    )
+                result = self._failed_result(
+                    task=task,
+                    working_dir=working_dir,
+                    sandbox=sandbox,
+                    error=str(exc),
                 )
-            return self._failed_result(
-                task=task,
-                working_dir=working_dir,
-                sandbox=sandbox,
-                error=str(exc),
+                # A rejected call never ran, but it is still a failed run and is
+                # recorded as one (#810: failed runs are audited too).
+                audit.worker_result(result, price_usage=False)
+                return result
+
+            # A progress-watched run (#327) streams events so every step shows up.
+            cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
+            # E.g. an MCP server and its pre-approved read tools for the planner (#384).
+            cmd += list(extra_args or [])
+
+            if experiment_logger is not None:
+                experiment_logger.debug(
+                    phase, "claude_call_start",
+                    f"Starting Claude call (sandbox={sandbox}, timeout={timeout_seconds}s)",
+                    command=cmd, cwd=working_dir, sandbox=sandbox,
+                    timeout_seconds=timeout_seconds,
+                )
+
+            subscription = (
+                claude_subscription_active(self.claude_bin, working_dir, self._safe_env())
+                if self._db_path is not None else None
+            )
+            live_parser = _LiveUsageParser(on_live_usage)
+            result = self._execute(
+                cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process,
+                on_heartbeat=progress_heartbeat(experiment_logger, phase, "Claude"),
+                on_stdout_line=live_parser.consume,
+                live_usage=live_parser,
             )
 
-        # A progress-watched run (#327) streams events so every step shows up.
-        cmd = self._build_command(sandbox, output_schema, stream=stall_seconds is not None)
-        # E.g. an MCP server and its pre-approved read tools for the planner (#384).
-        cmd += list(extra_args or [])
-
-        if experiment_logger is not None:
-            experiment_logger.debug(
-                phase, "claude_call_start",
-                f"Starting Claude call (sandbox={sandbox}, timeout={timeout_seconds}s)",
-                command=cmd, cwd=working_dir, sandbox=sandbox,
-                timeout_seconds=timeout_seconds,
+            # Preserve usage in the result while keeping ambiguous billing out of prices.
+            audit.worker_result(
+                result, subscription=subscription is True and bool(
+                    result.success or result.usage or result.model_usage
+                ),
+                price_usage=subscription is False,
             )
+            if experiment_logger is not None:
+                self._log_result(experiment_logger, phase, cmd, working_dir, result)
 
-        live_parser = _LiveUsageParser(on_live_usage)
-        result = self._execute(
-            cmd, task, working_dir, timeout_seconds, sandbox, stall_seconds, on_process,
-            on_heartbeat=progress_heartbeat(experiment_logger, phase, "Claude"),
-            on_stdout_line=live_parser.consume,
-        )
-
-        if experiment_logger is not None:
-            self._log_result(experiment_logger, phase, cmd, working_dir, result)
-
-        self._audit(result, timestamp)
-        return result
+            return result
 
     @staticmethod
     def _failed_result(
@@ -460,6 +531,7 @@ class ClaudeWorker:
         on_process: Any | None = None,
         on_heartbeat: Any | None = None,
         on_stdout_line: Any | None = None,
+        live_usage: _LiveUsageParser | None = None,
     ) -> WorkerResult:
         timed_out = False
         proc_error: str | None = None
@@ -514,21 +586,6 @@ class ClaudeWorker:
         stdout_capped, stdout_truncated = truncate_output(stdout_raw, self.max_output_bytes)
         stderr_capped, stderr_truncated = truncate_output(stderr_raw, self.max_output_bytes)
 
-        if proc_error:
-            return self._failed_result(
-                task=task,
-                working_dir=working_dir,
-                sandbox=sandbox,
-                error=proc_error,
-                runtime_ms=runtime_ms,
-                exit_code=exit_code,
-                stdout=stdout_capped,
-                stderr=stderr_capped,
-                stdout_truncated=stdout_truncated,
-                stderr_truncated=stderr_truncated,
-                timed_out=timed_out,
-            )
-
         parsed = _parse_result(stdout_raw)
         thread_id: str | None = None
         final_message: str | None = None
@@ -548,6 +605,18 @@ class ClaudeWorker:
             if parsed.get("is_error"):
                 error = final_message or f"Claude reported {parsed.get('subtype', 'an error')}"
 
+        model_usage = _usage_by_model(parsed or {})
+        if parsed is None:
+            live = live_usage or _LiveUsageParser(None)
+            live.callback = None
+            for line in stdout_raw.splitlines():
+                live.consume(line)
+            model_usage, streamed_usage = live.usage()
+            usage = streamed_usage or None
+        model = ",".join(model_usage) if model_usage else None
+        if not model and parsed and isinstance(parsed.get("model"), str):
+            model = parsed["model"]
+        error = proc_error or error
         success = exit_code == 0 and error is None
 
         return WorkerResult(
@@ -556,7 +625,7 @@ class ClaudeWorker:
             stdout=stdout_capped,
             stderr=stderr_capped,
             runtime_ms=runtime_ms,
-            timed_out=False,
+            timed_out=timed_out,
             stdout_truncated=stdout_truncated,
             stderr_truncated=stderr_truncated,
             thread_id=thread_id,
@@ -567,6 +636,8 @@ class ClaudeWorker:
             sandbox=sandbox,
             error=error,
             provider=PROVIDER,
+            billing_model=model,
+            model_usage=model_usage,
         )
 
     @classmethod
@@ -581,38 +652,6 @@ class ClaudeWorker:
     # ------------------------------------------------------------------
     # Audit logging
     # ------------------------------------------------------------------
-
-    def _audit(self, result: WorkerResult, timestamp: str) -> None:
-        if self._db_path is None:
-            return
-        try:
-            from modules.run_store import init_db, insert_run
-
-            parsed = _parse_result(result.stdout) or {}
-            cost = parsed.get("total_cost_usd")
-            actual_cost = float(cost) if isinstance(cost, (int, float)) else None
-            usage = result.usage or {}
-            conn = init_db(self._db_path)
-            insert_run(
-                conn,
-                timestamp=timestamp,
-                provider=PROVIDER,
-                model=_model_from_result(parsed),
-                input_description=result.task[:500],
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-                runtime_ms=result.runtime_ms,
-                estimated_cost=None,
-                actual_cost=actual_cost,
-                cost_status="actual" if actual_cost is not None else "unknown",
-                success=result.success,
-                error=result.error,
-            )
-            conn.close()
-        except Exception:
-            # Audit failure must never surface to the caller.
-            pass
 
 
 def _decoded(stream: bytes | str | None) -> str:

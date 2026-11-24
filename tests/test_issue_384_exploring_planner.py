@@ -79,15 +79,17 @@ class ClaudeRunTests(unittest.TestCase):
 
         def run(self, **kwargs):
             seen.update(kwargs)
+            seen["db_path"] = self._db_path
             args = kwargs["extra_args"]
             seen["config"] = json.loads(Path(args[args.index("--mcp-config") + 1]).read_text())
             return SimpleNamespace(success=True, final_message=ANSWER, error=None)
 
         with patch.dict(os.environ, {"AGENT_API_KEY": "k"}), \
                 patch("modules.claude_worker.ClaudeWorker.run", run):
-            self.assertEqual(nexus_tick._explore_with_claude("/agent", "plan"), ANSWER)
+            self.assertEqual(nexus_tick._explore_with_claude("/agent", "plan", "planner.db"), ANSWER)
 
         self.assertEqual(seen["sandbox"], "read-only")
+        self.assertEqual(seen["db_path"], "planner.db")
         self.assertEqual(seen["working_dir"], "/agent")
         server = seen["config"]["mcpServers"]["nexus"]
         self.assertEqual(server["headers"], {"x-api-key": "k"})

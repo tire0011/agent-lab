@@ -313,11 +313,12 @@ class NexusDelegationService:
                     metadata["error_detail"] = detail
                 return DelegationResult("azure_openai", False, "", metadata)
             data = response.json()
-            return DelegationResult(
-                "azure_openai",
-                True,
-                str(data["choices"][0]["message"]["content"]),
-                {"deployment": deployment, "usage": data.get("usage") or {}},
-            )
+            metadata = {"deployment": deployment, "usage": data.get("usage") or {}}
+            try:
+                content = data["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                metadata["error"] = "Azure returned no completion"
+                return DelegationResult("azure_openai", False, "", metadata)
+            return DelegationResult("azure_openai", True, str(content), metadata)
         except Exception as exc:  # noqa: BLE001
             return DelegationResult("azure_openai", False, "", {"error": type(exc).__name__})

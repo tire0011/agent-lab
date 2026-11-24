@@ -14,7 +14,7 @@ from modules.claude_worker import (
     PROVIDER,
     ClaudeWorker,
     _default_claude_bin,
-    _model_from_result,
+    _usage_by_model,
     _parse_result,
     _usage_from_result,
 )
@@ -109,8 +109,8 @@ class ParseResultTests(unittest.TestCase):
         self.assertIsNone(_usage_from_result({"usage": {"service_tier": "standard"}}))
 
     def test_model_name_falls_back_when_unreported(self):
-        self.assertEqual(_model_from_result(json.loads(_result_json())), "claude-sonnet-5")
-        self.assertEqual(_model_from_result({}), "claude")
+        self.assertIn("claude-sonnet-5", _usage_by_model(json.loads(_result_json())))
+        self.assertIsNone(_usage_by_model({}))
 
 
 # ---------------------------------------------------------------------------
@@ -408,8 +408,8 @@ class AuditTests(unittest.TestCase):
         self.assertEqual(row[1], "claude-sonnet-5")
         self.assertEqual(row[2], 100)
         self.assertEqual(row[3], 20)
-        self.assertAlmostEqual(row[4], 0.0123)
-        self.assertEqual(row[5], "actual")
+        self.assertIsNone(row[4])
+        self.assertEqual(row[5], "unknown")
         self.assertEqual(row[6], 1)
 
     @patch("subprocess.run")

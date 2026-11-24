@@ -29,6 +29,7 @@ set up once with ``vibe --setup`` (as the service user) is used instead.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from modules.worker_audit import audit_run
 from modules.coding_worker import (
     WorkerConfigError,
     WorkerResult,
@@ -50,6 +52,10 @@ from modules.coding_worker import (
 
 #: Same provider name as the API worker: the rotation entry stays ``mistral``.
 PROVIDER = "mistral"
+#: Provider label used in the ``runs`` audit table (#810): Vibe runs are billed
+#: to the Vibe Code subscription, which is a different bucket than the
+#: pay-per-token Mistral API worker that shares the rotation name.
+AUDIT_PROVIDER = "vibe"
 ENV_VIBE_BIN = "AGENT_VIBE_BIN"
 ENV_VIBE_MODEL = "AGENT_VIBE_MODEL"
 
@@ -124,7 +130,8 @@ def _final_message(stdout: str) -> str | None:
 
 def _read_export(output_dir: str) -> dict[str, Any]:
     try:
-        return json.loads(Path(output_dir, "export.json").read_text(encoding="utf-8"))
+        value = json.loads(Path(output_dir, "export.json").read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
     except (OSError, ValueError):
         return {}
 
@@ -139,6 +146,17 @@ def _usage(export: dict[str, Any]) -> dict[str, int] | None:
         if isinstance(value, int):
             result[key] = value
     return result or None
+
+
+def _cost_usd(export: dict[str, Any]) -> float | None:
+    """Return the reported USD amount when valid."""
+    value = export.get("cost_usd")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        return float(value) if math.isfinite(value) and value >= 0 else None
+    except OverflowError:
+        return None
 
 
 class VibeWorker:
@@ -179,45 +197,51 @@ class VibeWorker:
     ) -> WorkerResult:
         """Same signature as ``ClaudeWorker.run``; ``output_schema`` is added to
         the prompt as an instruction (the CLI has no schema flag)."""
-        try:
-            validate_worker_config(task, working_dir, sandbox)
-        except WorkerConfigError as exc:
-            return self._result(task, working_dir, sandbox, error=str(exc))
+        with audit_run(self._db_path, AUDIT_PROVIDER, phase, task) as audit:
+            try:
+                validate_worker_config(task, working_dir, sandbox)
+            except WorkerConfigError as exc:
+                result = self._result(task, working_dir, sandbox, error=str(exc))
+                # A rejected call never ran, but it is still a failed run and is
+                # recorded as one (#810: failed runs are audited too).
+                audit.worker_result(result)
+                return result
 
-        prompt = task
-        if output_schema is not None:
-            prompt += (
-                "\n\nAnswer with exactly one JSON object matching this JSON Schema, "
-                "and nothing else:\n" + json.dumps(output_schema)
-            )
-        with tempfile.TemporaryDirectory(prefix="nexus-vibe-") as scratch:
-            prompt_file = Path(scratch, "prompt.md")
-            prompt_file.write_text(prompt, encoding="utf-8")
-            output_dir = str(Path(scratch, "out"))
-            cmd = self._build_command(str(prompt_file), output_dir, working_dir, sandbox, timeout_seconds)
-            cmd += list(extra_args or [])
-            if experiment_logger is not None:
-                experiment_logger.debug(
-                    phase, "vibe_call_start",
-                    f"Starting Vibe call (sandbox={sandbox}, timeout={timeout_seconds}s)",
-                    command=cmd, cwd=working_dir, sandbox=sandbox, timeout_seconds=timeout_seconds,
+            prompt = task
+            if output_schema is not None:
+                prompt += (
+                    "\n\nAnswer with exactly one JSON object matching this JSON Schema, "
+                    "and nothing else:\n" + json.dumps(output_schema)
                 )
-            result = self._execute(
-                cmd, task, working_dir, sandbox, timeout_seconds, output_dir,
-                stall_seconds, on_process,
-                progress_heartbeat(experiment_logger, phase, "Vibe"),
-            )
-        if experiment_logger is not None:
-            level_event = "vibe_call_completed" if result.success else "vibe_call_failed"
-            experiment_logger.log_process(
-                phase, level_event,
-                f"Vibe call {'completed' if result.success else 'failed'}"
-                + (f": {result.error}" if result.error else ""),
-                command=cmd, cwd=working_dir, duration_ms=result.runtime_ms,
-                exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
-                timed_out=result.timed_out, level="INFO" if result.success else "ERROR",
-            )
-        return result
+            with tempfile.TemporaryDirectory(prefix="nexus-vibe-") as scratch:
+                prompt_file = Path(scratch, "prompt.md")
+                prompt_file.write_text(prompt, encoding="utf-8")
+                output_dir = str(Path(scratch, "out"))
+                cmd = self._build_command(str(prompt_file), output_dir, working_dir, sandbox, timeout_seconds)
+                cmd += list(extra_args or [])
+                if experiment_logger is not None:
+                    experiment_logger.debug(
+                        phase, "vibe_call_start",
+                        f"Starting Vibe call (sandbox={sandbox}, timeout={timeout_seconds}s)",
+                        command=cmd, cwd=working_dir, sandbox=sandbox, timeout_seconds=timeout_seconds,
+                    )
+                result = self._execute(
+                    cmd, task, working_dir, sandbox, timeout_seconds, output_dir,
+                    stall_seconds, on_process,
+                    progress_heartbeat(experiment_logger, phase, "Vibe"),
+                )
+                audit.worker_result(result)
+            if experiment_logger is not None:
+                level_event = "vibe_call_completed" if result.success else "vibe_call_failed"
+                experiment_logger.log_process(
+                    phase, level_event,
+                    f"Vibe call {'completed' if result.success else 'failed'}"
+                    + (f": {result.error}" if result.error else ""),
+                    command=cmd, cwd=working_dir, duration_ms=result.runtime_ms,
+                    exit_code=result.exit_code, stdout=result.stdout, stderr=result.stderr,
+                    timed_out=result.timed_out, level="INFO" if result.success else "ERROR",
+                )
+            return result
 
     def _build_command(
         self, prompt_file: str, output_dir: str, working_dir: str, sandbox: str, timeout_seconds: int
@@ -310,12 +334,21 @@ class VibeWorker:
             elif outcome and outcome.lower() not in _SUCCESS_OUTCOMES:
                 error = f"Vibe ended with outcome {outcome!r}"
 
+        cost = _cost_usd(export)
+        steps = export.get("steps")
+        made_calls = type(steps) is int and steps > 0
+        override = os.environ.get("AGENT_VIBE_SUBSCRIPTION", "").strip().lower()
+        if cost == 0 and error and not made_calls:
+            cost = None
+
         return self._result(
             task, working_dir, sandbox, error=error, exit_code=exit_code,
             stdout=stdout_raw, stderr=stderr_raw, runtime_ms=runtime_ms, timed_out=timed_out,
             thread_id=str(export["session_id"]) if export.get("session_id") else None,
             final_message=_final_message(stdout_raw) if error is None else None,
             usage=_usage(export),
+            cost_usd=cost,
+            subscription=made_calls and override in {"1", "true", "yes", "on"},
         )
 
     def _result(
@@ -323,6 +356,7 @@ class VibeWorker:
         exit_code: int | None = None, stdout: str = "", stderr: str = "",
         runtime_ms: int = 0, timed_out: bool = False, thread_id: str | None = None,
         final_message: str | None = None, usage: dict[str, int] | None = None,
+        cost_usd: float | None = None, subscription: bool = False,
     ) -> WorkerResult:
         stdout_capped, stdout_truncated = truncate_output(stdout, self.max_output_bytes)
         stderr_capped, stderr_truncated = truncate_output(stderr, self.max_output_bytes)
@@ -343,4 +377,7 @@ class VibeWorker:
             sandbox=sandbox,
             error=error,
             provider=PROVIDER,
+            cost_usd=cost_usd,
+            subscription=subscription,
+            billing_model=self.model,
         )
