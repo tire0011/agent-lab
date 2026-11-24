@@ -332,6 +332,9 @@ SHADOW_TIMEOUT_FALLBACK_SECONDS = 120.0  # when no rate is known
 # The monitor joins the shadow worker on T + this grace, so a request the
 # client bounds by T can never outlive the monitor.
 SHADOW_MONITOR_GRACE_SECONDS = 5.0
+# #799: the prompt variant recorded with every shadow row; the compact prompt
+# of #770/#790 is the first variant, so it is called compact_v1.
+SHADOW_PROMPT_VARIANT = "compact_v1"
 
 
 def _positive_rate(value: Any) -> bool:
@@ -486,6 +489,13 @@ class IssuePlanner:
     *explore* (prompt -> raw answer) is an agent that can read the code and
     use read-only tools (#384); *complete* is a single model call, used alone
     or when exploring fails.
+
+    *shadow* is the non-blocking local comparison (#671): it is called as
+    ``shadow(prompt, timeout, allowed)`` on a daemon thread (#798 passes the
+    allowed issue numbers so the callable can pin them in its json_schema
+    enum) and may return the raw answer string or a dict
+    ``{"content": ..., "cached_prompt_tokens": ...}`` when the server
+    reported reused prompt tokens (#799).
     """
 
     def __init__(
@@ -494,7 +504,8 @@ class IssuePlanner:
         explore: Callable[[str], str] | None = None,
         # #798: the shadow callable also receives the allowed issue numbers
         # (prompt, timeout, allowed) so it can pin them in its json_schema enum.
-        shadow: Callable[[str, float, set[int]], str] | None = None,
+        # #799: it may return {"content": ..., "cached_prompt_tokens": ...}.
+        shadow: Callable[[str, float, set[int]], Any] | None = None,
         *,
         db_path: str | None = None,
         rates: Any = None,
@@ -574,7 +585,8 @@ class IssuePlanner:
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=None, local_valid=0,
                        prompt_tokens=0, seconds=0.0,
-                       error="skipped: prompt_over_budget")
+                       error="skipped: prompt_over_budget",
+                       prompt_variant=SHADOW_PROMPT_VARIANT)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store skip: %s", exc)
             return
@@ -587,7 +599,7 @@ class IssuePlanner:
         join_timeout = timeout + SHADOW_MONITOR_GRACE_SECONDS
 
         def monitor() -> None:
-            result: list[str] = []
+            result: list[Any] = []
             failure: list[BaseException] = []
 
             def call() -> None:
@@ -606,15 +618,27 @@ class IssuePlanner:
             local_issue: int | None = None
             valid = False
             error: str | None = None
+            cached_prompt_tokens: int | None = None
             if worker.is_alive():
                 error = f"timeout after {join_timeout:g}s"
             elif failure:
                 error = f"{type(failure[0]).__name__}: {failure[0]}"[:500]
             else:
+                raw = result[0] if result else ""
+                content: Any = raw
+                if isinstance(raw, dict):
+                    # #799: a shadow callable that knows the server timings
+                    # returns {"content": ..., "cached_prompt_tokens": ...}.
+                    content = raw.get("content", "")
+                    # Malformed or out-of-range telemetry becomes None; it
+                    # never invalidates the answer or blocks the insert.
+                    from modules.planner_shadow import cached_token_count
+                    cached_prompt_tokens = cached_token_count(raw.get("cached_prompt_tokens"))
+                text = content if isinstance(content, str) else ("" if content is None else str(content))
                 # #798: kept even though the shadow's json_schema enum now
                 # constrains the wire format - the monitor still validates
                 # independently, each failure with its own error string.
-                data = _json_object(result[0] if result else "")
+                data = _json_object(text)
                 if data is None:
                     error = "invalid JSON"
                 else:
@@ -630,7 +654,9 @@ class IssuePlanner:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error)
+                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
+                       prompt_variant=SHADOW_PROMPT_VARIANT,
+                       cached_prompt_tokens=cached_prompt_tokens)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store result: %s", exc)
 

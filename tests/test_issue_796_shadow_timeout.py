@@ -198,6 +198,7 @@ class NexusTickShadowWiringTests(unittest.TestCase):
 
         class FakeClient:
             model = "fake-model"
+            last_timings = None
 
             def __init__(self, base_url=None, timeout=300.0, model=None, *, stream=None,
                          transport=None):
@@ -216,7 +217,9 @@ class NexusTickShadowWiringTests(unittest.TestCase):
             shadow = planner._shadow
             self.assertIsNotNone(shadow)
             result = shadow("the compact prompt", 123.0, {1, 2})
-        self.assertEqual(result, '{"issue": 1, "reason": "x"}')
+        # #799: the answer travels as {"content": ..., "cached_prompt_tokens": ...}.
+        self.assertEqual(result, {"content": '{"issue": 1, "reason": "x"}',
+                                  "cached_prompt_tokens": None})
         # LlamaCppClient(timeout=T, stream=False) with the same T the monitor used.
         self.assertEqual(captured["timeout"], 123.0)
         self.assertIs(captured["stream"], False)

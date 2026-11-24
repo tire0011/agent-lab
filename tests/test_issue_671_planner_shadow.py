@@ -105,7 +105,9 @@ class PlannerShadowTests(unittest.TestCase):
         rows = list_shadow(self.db)["rows"]
         self.assertEqual(len(rows), 1)
         self.assertIn(rows[0], [
-            dict(tick_id="replayed-tick", paid_issue=2, **values)
+            # #799: record() defaults the new nullable columns to NULL.
+            dict(tick_id="replayed-tick", paid_issue=2,
+                 prompt_variant=None, cached_prompt_tokens=None, **values)
             for values in (result, skip)
         ])
 

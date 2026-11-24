@@ -352,7 +352,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
             error TEXT,
-            created_at TEXT
+            created_at TEXT,
+            prompt_variant TEXT,
+            cached_prompt_tokens INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS local_localizations (

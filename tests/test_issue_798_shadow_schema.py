@@ -159,6 +159,7 @@ class NexusTickShadowSchemaTests(unittest.TestCase):
 
         class FakeClient:
             model = "fake-model"
+            last_timings = None
 
             def __init__(self, base_url=None, timeout=300.0, model=None, *, stream=None,
                          transport=None):
@@ -178,7 +179,9 @@ class NexusTickShadowSchemaTests(unittest.TestCase):
             shadow = planner._shadow
             self.assertIsNotNone(shadow)
             result = shadow("the compact prompt", 123.0, allowed)
-        self.assertEqual(result, '{"issue": 3, "reason": "x"}')
+        # #799: the answer travels as {"content": ..., "cached_prompt_tokens": ...}.
+        self.assertEqual(result, {"content": '{"issue": 3, "reason": "x"}',
+                                  "cached_prompt_tokens": None})
         self.assertEqual(captured["timeout"], 123.0)
         self.assertIs(captured["stream"], False)
         self.assertEqual(captured["messages"], [{"role": "user", "content": "the compact prompt"}])
@@ -204,7 +207,8 @@ class NexusTickShadowSchemaTests(unittest.TestCase):
         import nexus_tick
 
         source = inspect.getsource(nexus_tick._planner)
-        self.assertIn("def shadow(prompt: str, timeout: float, allowed: set[int]) -> str:", source)
+        self.assertIn("def shadow(prompt: str, timeout: float, allowed: set[int]) -> dict[str, Any]:",
+                      source)
         self.assertIn('"enum": sorted(allowed)', source)
         self.assertIn('"maxLength": 160', source)
 
