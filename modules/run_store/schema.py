@@ -385,13 +385,18 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
-    _migrate_runs_columns(conn)
-    # #810: built-in price rows, so token usage can be turned into a cost even
-    # when nobody inserted model_prices rows by hand. ON CONFLICT DO NOTHING
-    # keeps operator overrides and later valid_from history untouched.
-    seed_default_model_prices(conn)
-    _backfill_run_costs_once(conn)
     conn.commit()
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _migrate_runs_columns(conn)
+        price_columns = {row[1] for row in conn.execute("PRAGMA table_info(model_prices)")}
+        for column in ("cache_read_rate", "cache_write_rate"):
+            if column not in price_columns:
+                conn.execute(f"ALTER TABLE model_prices ADD COLUMN {column} REAL")
+    seed_default_model_prices(conn)
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        _backfill_run_costs_once(conn)
     return conn
 
 
@@ -403,7 +408,7 @@ def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:
     """
     from .records import backfill_run_costs
 
-    marker = "runs.cost_backfill_upto"
+    marker = "runs.cost_backfill_v2_upto"
     row = conn.execute(
         "SELECT value FROM service_settings WHERE key = ?", (marker,)
     ).fetchone()
@@ -431,6 +436,7 @@ def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:
 _RUNS_ADDITIVE_COLUMNS = [
     ("cost_currency", "TEXT"),
     ("run_kind", "TEXT"),
+    ("billing_evidence_json", "TEXT"),
 ]
 
 

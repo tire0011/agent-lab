@@ -256,7 +256,7 @@ def _owner_decisions(repo_root: str, days: int = 30, limit: int = 15) -> list[di
     return decisions
 
 
-def _explore_with_claude(repo_root: str, prompt: str) -> str:
+def _explore_with_claude(repo_root: str, prompt: str, db_path: str | None = None) -> str:
     """Plan as a read-only Claude agent with the Nexus MCP read tools (#384)."""
     import tempfile
 
@@ -277,7 +277,7 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
     with tempfile.NamedTemporaryFile("w", suffix=".json") as handle:
         json.dump(config, handle)
         handle.flush()
-        result = ClaudeWorker().run(
+        result = ClaudeWorker(db_path=db_path).run(
             task=prompt,
             working_dir=repo_root,
             sandbox="read-only",
@@ -297,9 +297,7 @@ def _explore_with_claude(repo_root: str, prompt: str) -> str:
 
 def _planner(repo_root: str, db_path: str | None = None):
     """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
-    import asyncio
-
-    from modules.nexus_delegation import NexusDelegationService
+    from modules.nexus_reviewer import _run_azure
     from modules.nexus_planner import IssuePlanner
 
     def complete(prompt: str) -> str:
@@ -309,14 +307,8 @@ def _planner(repo_root: str, db_path: str | None = None):
         free = model_registry.chat_first(prompt, role="planning", max_cost="free", max_tokens=2000)
         if free.success:
             return free.content
-        service = NexusDelegationService()
-        try:
-            result = asyncio.run(service.azure_chat(prompt, max_tokens=2000)).to_dict()
-        finally:
-            service.close()
-        if not result.get("success"):
-            raise RuntimeError(str((result.get("metadata") or {}).get("error") or "azure failed"))
-        return str(result.get("content") or "")
+        return _run_azure(prompt, repo_root, db_path, phase="planning", max_tokens=2000)
+
 
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
     from modules.local_model_rates import LocalModelRates
@@ -341,7 +333,7 @@ def _planner(repo_root: str, db_path: str | None = None):
         return str(response["choices"][0]["message"]["content"])
 
     return IssuePlanner(
-        complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt),
+        complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt, db_path),
         shadow=shadow,
         # The shadow timeout is computed from the rates measured for the model
         # the shadow client sends (#642, #796).

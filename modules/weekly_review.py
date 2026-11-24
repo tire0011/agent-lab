@@ -105,14 +105,20 @@ def starter_pack(db_path: str, repo_root: str, now: datetime) -> str:
                 "re-verifications":
                     ("SELECT substr(verdict,1,40), COUNT(*) FROM reverifications WHERE created_at >= ? "
                      "GROUP BY 1", (since,)),
-                # #810: money per coding agent this week, not just run counts.
-                "coding-agent runs by provider (runs, with cost/subscription, subscription, cost USD)":
-                    ("SELECT provider, COUNT(*), "
-                     "SUM(actual_cost IS NOT NULL OR estimated_cost IS NOT NULL "
-                     "OR cost_status IN ('subscription','free')), "
-                     "SUM(cost_status = 'subscription'), "
-                     "ROUND(SUM(COALESCE(actual_cost, estimated_cost, 0)), 4) "
-                     "FROM runs WHERE timestamp >= ? GROUP BY 1 ORDER BY 5 DESC", (since,)),
+                "coding-agent runs by provider and currency (provider, currency, runs, "
+                "with cost or subscription, subscription runs, total cost)":
+                    ("""SELECT provider, cost_currency, COUNT(*),
+                         SUM(actual_cost IS NOT NULL OR estimated_cost IS NOT NULL
+                             OR cost_status = 'subscription'),
+                         SUM(cost_status = 'subscription'),
+                         ROUND(SUM(COALESCE(actual_cost, estimated_cost)), 4)
+                       FROM runs
+                       WHERE julianday(timestamp) BETWEEN julianday(?) AND julianday(?)
+                         AND ((provider IN ('codex','claude','vibe','mistral')
+                               AND run_kind IN ('implementation','implementation_repair','review','weekly_review','task'))
+                              OR (provider = 'azure_openai' AND run_kind IN ('review','weekly_review')))
+                       GROUP BY provider, cost_currency ORDER BY provider, cost_currency""",
+                     (since, now.isoformat())),
             }
             for title, (sql, args) in sections.items():
                 lines.append(f"## {title}")
@@ -197,10 +203,10 @@ def _run_claude(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     return result.final_message or ""
 
 
-def _run_azure(prompt: str, repo_root: str) -> str:
+def _run_azure(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     from modules.nexus_reviewer import _run_azure as run
 
-    return run(prompt, repo_root)
+    return run(prompt, repo_root, db_path, phase="weekly_review")
 
 
 def default_runners(db_path: str) -> dict[str, Callable[[str, str], str]]:
@@ -208,7 +214,7 @@ def default_runners(db_path: str) -> dict[str, Callable[[str, str], str]]:
     return {
         "codex": lambda prompt, root: _run_codex(prompt, root, db_path),
         "claude": lambda prompt, root: _run_claude(prompt, root, db_path),
-        "azure": _run_azure,
+        "azure": lambda prompt, root: _run_azure(prompt, root, db_path),
     }
 
 

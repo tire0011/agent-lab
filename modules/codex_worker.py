@@ -1,6 +1,6 @@
 """Non-interactive Codex worker for controlled coding tasks.
 
-Runs ``codex exec --ephemeral --json`` as a subprocess (never via ``shell=True``)
+Runs ``codex exec --json`` as a subprocess (never via ``shell=True``)
 and returns a structured result. ``--sandbox`` defaults to read-only (writes
 blocked outright); with workspace-write only ``--approve-for-me`` is passed, since
 the CLI rejects the two together.
@@ -15,13 +15,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+from modules.worker_audit import audit_run
 from modules.coding_worker import (
     SANDBOX_MODES,
     WorkerConfigError,
@@ -53,7 +56,7 @@ CodexResult = WorkerResult
 _truncate = truncate_output
 
 
-def _parse_jsonl(stdout: str) -> tuple[str | None, str | None, dict[str, int] | None]:
+def _parse_jsonl(stdout: str, metadata: dict | None = None) -> tuple[str | None, str | None, dict[str, int] | None]:
     """Parse Codex's JSONL event stream into (thread_id, final_message, usage):
     the last agent_message text and the last turn.completed usage."""
     thread_id: str | None = None
@@ -69,24 +72,70 @@ def _parse_jsonl(stdout: str) -> tuple[str | None, str | None, dict[str, int] | 
         except json.JSONDecodeError:
             continue
 
+        if not isinstance(event, dict):
+            continue
         etype = event.get("type")
+        if metadata is not None and etype in {"thread.started", "turn.started", "turn.completed", "turn.failed"}:
+            model = event.get("model")
+            if isinstance(model, str) and model:
+                metadata["model"] = model
 
         if etype == "thread.started":
             thread_id = event.get("thread_id")
 
         elif etype == "item.completed":
             item = event.get("item", {})
-            if item.get("type") == "agent_message":
+            if isinstance(item, dict) and item.get("type") == "agent_message":
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     final_message = text
+            elif (metadata is not None and isinstance(item, dict) and item.get("type") == "error"
+                  and str(item.get("message", "")).startswith("model rerouted: ")):
+                metadata["rerouted"] = "yes"
 
-        elif etype == "turn.completed":
+        elif etype in {"turn.completed", "turn.failed"}:
             raw_usage = event.get("usage")
             if isinstance(raw_usage, dict):
-                usage = {k: int(v) for k, v in raw_usage.items() if isinstance(v, (int, float))}
+                usage = {k: v for k, v in raw_usage.items() if type(v) is int}
 
     return thread_id, final_message, usage
+
+
+def _rollout_billing(thread_id: str | None, codex_home: Path) -> tuple[str | None, dict[str, int] | None]:
+    """Read model and cumulative usage from this invocation's Codex session."""
+    if not isinstance(thread_id, str) or not re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", thread_id,
+    ):
+        return None, None
+    today = datetime.now()
+    sessions = codex_home / "sessions"
+    for day in (today, today - timedelta(days=1)):
+        directory = sessions / day.strftime("%Y/%m/%d")
+        for path in directory.glob(f"rollout-*-{thread_id}.jsonl"):
+            models = set()
+            usage = None
+            try:
+                with path.open(encoding="utf-8", errors="replace") as stream:
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except ValueError:
+                            continue
+                        payload = event.get("payload") if isinstance(event, dict) else None
+                        if not isinstance(payload, dict):
+                            continue
+                        if event.get("type") == "turn_context" and isinstance(payload.get("model"), str):
+                            models.add(payload["model"])
+                        if event.get("type") == "event_msg" and payload.get("type") == "token_count":
+                            info = payload.get("info")
+                            totals = info.get("total_token_usage") if isinstance(info, dict) else None
+                            if isinstance(totals, dict):
+                                usage = {key: value for key, value in totals.items() if type(value) is int}
+            except OSError:
+                continue
+            # Cumulative usage cannot be split across different models.
+            return (next(iter(models)) if len(models) == 1 else "" if models else None), usage
+    return None, None
 
 
 class CodexWorker:
@@ -140,72 +189,72 @@ class CodexWorker:
         With stall_seconds the run is progress-watched (#327): stopped only after
         a silent stall, with timeout_seconds as the absolute cap.
         """
-        timestamp = datetime.now(timezone.utc).isoformat()
+        with audit_run(self._db_path, PROVIDER, phase, task) as audit:
 
-        try:
-            self._validate(task, working_dir, sandbox)
-        except WorkerConfigError as exc:
-            if experiment_logger is not None:
-                experiment_logger.error(
-                    phase, "codex_call_invalid_config",
-                    f"Codex call rejected before starting: {exc}",
+            try:
+                self._validate(task, working_dir, sandbox)
+            except WorkerConfigError as exc:
+                if experiment_logger is not None:
+                    experiment_logger.error(
+                        phase, "codex_call_invalid_config",
+                        f"Codex call rejected before starting: {exc}",
+                    )
+                result = CodexResult(
+                    success=False,
+                    exit_code=None,
+                    stdout="",
+                    stderr="",
+                    runtime_ms=0,
+                    timed_out=False,
+                    stdout_truncated=False,
+                    stderr_truncated=False,
+                    thread_id=None,
+                    final_message=None,
+                    usage=None,
+                    task=task,
+                    working_dir=working_dir,
+                    sandbox=sandbox,
+                    error=str(exc),
+                    provider=PROVIDER,
                 )
-            result = CodexResult(
-                success=False,
-                exit_code=None,
-                stdout="",
-                stderr="",
-                runtime_ms=0,
-                timed_out=False,
-                stdout_truncated=False,
-                stderr_truncated=False,
-                thread_id=None,
-                final_message=None,
-                usage=None,
-                task=task,
-                working_dir=working_dir,
-                sandbox=sandbox,
-                error=str(exc),
-                provider=PROVIDER,
-            )
-            # A rejected call never ran, but it is still a failed run and is
-            # recorded as one (#810: failed runs are audited too).
-            self._audit(result, timestamp, phase)
+                # A rejected call never ran, but it is still a failed run and is
+                # recorded as one (#810: failed runs are audited too).
+                audit.worker_result(result)
+                return result
+
+            schema_path: str | None = None
+            try:
+                if output_schema is not None:
+                    fd, schema_path = tempfile.mkstemp(prefix="codex_schema_", suffix=".json")
+                    with os.fdopen(fd, "w") as f:
+                        json.dump(output_schema, f)
+
+                cmd = self._build_command(task, working_dir, sandbox, schema_path, skip_git_repo_check)
+
+                if experiment_logger is not None:
+                    experiment_logger.debug(
+                        phase, "codex_call_start",
+                        f"Starting Codex call (sandbox={sandbox}, timeout={timeout_seconds}s)",
+                        command=cmd, cwd=working_dir, sandbox=sandbox,
+                        timeout_seconds=timeout_seconds,
+                    )
+
+                result = self._execute(
+                    cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process,
+                    on_heartbeat=progress_heartbeat(experiment_logger, phase, "Codex"),
+                )
+            finally:
+                if schema_path is not None:
+                    try:
+                        os.remove(schema_path)
+                    except OSError:
+                        pass
+
+            audit.worker_result(result)
+            if experiment_logger is not None:
+                self._log_result(experiment_logger, phase, cmd, working_dir, result)
+
             return result
-
-        schema_path: str | None = None
-        try:
-            if output_schema is not None:
-                fd, schema_path = tempfile.mkstemp(prefix="codex_schema_", suffix=".json")
-                with os.fdopen(fd, "w") as f:
-                    json.dump(output_schema, f)
-
-            cmd = self._build_command(task, working_dir, sandbox, schema_path, skip_git_repo_check)
-
-            if experiment_logger is not None:
-                experiment_logger.debug(
-                    phase, "codex_call_start",
-                    f"Starting Codex call (sandbox={sandbox}, timeout={timeout_seconds}s)",
-                    command=cmd, cwd=working_dir, sandbox=sandbox,
-                    timeout_seconds=timeout_seconds,
-                )
-
-            result = self._execute(
-                cmd, working_dir, timeout_seconds, task, sandbox, stall_seconds, on_process,
-                on_heartbeat=progress_heartbeat(experiment_logger, phase, "Codex"),
-            )
-        finally:
-            if schema_path is not None:
-                try:
-                    os.remove(schema_path)
-                except OSError:
-                    pass
-
-        if experiment_logger is not None:
-            self._log_result(experiment_logger, phase, cmd, working_dir, result)
-
-        self._audit(result, timestamp, phase)
-        return result
 
     @staticmethod
     def _log_result(
@@ -264,10 +313,13 @@ class CodexWorker:
         cmd = [
             self.codex_bin,
             "exec",
-            "--ephemeral",
             "--json",
             "-C", working_dir,
         ]
+        # JSON output omits the resolved model on current CLI versions.
+        # Audited calls retain the native session so the model can be recovered.
+        if self._db_path is None:
+            cmd.append("--ephemeral")
         if self.model:
             cmd += ["--model", self.model]
         if skip_git_repo_check:
@@ -305,11 +357,12 @@ class CodexWorker:
         stderr_raw = ""
         exit_code: int | None = None
         started = time.perf_counter()
+        env = self._safe_env()
 
         try:
             if stall_seconds is not None:
                 watched = run_watched(
-                    cmd, cwd=working_dir, env=self._safe_env(),
+                    cmd, cwd=working_dir, env=env,
                     stall_seconds=stall_seconds, max_seconds=timeout_seconds,
                     on_process=on_process,
                     on_heartbeat=on_heartbeat,
@@ -328,7 +381,7 @@ class CodexWorker:
                     cwd=working_dir,
                     # Intentionally inherit only a minimal env; never pass full
                     # os.environ to avoid leaking secrets.
-                    env=self._safe_env(),
+                    env=env,
                 )
                 exit_code = proc.returncode
                 stdout_raw = proc.stdout
@@ -350,28 +403,19 @@ class CodexWorker:
         stdout_capped, stdout_truncated = _truncate(stdout_raw, self.max_output_bytes)
         stderr_capped, stderr_truncated = _truncate(stderr_raw, self.max_output_bytes)
 
-        if proc_error:
-            return CodexResult(
-                success=False,
-                exit_code=exit_code,
-                stdout=stdout_capped,
-                stderr=stderr_capped,
-                runtime_ms=runtime_ms,
-                timed_out=timed_out,
-                stdout_truncated=stdout_truncated,
-                stderr_truncated=stderr_truncated,
-                thread_id=None,
-                final_message=None,
-                usage=None,
-                task=task,
-                working_dir=working_dir,
-                sandbox=sandbox,
-                error=proc_error,
-                provider=PROVIDER,
-            )
-
-        thread_id, final_message, usage = _parse_jsonl(stdout_raw)
-        success = (exit_code == 0)
+        metadata: dict[str, str] = {}
+        thread_id, final_message, usage = _parse_jsonl(stdout_raw, metadata)
+        startup = re.search(r"^model: ([a-zA-Z0-9_.:-]+)\s*$", stderr_raw[:4096], re.MULTILINE)
+        model = metadata.get("model") or (startup[1] if startup else None) or self.model
+        if self._db_path is not None and (not metadata.get("model") or not usage):
+            codex_home = Path(env["CODEX_HOME"]) if env.get("CODEX_HOME") else Path.home() / ".codex"
+            rollout_model, rollout_usage = _rollout_billing(thread_id, codex_home)
+            if rollout_model is not None:
+                model = rollout_model
+            usage = usage or rollout_usage
+        if metadata.get("rerouted"):
+            model = None
+        success = exit_code == 0 and proc_error is None
 
         return CodexResult(
             success=success,
@@ -388,8 +432,9 @@ class CodexWorker:
             task=task,
             working_dir=working_dir,
             sandbox=sandbox,
-            error=None,
+            error=proc_error,
             provider=PROVIDER,
+            billing_model=model,
         )
 
     #: Codex-specific variables added to the shared base passthrough set.
@@ -409,48 +454,6 @@ class CodexWorker:
         return filtered_env(cls._EXTRA_ENV_KEYS)
 
     # Audit logging
-
-    def _audit(self, result: CodexResult, timestamp: str, phase: str = PROVIDER) -> None:
-        if self._db_path is None:
-            return
-        try:
-            from modules.run_store import init_db, insert_run, resolve_run_cost
-            conn = init_db(self._db_path)
-            usage = result.usage or {}
-            # #810: Codex is priced from the recorded usage and the price
-            # table (subscription logins excepted, which are not Codex's
-            # billing here); a failed run keeps whatever usage it produced.
-            model = self.model or PROVIDER
-            cost = resolve_run_cost(
-                conn,
-                provider=PROVIDER,
-                model=model,
-                timestamp=timestamp,
-                usage=result.usage,
-            )
-            insert_run(
-                conn,
-                timestamp=timestamp,
-                provider=PROVIDER,
-                model=model,
-                input_description=result.task[:500],
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                total_tokens=usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
-                runtime_ms=result.runtime_ms,
-                estimated_cost=cost["estimated_cost"],
-                actual_cost=cost["actual_cost"],
-                cost_status=cost["cost_status"],
-                cost_currency=cost["cost_currency"],
-                run_kind=phase,
-                success=result.success,
-                error=result.error,
-            )
-            conn.close()
-        except Exception:
-            # Audit failure must never surface to the caller.
-            pass
-
 
 # CLI entry point for manual smoke-testing
 

@@ -116,13 +116,12 @@ class PriceSeedTests(RunStoreTestCase):
             len(DEFAULT_MODEL_PRICES),
         )
 
-    def test_get_effective_price_falls_back_to_wildcard(self):
+    def test_unknown_model_has_no_fallback_price(self):
         conn = self._init()
         exact = get_effective_price(conn, "codex", "gpt-5", _ts(1))
         self.assertEqual(exact["input_price_per_million_tokens"], 1.25)
         wildcard = get_effective_price(conn, "codex", "some-future-model", _ts(1))
-        self.assertIsNotNone(wildcard)
-        self.assertEqual(wildcard["model"], "*")
+        self.assertIsNone(wildcard)
         self.assertIsNone(get_effective_price(conn, "no-such-provider", "x", _ts(1)))
 
 
@@ -131,17 +130,17 @@ class PriceSeedTests(RunStoreTestCase):
 # ---------------------------------------------------------------------------
 
 class ResolveRunCostTests(RunStoreTestCase):
-    def test_actual_cost_reported_by_the_tool_wins(self):
+    def test_subscription_takes_precedence_over_cli_cost(self):
         conn = self._init()
         cost = resolve_run_cost(
             conn, provider="claude", model="claude-sonnet-4-5", timestamp=_ts(1),
             usage={"input_tokens": 1000, "output_tokens": 100},
             actual_cost=0.0123, subscription=True,
         )
-        self.assertEqual(cost["cost_status"], "actual")
-        self.assertAlmostEqual(cost["actual_cost"], 0.0123)
+        self.assertEqual(cost["cost_status"], "subscription")
+        self.assertIsNone(cost["actual_cost"])
         self.assertIsNone(cost["estimated_cost"])
-        self.assertEqual(cost["cost_currency"], "USD")
+        self.assertIsNone(cost["cost_currency"])
 
     def test_subscription_run_is_marked_not_priced(self):
         conn = self._init()
@@ -156,21 +155,30 @@ class ResolveRunCostTests(RunStoreTestCase):
     def test_estimated_from_usage_and_price_table_with_cache_subtracted(self):
         conn = self._init()
         cost = resolve_run_cost(
-            conn, provider="codex", model="codex", timestamp=_ts(1),
+            conn, provider="codex", model="gpt-5", timestamp=_ts(1),
             usage={"input_tokens": 1_000_000, "output_tokens": 100_000, "cached_input_tokens": 400_000},
         )
         self.assertEqual(cost["cost_status"], "estimated")
         # 600k billable input at 1.25/1M + 100k output at 10/1M.
-        self.assertAlmostEqual(cost["estimated_cost"], 600_000 / 1e6 * 1.25 + 100_000 / 1e6 * 10.0)
+        self.assertAlmostEqual(cost["estimated_cost"], 600_000 / 1e6 * 1.25 + 400_000 / 1e6 * 0.125 + 100_000 / 1e6 * 10.0)
         self.assertEqual(cost["cost_currency"], "USD")
 
-    def test_claude_cache_read_tokens_are_subtracted_too(self):
+    def test_claude_cache_reads_are_separate_from_input(self):
         conn = self._init()
         cost = resolve_run_cost(
             conn, provider="claude", model="claude-sonnet-4-5", timestamp=_ts(1),
             usage={"input_tokens": 1_000_000, "output_tokens": 0, "cache_read_input_tokens": 250_000},
         )
-        self.assertAlmostEqual(cost["estimated_cost"], 750_000 / 1e6 * 3.0)
+        self.assertAlmostEqual(cost["estimated_cost"], 3.0 + 250_000 / 1e6 * 0.30)
+
+    def test_claude_cache_creation_uses_both_rates(self):
+        conn = self._init()
+        cost = resolve_run_cost(
+            conn, provider="claude", model="claude-sonnet-4-5", timestamp=_ts(1),
+            usage={"input_tokens": 0, "output_tokens": 0, "cache_creation_input_tokens": 1000,
+                   "cache_creation_1h_input_tokens": 400},
+        )
+        self.assertAlmostEqual(cost["estimated_cost"], (600 * 3.75 + 400 * 6) / 1e6)
 
     def test_usage_without_price_is_unknown_not_zero(self):
         conn = self._init()
@@ -232,12 +240,11 @@ class RunsMigrationTests(RunStoreTestCase):
         rows = conn.execute(
             "SELECT provider, cost_status, cost_currency, run_kind, estimated_cost FROM runs ORDER BY id"
         ).fetchall()
-        # The row with recorded tokens is backfilled from the price table...
+        # Legacy counts alone cannot establish the model or cache rates.
         self.assertEqual(rows[0][0], "codex")
-        self.assertEqual(rows[0][1], "estimated")
-        self.assertEqual(rows[0][2], "USD")
-        self.assertAlmostEqual(rows[0][4], 1 / 1e6 * 1.25 + 1 / 1e6 * 10.0)
-        # ...the one without usage stays unknown: NULL, not a fabricated cost.
+        self.assertEqual(rows[0][1], "unknown")
+        self.assertIsNone(rows[0][2])
+        self.assertIsNone(rows[0][4])
         self.assertEqual(rows[1][1], "unknown")
         self.assertIsNone(rows[1][2])
         self.assertIsNone(rows[1][4])
@@ -286,24 +293,24 @@ class WeeklyCostQueryTests(RunStoreTestCase):
         self._seed_week(conn)
         since = _ts(14)
         rows = weekly_cost_by_provider(conn, since=since)
-        by_key = {(row["week"], row["provider"]): row for row in rows}
+        by_key = {(row["week"], row["provider"], row["currency"]): row for row in rows}
         # Week A: codex + vibe + claude; week B: codex + vibe.
-        self.assertEqual(len(rows), 5)
-        codex_weeks = sorted(row["week"] for (week, provider), row in by_key.items()
-                             if provider == "codex")
+        self.assertEqual(len(rows), 6)
+        codex_weeks = sorted(row["week"] for (week, provider, currency), row in by_key.items()
+                             if provider == "codex" and currency == "USD")
         self.assertEqual(len(codex_weeks), 2)
         this_week_codex = next(
-            row for (week, provider), row in by_key.items()
-            if provider == "codex" and row["runs"] == 2
+            row for (week, provider, currency), row in by_key.items()
+            if provider == "codex" and currency == "USD" and row["total_cost"] == 0.20
         )
-        self.assertEqual(this_week_codex["runs"], 2)
+        self.assertEqual(this_week_codex["runs"], 1)
         self.assertEqual(this_week_codex["runs_with_cost"], 1)  # the unknown one has none
         self.assertAlmostEqual(this_week_codex["total_cost"], 0.20)
         self.assertEqual(this_week_codex["currency"], "USD")
-        vibe_rows = [row for (_w, provider), row in by_key.items() if provider == "vibe"]
+        vibe_rows = [row for (_w, provider, _currency), row in by_key.items() if provider == "vibe"]
         self.assertTrue(all(row["subscription_runs"] == row["runs"] for row in vibe_rows))
-        self.assertTrue(all(row["total_cost"] == 0.0 for row in vibe_rows))
-        claude = next(row for (_w, provider), row in by_key.items() if provider == "claude")
+        self.assertTrue(all(row["total_cost"] is None for row in vibe_rows))
+        claude = next(row for (_w, provider, _currency), row in by_key.items() if provider == "claude")
         self.assertAlmostEqual(claude["total_cost"], 1.25)
         self.assertEqual(claude["runs_with_cost"], 1)
 
@@ -311,20 +318,18 @@ class WeeklyCostQueryTests(RunStoreTestCase):
         conn = self._init()
         self._seed_week(conn)
         rows = conn.execute(run_store.WEEKLY_COST_BY_PROVIDER_SQL, (_ts(14),)).fetchall()
-        self.assertEqual(len(rows), 5)
+        self.assertEqual(len(rows), 6)
 
     def test_completeness_share_over_last_7_days(self):
         conn = self._init()
-        for i in range(19):  # 19 of 20 runs costed -> 95 % > 90 %
-            self._insert(conn, timestamp=_ts(0.5, hour=i % 24),
-                         estimated_cost=0.01 * i, cost_status="estimated")
+        self._insert(conn, timestamp=_ts(0), estimated_cost=0.0, cost_status="estimated")
+        self._insert(conn, timestamp=_ts(0, hour=22), cost_status="subscription")  # future
         self._insert(conn, timestamp=_ts(1), cost_status="unknown", success=False, error="x")
         self._insert(conn, timestamp=_ts(30), cost_status="unknown")  # outside the window
         metric = run_cost_completeness(conn, days=7, now=NOW)
-        self.assertEqual(metric["runs"], 20)
-        self.assertEqual(metric["runs_with_cost_or_subscription"], 19)
-        self.assertAlmostEqual(metric["share"], 0.95)
-        self.assertGreater(metric["share"], 0.90)
+        self.assertEqual(metric["runs"], 2)
+        self.assertEqual(metric["runs_with_cost_or_subscription"], 1)
+        self.assertAlmostEqual(metric["share"], 0.5)
 
     def test_completeness_counts_subscription_and_can_be_scoped_to_providers(self):
         conn = self._init()
@@ -351,10 +356,10 @@ class WeeklyCostQueryTests(RunStoreTestCase):
 class BackfillTests(RunStoreTestCase):
     def test_unknown_runs_with_tokens_are_backfilled_from_the_price_table(self):
         conn = self._init()
-        legacy_id = self._insert(conn, timestamp=_ts(5), provider="codex", model="codex",
+        legacy_id = self._insert(conn, timestamp=_ts(5), provider="azure_openai", model="gpt-4o",
                                  input_tokens=2_000_000, output_tokens=100_000,
                                  cost_status="unknown")
-        no_tokens = self._insert(conn, timestamp=_ts(5), provider="codex", model="codex",
+        no_tokens = self._insert(conn, timestamp=_ts(5), provider="azure_openai", model="gpt-4o",
                                  input_tokens=0, output_tokens=0, cost_status="unknown")
         already = self._insert(conn, timestamp=_ts(5), provider="claude", model="claude-sonnet-4-5",
                                actual_cost=0.5, cost_status="actual")
@@ -364,7 +369,7 @@ class BackfillTests(RunStoreTestCase):
         rows = {row[0]: row for row in conn.execute(
             "SELECT id, estimated_cost, cost_status, cost_currency FROM runs"
         ).fetchall()}
-        self.assertAlmostEqual(rows[legacy_id][1], 2_000_000 / 1e6 * 1.25 + 100_000 / 1e6 * 10.0)
+        self.assertAlmostEqual(rows[legacy_id][1], 2_000_000 / 1e6 * 2.50 + 100_000 / 1e6 * 10.0)
         self.assertEqual(rows[legacy_id][2], "estimated")
         self.assertEqual(rows[legacy_id][3], "USD")
         # No usage -> stays unknown, no invented cost.
@@ -375,8 +380,8 @@ class BackfillTests(RunStoreTestCase):
 
     def test_backfill_is_idempotent_and_runs_once_per_database(self):
         conn = self._init()
-        run_id = self._insert(conn, timestamp=_ts(5), input_tokens=1_000_000,
-                              output_tokens=0, cost_status="unknown")
+        run_id = self._insert(conn, timestamp=_ts(5), provider="azure_openai", model="gpt-4o",
+                              input_tokens=1_000_000, output_tokens=0, cost_status="unknown")
         conn.close()
         conn = self._init()
         first = conn.execute("SELECT estimated_cost, cost_status FROM runs WHERE id=?",
@@ -399,20 +404,20 @@ class BackfillTests(RunStoreTestCase):
         conn.execute(
             "INSERT INTO model_prices (provider, model, input_price_per_million_tokens,"
             " output_price_per_million_tokens, currency, valid_from, source)"
-            " VALUES ('codex', 'gpt-5', 5.0, 20.0, 'USD', '2026-11-25T00:00:00Z', 'test')"
+            " VALUES ('azure_openai', 'gpt-4o', 5.0, 20.0, 'USD', '2026-11-25T00:00:00Z', 'test')"
         )
         conn.commit()
-        old = self._insert(conn, timestamp="2026-11-20T10:00:00+00:00", provider="codex",
-                           model="gpt-5", input_tokens=1_000_000, output_tokens=0,
+        old = self._insert(conn, timestamp="2026-11-20T10:00:00+00:00", provider="azure_openai",
+                           model="gpt-4o", input_tokens=1_000_000, output_tokens=0,
                            cost_status="unknown")
-        new = self._insert(conn, timestamp="2026-11-28T10:00:00+00:00", provider="codex",
-                           model="gpt-5", input_tokens=1_000_000, output_tokens=0,
+        new = self._insert(conn, timestamp="2026-11-28T10:00:00+00:00", provider="azure_openai",
+                           model="gpt-4o", input_tokens=1_000_000, output_tokens=0,
                            cost_status="unknown")
         conn.close()
         conn = self._init()
         old_cost = conn.execute("SELECT estimated_cost FROM runs WHERE id=?", (old,)).fetchone()[0]
         new_cost = conn.execute("SELECT estimated_cost FROM runs WHERE id=?", (new,)).fetchone()[0]
-        self.assertAlmostEqual(old_cost, 1.25)   # older valid_from row
+        self.assertAlmostEqual(old_cost, 2.50)   # older valid_from row
         self.assertAlmostEqual(new_cost, 5.0)    # newer row wins for the newer run
 
 
@@ -454,7 +459,7 @@ class CodexAuditTests(RunStoreTestCase):
 
     @patch("subprocess.run")
     def test_run_cost_is_estimated_from_usage_and_price_table(self, mock_run):
-        mock_run.return_value = _completed_proc(stdout=CODEX_JSONL)
+        mock_run.return_value = _completed_proc(stdout=CODEX_JSONL, stderr="model: gpt-5\n")
         result = self._worker().run("implement x", self.tmp.name, phase="implementation")
         self.assertTrue(result.success)
         row = self._latest_run()
@@ -462,7 +467,7 @@ class CodexAuditTests(RunStoreTestCase):
         self.assertEqual(row[2], 1000)
         self.assertEqual(row[3], 100)
         # billable input 600 at 1.25/1M + output 100 at 10/1M
-        self.assertAlmostEqual(row[4], 600 / 1e6 * 1.25 + 100 / 1e6 * 10.0)
+        self.assertAlmostEqual(row[4], 600 / 1e6 * 1.25 + 400 / 1e6 * 0.125 + 100 / 1e6 * 10.0)
         self.assertIsNone(row[5])
         self.assertEqual(row[6], "estimated")
         self.assertEqual(row[7], "USD")
@@ -489,6 +494,49 @@ class CodexAuditTests(RunStoreTestCase):
         self.assertEqual(row[9], 0)
         self.assertEqual(row[8], "review")
 
+    @patch("subprocess.run")
+    def test_codex_timeout_recovers_model_and_usage_from_linked_rollout(self, mock_run):
+        from datetime import datetime
+
+        session = "c14948c9-e21a-4b4c-ba65-18468adb97f0"
+        codex_home = Path(self.tmp.name) / "codex-home"
+        day = codex_home / "sessions" / datetime.now().strftime("%Y/%m/%d")
+        day.mkdir(parents=True)
+        (day / f"rollout-test-{session}.jsonl").write_text("\n".join(map(json.dumps, [
+            {"type": "turn_context", "payload": {"model": "gpt-5"}},
+            {"type": "event_msg", "payload": {"type": "token_count", "info": {
+                "total_token_usage": {"input_tokens": 1000, "output_tokens": 100, "cached_input_tokens": 400},
+            }}},
+        ])))
+        event = json.dumps({"type": "thread.started", "thread_id": session})
+        mock_run.side_effect = subprocess.TimeoutExpired("codex", 1, output=event.encode())
+        with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}):
+            result = self._worker().run("task", self.tmp.name)
+        self.assertTrue(result.timed_out)
+        row = self._latest_run()
+        self.assertEqual(row[1], "gpt-5")
+        self.assertAlmostEqual(row[4], (600 * 1.25 + 400 * .125 + 100 * 10) / 1e6)
+
+    def test_codex_watchdog_stop_keeps_usage(self):
+        from modules.coding_worker import STOP_STALLED, WatchedRun
+
+        with patch("modules.codex_worker.run_watched", return_value=WatchedRun(
+            None, CODEX_JSONL, "model: gpt-5\n", STOP_STALLED,
+        )):
+            result = self._worker().run("task", self.tmp.name, stall_seconds=1)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(self._latest_run()[6], "estimated")
+
+    @patch("subprocess.run")
+    def test_result_logging_failure_keeps_the_codex_audit(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=CODEX_JSONL, stderr="model: gpt-5\n")
+        logger = MagicMock()
+        logger.log_process.side_effect = RuntimeError("logger failed")
+        with self.assertRaisesRegex(RuntimeError, "logger failed"):
+            self._worker().run("task", self.tmp.name, experiment_logger=logger)
+        rows = self._init().execute("SELECT cost_status FROM runs").fetchall()
+        self.assertEqual([row[0] for row in rows], ["estimated"])
+
 
 class ClaudeAuditTests(RunStoreTestCase):
     def _worker(self, **kwargs):
@@ -511,7 +559,7 @@ class ClaudeAuditTests(RunStoreTestCase):
             "type": "result", "subtype": "success", "is_error": False, "session_id": "sid-1",
             "result": "ok", "total_cost_usd": 0.0123,
             "usage": {"input_tokens": 1000, "output_tokens": 100, "cache_read_input_tokens": 200},
-            "modelUsage": {"claude-sonnet-4-5": {"inputTokens": 1000}},
+            "modelUsage": {"claude-sonnet-4-5": {"inputTokens": 1000, "outputTokens": 100, "cacheReadInputTokens": 200}},
         }
         payload.update(overrides)
         return json.dumps(payload)
@@ -523,24 +571,22 @@ class ClaudeAuditTests(RunStoreTestCase):
         return patch.dict(os.environ, env, clear=True)
 
     @patch("subprocess.run")
-    def test_api_billed_run_records_actual_cost(self, mock_run):
+    def test_api_billed_run_records_usage_based_estimate(self, mock_run):
         mock_run.return_value = _completed_proc(stdout=self._result_json())
-        with self._clean_claude_env():
+        with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="0"):
             self._worker().run("task", self.tmp.name, phase="implementation")
         row = self._latest_run()
         self.assertEqual(row[0], "claude")
         self.assertEqual(row[1], "claude-sonnet-4-5")
-        self.assertAlmostEqual(row[3], 0.0123)
-        self.assertEqual(row[4], "actual")
+        self.assertIsNone(row[3])
+        self.assertAlmostEqual(row[2], (1000 * 3 + 200 * 0.30 + 100 * 15) / 1e6)
+        self.assertEqual(row[4], "estimated")
         self.assertEqual(row[5], "USD")
         self.assertEqual(row[6], "implementation")
 
     @patch("subprocess.run")
     def test_subscription_run_is_marked_not_given_a_fake_price(self, mock_run):
-        payload = self._result_json()
-        parsed = json.loads(payload)
-        parsed.pop("total_cost_usd")  # subscription logins report no cost
-        mock_run.return_value = _completed_proc(stdout=json.dumps(parsed))
+        mock_run.return_value = _completed_proc(stdout=self._result_json())
         with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="1"):
             self._worker().run("task", self.tmp.name, phase="review")
         row = self._latest_run()
@@ -563,28 +609,27 @@ class ClaudeAuditTests(RunStoreTestCase):
         parsed = json.loads(self._result_json())
         parsed.pop("total_cost_usd")
         mock_run.return_value = _completed_proc(stdout=json.dumps(parsed))
-        with self._clean_claude_env():
+        with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="0"):
             self._worker().run("task", self.tmp.name, phase="weekly_review")
         row = self._latest_run()
         # billable input 800 at 3/1M + output 100 at 15/1M
-        self.assertAlmostEqual(row[2], 800 / 1e6 * 3.0 + 100 / 1e6 * 15.0)
+        self.assertAlmostEqual(row[2], (1000 * 3 + 200 * 0.30 + 100 * 15) / 1e6)
         self.assertEqual(row[4], "estimated")
         self.assertEqual(row[5], "USD")
         self.assertEqual(row[6], "weekly_review")
 
     @patch("subprocess.run")
     def test_oauth_login_without_api_key_counts_as_subscription(self, mock_run):
-        from modules.claude_worker import claude_subscription_active
         parsed = json.loads(self._result_json())
         parsed.pop("total_cost_usd")
         mock_run.return_value = _completed_proc(stdout=json.dumps(parsed))
         with self._clean_claude_env(CLAUDE_CODE_OAUTH_TOKEN="oauth-123"):
-            self.assertTrue(claude_subscription_active())
             self._worker().run("task", self.tmp.name)
         self.assertEqual(self._latest_run()[4], "subscription")
         with self._clean_claude_env(CLAUDE_CODE_OAUTH_TOKEN="oauth-123",
                                      ANTHROPIC_API_KEY="sk-ant-api"):
-            self.assertFalse(claude_subscription_active())
+            self._worker().run("task", self.tmp.name)
+        self.assertEqual(self._latest_run()[4], "estimated")
 
     @patch("subprocess.run")
     def test_failed_run_keeps_its_usage_based_cost(self, mock_run):
@@ -593,13 +638,62 @@ class ClaudeAuditTests(RunStoreTestCase):
         parsed["is_error"] = True
         parsed["result"] = "API Error: 529 Overloaded"
         mock_run.return_value = _completed_proc(stdout=json.dumps(parsed), returncode=1)
-        with self._clean_claude_env():
+        with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="0"):
             result = self._worker().run("task", self.tmp.name)
         self.assertFalse(result.success)
         row = self._latest_run()
         self.assertEqual(row[7], 0)
         self.assertEqual(row[4], "estimated")  # usage was recorded, so cost is computed
         self.assertIsNotNone(row[2])
+
+    @patch("subprocess.run")
+    def test_stored_claude_login_wins_over_positive_reported_cost(self, mock_run):
+        mock_run.side_effect = [
+            _completed_proc(stdout=json.dumps({
+                "loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max",
+            })),
+            _completed_proc(stdout=self._result_json()),
+        ]
+        with self._clean_claude_env(ANTHROPIC_AUTH_TOKEN=""):
+            self._worker().run("task", self.tmp.name)
+        self.assertEqual(mock_run.call_args_list[0].args[0][1:], ["auth", "status", "--json"])
+        self.assertEqual(self._latest_run()[4], "subscription")
+
+    @patch("subprocess.run")
+    def test_claude_prices_each_model_and_cache_counter_even_when_output_is_capped(self, mock_run):
+        mock_run.return_value = _completed_proc(stdout=self._result_json(
+            result="long " * 100,
+            modelUsage={
+                "claude-sonnet-4-5-20250929": {
+                    "inputTokens": 1000, "outputTokens": 100,
+                    "cacheReadInputTokens": 200, "cacheCreationInputTokens": 300,
+                },
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 500, "outputTokens": 50, "cacheReadInputTokens": 800,
+                },
+            },
+        ))
+        worker = self._worker()
+        worker.max_output_bytes = 20
+        with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="0"):
+            result = worker.run("task", self.tmp.name)
+        self.assertTrue(result.stdout_truncated)
+        expected = (1000 * 3 + 100 * 15 + 200 * .3 + 300 * 3.75 + 500 + 50 * 5 + 800 * .1) / 1e6
+        self.assertAlmostEqual(self._latest_run()[2], expected)
+
+    @patch("subprocess.run")
+    def test_claude_timeout_retains_streamed_usage(self, mock_run):
+        event = json.dumps({"type": "assistant", "message": {
+            "id": "m1", "model": "claude-sonnet-4-5",
+            "usage": {"input_tokens": 200, "output_tokens": 10, "cache_read_input_tokens": 400},
+        }})
+        mock_run.side_effect = subprocess.TimeoutExpired("claude", 1, output=(event + "\n" + event).encode())
+        with self._clean_claude_env(AGENT_CLAUDE_SUBSCRIPTION="0"):
+            result = self._worker().run("task", self.tmp.name)
+        self.assertFalse(result.success)
+        self.assertTrue(result.timed_out)
+        self.assertEqual(result.usage["input_tokens"], 200)
+        self.assertAlmostEqual(self._latest_run()[2], (200 * 3 + 10 * 15 + 400 * .3) / 1e6)
 
 
 FAKE_VIBE = textwrap.dedent('''\
@@ -609,13 +703,13 @@ FAKE_VIBE = textwrap.dedent('''\
     def opt(name):
         return args[args.index(name) + 1] if name in args else None
     out = opt("--output-dir"); os.makedirs(out, exist_ok=True)
-    export = {{"outcome": "finished", "error": None, "session_id": "s-1",
+    export = {{"outcome": "finished", "error": None, "session_id": "s-1", "steps": 1,
                "usage": {{"input_tokens": 500, "output_tokens": 50, "cached_input_tokens": 0}}}}
     cost = os.environ.get("FAKE_VIBE_COST")
     if cost:
         export["cost_usd"] = float(cost)
     if os.environ.get("FAKE_VIBE_MODE") == "402":
-        export.update(outcome="infrastructure_failure",
+        export.update(outcome="infrastructure_failure", steps=0,
                       error={{"message": "402 Payment Required", "code": "backend_error"}})
         open(os.path.join(out, "export.json"), "w").write(json.dumps(export)); sys.exit(2)
     open(os.path.join(out, "export.json"), "w").write(json.dumps(export))
@@ -665,7 +759,8 @@ class VibeAuditTests(RunStoreTestCase):
         self.assertEqual(row[7], "implementation")
 
     def test_subscription_run_is_marked_not_priced(self):
-        result = self._worker().run("task", str(self.workdir), phase="weekly_review")
+        with patch.dict(os.environ, {"AGENT_VIBE_SUBSCRIPTION": "1"}):
+            result = self._worker().run("task", str(self.workdir), phase="weekly_review")
         self.assertTrue(result.success, result.error)
         self.assertIsNone(result.cost_usd)
         row = self._latest_run()
@@ -675,14 +770,25 @@ class VibeAuditTests(RunStoreTestCase):
         self.assertIsNone(row[4])
         self.assertEqual(row[7], "weekly_review")
 
-    def test_failed_run_is_recorded_with_subscription_marker(self):
-        with patch.dict(os.environ, {"FAKE_VIBE_MODE": "402"}):
+    def test_failed_run_without_billing_evidence_stays_unknown(self):
+        with patch.dict(os.environ, {"FAKE_VIBE_MODE": "402", "FAKE_VIBE_COST": "0",
+                                     "AGENT_VIBE_SUBSCRIPTION": "1"}):
             result = self._worker().run("task", str(self.workdir))
         self.assertFalse(result.success)
         row = self._latest_run()
         self.assertEqual(row[8], 0)
-        self.assertEqual(row[5], "subscription")  # no cost_usd -> subscription, not a fake price
+        self.assertEqual(row[5], "unknown")
         self.assertIsNone(row[4])
+
+    def test_vibe_accepts_zero_and_rejects_malformed_export(self):
+        from modules.vibe_worker import _cost_usd, _read_export
+
+        with patch.dict(os.environ, {"FAKE_VIBE_COST": "0", "AGENT_VIBE_SUBSCRIPTION": "0"}):
+            self._worker().run("task", str(self.workdir))
+        self.assertEqual(tuple(self._latest_run()[4:6]), (0.0, "actual"))
+        for payload in ("null", "[]", "{broken", '{"cost_usd": NaN}', '{"cost_usd": true}'):
+            (self.root / "export.json").write_text(payload)
+            self.assertIsNone(_cost_usd(_read_export(str(self.root))))
 
 
 class MistralApiAuditTests(RunStoreTestCase):
@@ -720,7 +826,7 @@ class CodexTaskServiceAuditTests(RunStoreTestCase):
     def test_task_run_lands_in_runs_with_cost(self, mock_run):
         from modules.codex_task_service import CodexTaskService
 
-        mock_run.return_value = _completed_proc(stdout=CODEX_JSONL)
+        mock_run.return_value = _completed_proc(stdout=CODEX_JSONL, stderr="model: gpt-5\n")
         service = CodexTaskService(db_path=self.db_path)
         self.addCleanup(service.close)
         task = service.create_task(prompt="do it", working_dir=self.tmp.name, provider="codex")
@@ -732,7 +838,7 @@ class CodexTaskServiceAuditTests(RunStoreTestCase):
             "SELECT provider, estimated_cost, cost_status, run_kind FROM runs ORDER BY id DESC LIMIT 1"
         ).fetchone()
         self.assertEqual(row[0], "codex")
-        self.assertAlmostEqual(row[1], 600 / 1e6 * 1.25 + 100 / 1e6 * 10.0)
+        self.assertAlmostEqual(row[1], 600 / 1e6 * 1.25 + 400 / 1e6 * 0.125 + 100 / 1e6 * 10.0)
         self.assertEqual(row[2], "estimated")
         self.assertEqual(row[3], "task")
 
@@ -760,6 +866,132 @@ class NexusReviewerWiringTests(RunStoreTestCase):
             reviewer = nexus_reviewer.NexusReviewer(db_path=self.db_path)
             reviewer._runners["codex"]("prompt", self.tmp.name)
             run_codex.assert_called_once_with("prompt", self.tmp.name, self.db_path)
+
+
+class CostRegressionTests(RunStoreTestCase):
+    def test_same_provider_week_preserves_currencies(self):
+        conn = self._init()
+        for currency, price in (("EUR", 3), ("USD", 5), (None, 7)):
+            self._insert(conn, actual_cost=price, cost_currency=currency, cost_status="actual")
+        totals = {row["currency"]: row["total_cost"]
+                  for row in weekly_cost_by_provider(conn, now=NOW)}
+        self.assertEqual(totals, {"EUR": 3, "USD": 5, None: 7})
+
+    def test_weekly_review_shows_only_coding_costs_and_their_currencies(self):
+        from modules.weekly_review import starter_pack
+
+        conn = self._init()
+        for provider, kind, currency, actual in (
+            ("azure_openai", "agent", "USD", 999),
+            ("claude", "planning", "USD", 888),
+            ("codex", "implementation", "USD", 5),
+            ("codex", "implementation_repair", "EUR", 3),
+            ("azure_openai", "weekly_review", "USD", 2),
+        ):
+            self._insert(conn, provider=provider, run_kind=kind, cost_currency=currency,
+                         actual_cost=actual, cost_status="actual")
+        pack = starter_pack(self.db_path, self.tmp.name, NOW)
+        self.assertIn("codex | USD | 1 | 1 | 0 | 5.0", pack)
+        self.assertIn("codex | EUR | 1 | 1 | 0 | 3.0", pack)
+        self.assertIn("azure_openai | USD | 1 | 1 | 0 | 2.0", pack)
+        self.assertNotIn("999.0", pack)
+        self.assertNotIn("888.0", pack)
+
+    def test_interrupted_attempt_and_later_retry_have_one_row_each(self):
+        from modules.worker_audit import audit_run
+
+        with self.assertRaises(KeyboardInterrupt):
+            with audit_run(self.db_path, "codex", "implementation", "first"):
+                raise KeyboardInterrupt
+        with audit_run(self.db_path, "codex", "implementation", "retry") as audit:
+            fields = dict(model="gpt-5", success=True, error=None, runtime_ms=1,
+                          usage={"input_tokens": 100, "output_tokens": 10})
+            audit.finish(**fields)
+            audit.finish(**fields)
+        rows = self._init().execute("SELECT cost_status, error FROM runs ORDER BY id").fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("unknown", "KeyboardInterrupt"), ("estimated", None)])
+
+    def test_process_hard_exit_leaves_visible_unknown_attempt(self):
+        code = (
+            "import os, sys\n"
+            "from modules.worker_audit import audit_run\n"
+            "with audit_run(sys.argv[1], 'codex', 'implementation', 'crash'):\n"
+            "    os._exit(27)\n"
+        )
+        result = subprocess.run([sys.executable, "-c", code, self.db_path], check=False)
+        self.assertEqual(result.returncode, 27)
+        row = self._init().execute("SELECT cost_status, error FROM runs").fetchone()
+        self.assertEqual(tuple(row), ("unknown", "Provider attempt did not finalize"))
+
+    def test_finalize_retries_same_row_after_transient_database_failure(self):
+        from modules.worker_audit import audit_run
+        from modules.run_store import _connect
+
+        with audit_run(self.db_path, "vibe", "task", "task") as audit:
+            with patch("modules.worker_audit._connect",
+                       side_effect=[sqlite3.OperationalError("locked"), _connect(self.db_path)]):
+                audit.finish(model="vibe", success=True, error=None, runtime_ms=1, actual_cost=0)
+        rows = self._init().execute("SELECT cost_status, actual_cost FROM runs").fetchall()
+        self.assertEqual([tuple(row) for row in rows], [("actual", 0.0)])
+
+    def test_backfill_rollback_and_retry(self):
+        conn = self._init()
+        row_id = self._insert(conn, provider="azure_openai", model="gpt-4o",
+                              input_tokens=1000, output_tokens=100)
+        from modules.run_store.records import backfill_run_costs
+
+        def interrupt(conn, *, after_id):
+            backfill_run_costs(conn, after_id=after_id)
+            raise RuntimeError("interrupted before checkpoint")
+
+        with patch("modules.run_store.records.backfill_run_costs", side_effect=interrupt):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                init_db(self.db_path)
+        state = conn.execute("SELECT cost_status FROM runs WHERE id=?", (row_id,)).fetchone()
+        self.assertEqual(state[0], "unknown")
+        state = self._init().execute("SELECT cost_status FROM runs WHERE id=?", (row_id,)).fetchone()
+        self.assertEqual(state[0], "estimated")
+
+    def test_historical_evidence_requires_exact_link_and_replays_atomically(self):
+        from modules.run_store.cost_recovery import recover_run_costs
+
+        conn = self._init()
+        stamp = _ts(1)
+        row_id = self._insert(conn, provider="vibe", timestamp=stamp, model="vibe")
+        entry = dict(id=row_id, provider="vibe", timestamp=stamp, source="linked export",
+                     actual_usd=0, billing_mode="api")
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            recover_run_costs(conn, [entry, dict(entry, id=row_id + 1)])
+        self.assertEqual(run_cost_completeness(conn, now=NOW)["share"], 0.0)
+        self.assertEqual(recover_run_costs(conn, [dict(entry, billing_mode=None)]), 0)
+        self.assertEqual(recover_run_costs(conn, [entry]), 1)
+        self.assertEqual(recover_run_costs(conn, [entry]), 0)
+        self.assertEqual(run_cost_completeness(conn, now=NOW)["share"], 1.0)
+
+    def test_azure_weekly_review_audits_failure_and_success(self):
+        from modules.nexus_delegation import DelegationResult
+        from modules.weekly_review import default_runners
+
+        runner = default_runners(self.db_path)["azure"]
+        with patch("modules.nexus_delegation.NexusDelegationService") as service:
+            from unittest.mock import AsyncMock
+
+            service.return_value.azure_chat = AsyncMock(side_effect=[
+                RuntimeError("transport"),
+                DelegationResult("azure_openai", True, "answer", {
+                    "deployment": "gpt-4o",
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 5},
+                }),
+            ])
+            with self.assertRaisesRegex(RuntimeError, "transport"):
+                runner("prompt", self.tmp.name)
+            self.assertEqual(runner("prompt", self.tmp.name), "answer")
+        rows = self._init().execute(
+            "SELECT run_kind, success, cost_status, input_tokens FROM runs ORDER BY id"
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in rows], [
+            ("weekly_review", 0, "unknown", 0), ("weekly_review", 1, "estimated", 100),
+        ])
 
 
 if __name__ == "__main__":

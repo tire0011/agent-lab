@@ -75,10 +75,10 @@ def get_applicable_price(
             output_price_per_million_tokens,
             currency,
             valid_from,
-            source
+            source, cache_read_rate, cache_write_rate
         FROM model_prices
-        WHERE provider = ? AND model = ? AND valid_from <= ?
-        ORDER BY valid_from DESC
+        WHERE provider = ? AND model = ? AND julianday(valid_from) <= julianday(?)
+        ORDER BY julianday(valid_from) DESC
         LIMIT 1
         """,
         (provider, model, at_timestamp),
@@ -95,6 +95,8 @@ def get_applicable_price(
         "currency": row[4],
         "valid_from": row[5],
         "source": row[6],
+        "cache_read_rate": row[7],
+        "cache_write_rate": row[8],
     }
 
 
@@ -115,17 +117,30 @@ def get_effective_price(
     model: str,
     at_timestamp: str,
 ) -> dict[str, Any] | None:
-    """The applicable price row for *provider*/*model*, falling back to the
-    provider's wildcard row (``model = '*'``) so a coding-agent run is priced
-    even when the exact model name is unknown (#810)."""
+    """Resolve exact prices and explicitly supported model aliases."""
     price = get_applicable_price(conn, provider, model, at_timestamp)
-    if price is None and model != WILDCARD_MODEL:
-        price = get_applicable_price(conn, provider, WILDCARD_MODEL, at_timestamp)
-    return price
+    if model == WILDCARD_MODEL:
+        return None
+    if price:
+        return price
+    aliases = {
+        "claude": {
+            "claude-sonnet-4-5-20250929": "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+            "claude-opus-4-5-20251101": "claude-opus-4-5",
+            "claude-opus-4-1-20250805": "claude-opus-4-1",
+        },
+        "codex": {
+            "gpt-5.4-2026-03-05": "gpt-5.4",
+            "gpt-5.5-2026-04-23": "gpt-5.5",
+        },
+    }
+    alias = aliases.get(provider, {}).get(model)
+    return get_applicable_price(conn, provider, alias, at_timestamp) if alias else None
 
 
 #: Cost statuses a run row can carry. ``actual`` = the tool reported a money
-#: amount (Claude's total_cost_usd, Vibe's export.json cost_usd);
+#: amount (Vibe's export.json cost_usd);
 #: ``estimated`` = computed from usage and the price table; ``subscription`` =
 #: billed by a subscription, no per-token price applies (#810); ``free`` =
 #: genuinely free (local model, free API tier); ``unknown`` = no usage and no
@@ -138,14 +153,43 @@ COST_STATUS_UNKNOWN = "unknown"
 
 #: Statuses that count as "this run has a cost value or a subscription mark"
 #: for the #810 completeness metric.
-COSTED_STATUSES = (COST_STATUS_SUBSCRIPTION, COST_STATUS_FREE)
+COSTED_STATUSES = (COST_STATUS_SUBSCRIPTION,)
 
 
-def _billable_input_tokens(usage: dict[str, int]) -> int:
-    """Input tokens minus the cache-read counters: cached input is billed at a
-    reduced rate, so counting it as full-price input would overstate the cost."""
-    cached = usage.get("cached_input_tokens", 0) + usage.get("cache_read_input_tokens", 0)
-    return max(0, usage.get("input_tokens", 0) - cached)
+def _token_cost(provider: str, usage: dict[str, int], price: dict[str, Any]) -> float | None:
+    if not isinstance(usage, dict) or not {"input_tokens", "output_tokens"} <= usage.keys():
+        return None
+    if any(type(value) is not int or not 0 <= value < 2**63 for value in usage.values()):
+        return None
+    input_tokens = usage["input_tokens"]
+    input_rate = price["input_price_per_million_tokens"]
+    cache_cost = 0.0
+    if provider == "codex":
+        cached = usage.get("cached_input_tokens", 0)
+        if price["model"] in {"gpt-5.4", "gpt-5.5"} and input_tokens > 272_000:
+            # The aggregate cannot distinguish many short prompts from a long one.
+            return None
+        if (cached > input_tokens or cached and price["cache_read_rate"] is None
+                or usage.get("cache_write_input_tokens", 0)):
+            return None
+        input_tokens -= cached
+        cache_cost = cached * (price["cache_read_rate"] or 0)
+    elif provider == "claude":
+        cached = usage.get("cache_read_input_tokens", 0)
+        created = usage.get("cache_creation_input_tokens", 0)
+        long_lived = usage.get("cache_creation_1h_input_tokens", 0)
+        if (cached and price["cache_read_rate"] is None
+                or created and price["cache_write_rate"] is None or long_lived > created):
+            return None
+        cache_cost = (
+            cached * (price["cache_read_rate"] or 0)
+            + (created - long_lived) * (price["cache_write_rate"] or 0)
+            + long_lived * input_rate * 2
+        )
+    return calculate_estimated_cost(
+        input_tokens, usage["output_tokens"], input_rate,
+        price["output_price_per_million_tokens"],
+    ) + cache_cost / 1_000_000
 
 
 def resolve_run_cost(
@@ -155,53 +199,31 @@ def resolve_run_cost(
     model: str,
     timestamp: str,
     usage: dict[str, int] | None = None,
+    model_usage: dict[str, dict[str, int]] | None = None,
     actual_cost: float | None = None,
     subscription: bool = False,
 ) -> dict[str, Any]:
-    """Decide the cost columns for one run (#810).
-
-    Precedence: a real money amount reported by the tool wins (``actual``);
-    then a subscription run is marked ``subscription`` with no fake price; then
-    the cost is estimated from the recorded usage and the price table
-    (``estimated``); with usage but no matching price, or with no usage at all,
-    the honest answer is ``unknown``. Returns a dict with ``estimated_cost``,
-    ``actual_cost``, ``cost_status`` and ``cost_currency``.
-    """
-    if actual_cost is not None and actual_cost > 0:
-        return {
-            "estimated_cost": None,
-            "actual_cost": float(actual_cost),
-            "cost_status": COST_STATUS_ACTUAL,
-            "cost_currency": "USD",
-        }
+    """Resolve the cost from the billing mode and captured provider evidence."""
+    fields = dict(estimated_cost=None, actual_cost=None, cost_status="unknown", cost_currency=None)
     if subscription:
-        return {
-            "estimated_cost": None,
-            "actual_cost": None,
-            "cost_status": COST_STATUS_SUBSCRIPTION,
-            "cost_currency": None,
-        }
-    if usage:
-        price = get_effective_price(conn, provider, model, timestamp)
-        if price is not None:
-            estimated = calculate_estimated_cost(
-                _billable_input_tokens(usage),
-                usage.get("output_tokens", 0),
-                price["input_price_per_million_tokens"],
-                price["output_price_per_million_tokens"],
-            )
-            return {
-                "estimated_cost": estimated,
-                "actual_cost": None,
-                "cost_status": COST_STATUS_ESTIMATED,
-                "cost_currency": price["currency"],
-            }
-    return {
-        "estimated_cost": None,
-        "actual_cost": None,
-        "cost_status": COST_STATUS_UNKNOWN,
-        "cost_currency": None,
-    }
+        return dict(fields, cost_status="subscription")
+    if type(actual_cost) in (int, float) and 0 <= actual_cost < float("inf"):
+        return dict(fields, actual_cost=actual_cost, cost_status="actual", cost_currency="USD")
+    usages = model_usage if model_usage is not None else ({model: usage} if usage else {})
+    if not usages or provider == "vibe":
+        return fields
+    total = 0.0
+    currency = None
+    for model_id, counters in usages.items():
+        price = get_effective_price(conn, provider, model_id, timestamp)
+        if price is None or currency is not None and price["currency"] != currency:
+            return fields
+        cost = _token_cost(provider, counters, price)
+        if cost is None:
+            return fields
+        currency = price["currency"]
+        total += cost
+    return dict(fields, estimated_cost=total, cost_status="estimated", cost_currency=currency)
 
 
 def insert_run(
@@ -270,19 +292,19 @@ def insert_run(
 #: (usage x price table); subscription runs are counted but add no money.
 WEEKLY_COST_BY_PROVIDER_SQL = """
 SELECT
-    strftime('%Y-%W', timestamp) AS week,
+    date(timestamp, '-6 days', 'weekday 1') AS week,
     provider,
     COUNT(*) AS runs,
     SUM(CASE WHEN actual_cost IS NOT NULL OR estimated_cost IS NOT NULL
-                  OR cost_status IN ('subscription', 'free') THEN 1 ELSE 0 END)
+                  OR cost_status = 'subscription' THEN 1 ELSE 0 END)
         AS runs_with_cost,
     SUM(CASE WHEN cost_status = 'subscription' THEN 1 ELSE 0 END) AS subscription_runs,
-    SUM(COALESCE(actual_cost, estimated_cost, 0)) AS total_cost,
-    COALESCE(MAX(cost_currency), 'USD') AS currency
+    SUM(COALESCE(actual_cost, estimated_cost)) AS total_cost,
+    cost_currency AS currency
 FROM runs
-WHERE timestamp >= ?
-GROUP BY week, provider
-ORDER BY week DESC, provider
+WHERE julianday(timestamp) >= julianday(?)
+GROUP BY week, provider, currency
+ORDER BY week DESC, provider, currency
 """
 
 
@@ -305,7 +327,7 @@ def weekly_cost_by_provider(
             "runs": int(row[2]),
             "runs_with_cost": int(row[3] or 0),
             "subscription_runs": int(row[4] or 0),
-            "total_cost": float(row[5] or 0.0),
+            "total_cost": row[5],
             "currency": row[6],
         }
         for row in rows
@@ -313,18 +335,19 @@ def weekly_cost_by_provider(
 
 
 def backfill_run_costs(conn: sqlite3.Connection, *, after_id: int = 0) -> int:
-    """#810 backfill: runs recorded before the price table was seeded have token
-    counts but ``cost_status='unknown'``. Estimate them from the stored tokens
-    and the price table valid at their timestamp - the same calculation the
-    workers now do live. Only ``unknown`` rows that actually have tokens and a
-    matching price are updated. *after_id* skips rows up to that id, so callers
-    can persist progress and re-run cheaply; returns the highest run id seen."""
+    """Backfill legacy Azure usage with a known deployment and applicable price.
+
+    Codex and Claude aggregates omit cache, model, or billing-mode evidence.
+    The caller commits the estimates and migration checkpoint together.
+    """
     rows = conn.execute(
         """
         SELECT id, provider, model, timestamp, input_tokens, output_tokens
         FROM runs
         WHERE id > ?
-          AND cost_status = 'unknown' AND (input_tokens > 0 OR output_tokens > 0)
+          AND provider = 'azure_openai' AND model = 'gpt-4o' AND cost_status = 'unknown'
+          AND estimated_cost IS NULL AND actual_cost IS NULL
+          AND (input_tokens > 0 OR output_tokens > 0)
         ORDER BY id
         """,
         (after_id,),
@@ -349,7 +372,6 @@ def backfill_run_costs(conn: sqlite3.Connection, *, after_id: int = 0) -> int:
             """,
             (cost, price["currency"], run_id),
         )
-    conn.commit()
     return upto
 
 
@@ -368,10 +390,10 @@ def run_cost_completeness(
     sql = (
         "SELECT COUNT(*), "
         "SUM(CASE WHEN actual_cost IS NOT NULL OR estimated_cost IS NOT NULL "
-        "          OR cost_status IN ('subscription', 'free') THEN 1 ELSE 0 END) "
-        "FROM runs WHERE timestamp >= ?"
+        "          OR cost_status = 'subscription' THEN 1 ELSE 0 END) "
+        "FROM runs WHERE julianday(timestamp) BETWEEN julianday(?) AND julianday(?)"
     )
-    params: list[Any] = [since]
+    params: list[Any] = [since, now.isoformat()]
     if providers:
         placeholders = ", ".join("?" for _ in providers)
         sql += f" AND provider IN ({placeholders})"

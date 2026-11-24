@@ -9,15 +9,6 @@ from typing import Any
 from nexus_version import VERSION
 
 
-def _azure_delta(azure_cost: Any) -> float | None:
-    """The measured Azure money delta of a run (#810), when there is one."""
-    if isinstance(azure_cost, dict):
-        value = azure_cost.get("actual_cost_delta")
-        if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
-            return float(value)
-    return None
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal Azure OpenAI task runner")
     parser.add_argument("--version", action="version", version=VERSION)
@@ -223,13 +214,9 @@ def main() -> int:
                 output_tokens=0,
                 total_tokens=0,
                 runtime_ms=runtime_ms,
-                # #810: the router pipeline is local-first; when Azure was
-                # actually billed the measured delta is the actual cost,
-                # otherwise the run is honestly free, not "estimated"-NULL.
-                estimated_cost=None if _azure_delta(azure_cost) else 0.0,
-                actual_cost=_azure_delta(azure_cost),
-                cost_status="actual" if _azure_delta(azure_cost) else "free",
-                cost_currency="USD" if _azure_delta(azure_cost) else None,
+                estimated_cost=None,
+                actual_cost=None,
+                cost_status="unknown",
                 run_kind="agent_router",
                 success=True,
                 error=None,
@@ -274,10 +261,9 @@ def main() -> int:
                 output_tokens=0,
                 total_tokens=0,
                 runtime_ms=runtime_ms,
-                estimated_cost=None if _azure_delta(azure_cost) else 0.0,
-                actual_cost=_azure_delta(azure_cost),
-                cost_status="actual" if _azure_delta(azure_cost) else "free",
-                cost_currency="USD" if _azure_delta(azure_cost) else None,
+                estimated_cost=None,
+                actual_cost=None,
+                cost_status="unknown",
                 run_kind="agent_router",
                 success=False,
                 error=str(exc),
@@ -404,9 +390,8 @@ def main() -> int:
             total_tokens=0,
             runtime_ms=runtime_ms,
             estimated_cost=None,
-            actual_cost=_azure_delta(azure_cost),
-            cost_status="actual" if _azure_delta(azure_cost) else "unknown",
-            cost_currency="USD" if _azure_delta(azure_cost) else None,
+            actual_cost=None,
+            cost_status="unknown",
             run_kind="agent",
             success=False,
             error=str(exc),
