@@ -314,6 +314,7 @@ def _planner(repo_root: str, db_path: str | None = None):
 
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
     from modules.local_model_rates import LocalModelRates
+    from modules.planner_shadow import cached_token_count
 
     def shadow(prompt: str, timeout: float, allowed: set[int]) -> dict[str, Any]:
         # #796: the same rate-based timeout T that the monitor joins on bounds
@@ -333,14 +334,9 @@ def _planner(repo_root: str, db_path: str | None = None):
             ),
         ))
         content = str(response["choices"][0]["message"]["content"])
-        # #799: report the prompt tokens llama-server reused from its cache:
-        # timings.cache_n (#685), normalized to tokens_cached on last_timings,
-        # so the planner_shadow row can store them as cached_prompt_tokens.
-        timings = client.last_timings or {}
-        # cached_token_count never raises: NaN, infinity, negative or
-        # out-of-range counts become None and the answer stays usable.
-        from modules.planner_shadow import cached_token_count
-        cached_prompt_tokens = cached_token_count(timings.get("tokens_cached"))
+        timings = response.get("timings")
+        cached = timings.get("cache_n") if isinstance(timings, dict) else None
+        cached_prompt_tokens = cached_token_count(cached)
         return {"content": content, "cached_prompt_tokens": cached_prompt_tokens}
 
     return IssuePlanner(

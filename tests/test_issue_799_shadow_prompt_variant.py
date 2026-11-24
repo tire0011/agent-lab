@@ -7,11 +7,13 @@ columns). ``record()`` accepts both values and ``list_shadow`` returns both.
 ``_start_shadow`` stores ``prompt_variant='compact_v1'`` with every row and
 fills ``cached_prompt_tokens`` when the shadow callable reports the prompt
 tokens llama-server reused from its cache (``timings.cache_n``), which
-``nexus_tick.py`` ``shadow()`` reads from ``client.last_timings``.
+``nexus_tick.py`` ``shadow()`` reads from the response.
 """
 
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -366,16 +368,43 @@ class SerializedMigrationTests(unittest.TestCase):
         self.assertEqual(rows["new"]["cached_prompt_tokens"], 5)
 
     def test_crash_before_commit_leaves_the_legacy_table_intact(self):
-        # A process that dies mid-migration never commits; SQLite DDL is
-        # transactional, so the table is exactly as before.
-        crashed = sqlite3.connect(self.db, isolation_level=None)
-        crashed.execute("BEGIN IMMEDIATE")
-        crashed.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
-        crashed.close()  # closing without COMMIT rolls back
+        child = subprocess.run(
+            [sys.executable, "-c", """
+import os
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("BEGIN IMMEDIATE")
+conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
+os._exit(42)
+""", self.db],
+            timeout=10,
+        )
+        self.assertEqual(child.returncode, 42)
         self.assertNotIn("created_at", _columns(self.db))
         rows = list_shadow(self.db)["rows"]
         self.assertEqual([r["tick_id"] for r in rows], ["old"])
         self.assertIn("cached_prompt_tokens", _columns(self.db))
+
+    def test_interrupted_reader_migration_rolls_back_and_retries(self):
+        def interrupt(conn):
+            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
+            raise KeyboardInterrupt
+
+        with patch.object(planner_shadow, "ensure_table", interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                list_shadow(self.db)
+        self.assertNotIn("created_at", _columns(self.db))
+        self.assertEqual([r["tick_id"] for r in list_shadow(self.db)["rows"]], ["old"])
+
+    def test_failed_insert_rolls_back_migration_and_retries_same_tick(self):
+        with self.assertRaises(sqlite3.IntegrityError):
+            record(self.db, **_row("retry", local_valid=2))
+        self.assertNotIn("prompt_variant", _columns(self.db))
+        record(self.db, **_row("retry"))
+        rows = list_shadow(self.db)["rows"]
+        self.assertEqual([r["tick_id"] for r in rows], ["retry", "old"])
 
     def test_partially_migrated_table_gets_only_the_missing_columns(self):
         with sqlite3.connect(self.db) as conn:
@@ -431,11 +460,8 @@ class NexusTickShadowCacheTests(unittest.TestCase):
             def __init__(self, base_url=None, timeout=300.0, model=None, *, stream=None,
                          transport=None):
                 captured["timeout"] = timeout
-                self.last_timings = None
 
             async def chat_completion(self, messages, max_tokens=1024, **kwargs):
-                # Mimic the real client: normalize the server's timings.
-                self.last_timings = llama_cpp_client.normalize_timings(response.get("timings"))
                 return response
 
         with tempfile.TemporaryDirectory() as tmp, \
@@ -454,14 +480,13 @@ class NexusTickShadowCacheTests(unittest.TestCase):
     def test_missing_cache_n_is_reported_as_null(self):
         result = self._shadow_result({
             "choices": [{"message": {"content": '{"issue": 2, "reason": "x"}'}}],
-            "timings": {"prompt_n": 900, "predicted_n": 40},
+            "timings": {"prompt_n": 900, "predicted_n": 40, "n_past": 850},
         })
         self.assertEqual(result["content"], '{"issue": 2, "reason": "x"}')
         self.assertIsNone(result["cached_prompt_tokens"])
 
-
     def test_malformed_cache_n_keeps_the_answer_and_reports_null(self):
-        for value in (float("nan"), float("inf"), float("-inf"), 2**63, -5, 3.5):
+        for value in (float("nan"), float("inf"), float("-inf"), 2**63, -5, 3.5, "812"):
             with self.subTest(value=value):
                 result = self._shadow_result({
                     "choices": [{"message": {"content": '{"issue": 1, "reason": "x"}'}}],

@@ -15,6 +15,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import statistics
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Any
 
@@ -98,18 +99,14 @@ def _ensure_table_locked(conn: sqlite3.Connection) -> None:
     """
     if _missing_columns(conn) == []:
         return
-    conn.execute("BEGIN IMMEDIATE")
-    try:
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
-    except BaseException:
-        conn.rollback()
-        raise
-    conn.commit()
 
 
 def record(db_path: str, **values: Any) -> None:
     """Keep the first completed observation for each tick, including retries."""
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn, conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
         values.setdefault("created_at", datetime.now(timezone.utc).isoformat())
@@ -128,7 +125,7 @@ def record(db_path: str, **values: Any) -> None:
 
 
 def list_shadow(db_path: str, limit: int = 20) -> dict[str, Any]:
-    with sqlite3.connect(db_path, timeout=30) as conn:
+    with closing(sqlite3.connect(db_path, timeout=30)) as conn:
         conn.row_factory = sqlite3.Row
         _ensure_table_locked(conn)
         rows = [dict(row) for row in conn.execute(
