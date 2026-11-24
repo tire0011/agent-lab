@@ -297,6 +297,8 @@ def _explore_with_claude(repo_root: str, prompt: str, db_path: str | None = None
 
 def _planner(repo_root: str, db_path: str | None = None):
     """Plan as an exploring agent; a single Azure call is the fallback (#337, #354, #384)."""
+    import asyncio
+
     from modules.nexus_reviewer import _run_azure
     from modules.nexus_planner import IssuePlanner
 
@@ -308,7 +310,6 @@ def _planner(repo_root: str, db_path: str | None = None):
         if free.success:
             return free.content
         return _run_azure(prompt, repo_root, db_path, phase="planning", max_tokens=2000)
-
 
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
     from modules.local_model_rates import LocalModelRates
