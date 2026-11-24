@@ -34,6 +34,7 @@ from ..models import (
     STATUS_TIMED_OUT,
 )
 from ..text_utils import _truncate_text, _utcnow_iso
+from ..whitespace_fix import diff_check_report, fix_whitespace
 from .core import (
     BASELINE_RECHECK_ENV_VAR,
     DEFAULT_BASELINE_RECHECK_SECONDS,
@@ -413,6 +414,65 @@ class VerificationMixin:
             )
 
 
+    def _verification_diff(
+        self, worktree_path: str, elog: ExperimentLogger,
+    ) -> tuple[str, str, str]:
+        """Read the stat, patch, and check report from one worktree snapshot."""
+        with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
+            index_env = dict(os.environ)
+            index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
+
+            def git(args: list[str]) -> subprocess.CompletedProcess:
+                return _run_git(
+                    args, cwd=worktree_path, env=index_env, elog=elog, phase="verifying",
+                )
+
+            git(["read-tree", "HEAD"]).check_returncode()
+            git(["add", "-A"]).check_returncode()
+            stat = git(["diff", "--cached", "--stat", "HEAD"])
+            stat.check_returncode()
+            diff = git(["diff", "--cached", "HEAD"])
+            diff.check_returncode()
+            check = git(["diff", "--cached", "--check", "HEAD"])
+            report = diff_check_report(check)
+            return stat.stdout, diff.stdout, report
+
+    def _autofix_diff_check_whitespace(
+        self,
+        worktree_path: str,
+        diff_check_issue: str,
+        elog: ExperimentLogger,
+    ) -> tuple[str, dict[str, int], tuple[str, str] | None]:
+        """Apply one fix and return the report, changed lines, and refreshed diff."""
+        fixed_files: dict[str, int] = {}
+        try:
+            fix_result = fix_whitespace(worktree_path, "HEAD")
+            fixed_files = fix_result.fixed_files
+            if not fixed_files:
+                return fix_result.remaining_report or diff_check_issue, fixed_files, None
+            diff_stat, diff_text, remaining = self._verification_diff(worktree_path, elog)
+            _run_git(
+                ["--literal-pathspecs", "add", "--", *sorted(fixed_files)],
+                cwd=worktree_path, elog=elog, phase="verifying",
+            ).check_returncode()
+        except Exception as exc:  # noqa: BLE001 - an autofix failure cannot clear the original finding
+            elog.warning(
+                "verifying", "diff_check_autofix_failed",
+                "Whitespace autofix could not complete; keeping the original git diff --check report",
+                exc=exc,
+            )
+            return diff_check_issue, fixed_files, None
+        elog.info(
+            "verifying", "diff_check_autofixed",
+            f"Auto-fixed {fix_result.fixed_line_count} whitespace line(s) reported by "
+            f"git diff --check in {len(fixed_files)} file(s)",
+            files=sorted(fixed_files),
+            lines_fixed=fix_result.fixed_line_count,
+            files_line_counts=fixed_files,
+            remaining_report=remaining[:500] or None,
+        )
+        return remaining, fixed_files, (diff_stat, diff_text)
+
     def _verify(
         self,
         experiment_id: str,
@@ -490,37 +550,7 @@ class VerificationMixin:
                 ["status", "--short", "--untracked-files=all"],
                 cwd=worktree_path, elog=elog, phase="verifying",
             )
-            with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
-                index_env = dict(os.environ)
-                index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
-                read_tree_proc = _run_git(
-                    ["read-tree", "HEAD"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying"
-                )
-                add_proc = _run_git(["add", "-A"], cwd=worktree_path, env=index_env, elog=elog, phase="verifying")
-                if read_tree_proc.returncode != 0 or add_proc.returncode != 0:
-                    failed_proc = read_tree_proc if read_tree_proc.returncode != 0 else add_proc
-                    raise subprocess.CalledProcessError(
-                        failed_proc.returncode,
-                        failed_proc.args,
-                        output=failed_proc.stdout,
-                        stderr=failed_proc.stderr,
-                    )
-                stat_proc = _run_git(
-                    ["diff", "--cached", "--stat", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
-                )
-                diff_proc = _run_git(
-                    ["diff", "--cached", "HEAD"], cwd=worktree_path, env=index_env,
-                    elog=elog, phase="verifying",
-                )
-                check_proc = _run_git(
-                    ["diff", "--cached", "--check", "HEAD"],
-                    cwd=worktree_path,
-                    env=index_env,
-                    elog=elog, phase="verifying",
-                )
+            diff_stat, full_diff, diff_check_issue = self._verification_diff(worktree_path, elog)
         except (OSError, subprocess.SubprocessError) as exc:
             elog.error(
                 "verifying", "verification_git_exception",
@@ -534,13 +564,21 @@ class VerificationMixin:
             return self.get_experiment(experiment_id)
 
         git_status = status_proc.stdout
-        diff_stat = stat_proc.stdout
-        diff_text = _truncate_text(diff_proc.stdout, self.max_diff_bytes, label="diff")
-        diff_check_issue = check_proc.stdout.strip() or (check_proc.returncode != 0 and check_proc.stderr.strip())
         if git_status.strip():
             elog.debug("verifying", "git_status_checked", "Worktree has uncommitted changes as expected")
         else:
             elog.warning("verifying", "git_status_clean", "Worktree has no changes after implementation phase")
+
+        # #817: a whitespace-only `git diff --check` finding is mechanical dirt, not a
+        # verdict - fix it in the worktree once and let only the remaining report count.
+        diff_check_autofixed: dict[str, int] = {}
+        if diff_check_issue:
+            diff_check_issue, diff_check_autofixed, refreshed_diff = (
+                self._autofix_diff_check_whitespace(worktree_path, diff_check_issue, elog)
+            )
+            if refreshed_diff is not None:
+                diff_stat, full_diff = refreshed_diff
+        diff_text = _truncate_text(full_diff, self.max_diff_bytes, label="diff")
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
         test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
@@ -679,6 +717,21 @@ class VerificationMixin:
 
         test_output_capped = _truncate_text(test_output, self.max_test_output_bytes, label="test output")
 
+        # #817: mention the whitespace auto-fix in the verification summary so the
+        # reviewer sees it next to the test output (stored record + PR diagnostics).
+        diff_check_autofix_note: str | None = None
+        if diff_check_autofixed:
+            diff_check_autofix_note = (
+                f"git diff --check whitespace auto-fixed in {len(diff_check_autofixed)} "
+                f"file(s), {sum(diff_check_autofixed.values())} line(s): "
+                + ", ".join(sorted(diff_check_autofixed))
+            )
+            note = f"[diff_check_autofixed] {diff_check_autofix_note}"
+            # Reserve space for the note while keeping the CI evidence line first.
+            output_budget = self.max_test_output_bytes - len(note.encode("utf-8", errors="replace")) - 1
+            summary_output = _truncate_text(test_output, max(0, output_budget), label="test output")
+            test_output_capped = f"{summary_output}\n{note}" if summary_output else note
+
         final_status = STATUS_SUCCEEDED
         error: str | None = None
         quality_evaluation: dict[str, Any] | None = None
@@ -696,6 +749,8 @@ class VerificationMixin:
         elif diff_check_issue:
             final_status = STATUS_NEEDS_REVIEW
             error = f"git diff --check reported issues: {str(diff_check_issue)[:500]}"
+            if diff_check_autofix_note:
+                error = f"{error}; {diff_check_autofix_note}"
             elog.warning("verifying", "diff_check_issue", f"git diff --check reported issues: {diff_check_issue}")
         elif test_timed_out:
             # An aborted test run is not a test failure (exit_code=None is expected): keep this
@@ -741,7 +796,7 @@ class VerificationMixin:
             try:
                 options = {"watchdog": self._get_test_watchdog_config()} if abort_on_test_stall else {}
                 timing_failure = self._run_timing_check(
-                    experiment_id, worktree_path, diff_proc.stdout, elog, **options,
+                    experiment_id, worktree_path, full_diff, elog, **options,
                 )
             except HungTest as exc:
                 self._record_verification_run(
