@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from modules import github_authorization
 from modules.logging_config import configure_logging
@@ -314,7 +315,7 @@ def _planner(repo_root: str, db_path: str | None = None):
     from modules.llama_cpp_client import LlamaCppClient, json_schema_response_format
     from modules.local_model_rates import LocalModelRates
 
-    def shadow(prompt: str, timeout: float, allowed: set[int]) -> str:
+    def shadow(prompt: str, timeout: float, allowed: set[int]) -> dict[str, Any]:
         # #796: the same rate-based timeout T that the monitor joins on bounds
         # this request, so the request can never outlive the monitor.
         client = LlamaCppClient(timeout=timeout, stream=False)
@@ -331,7 +332,16 @@ def _planner(repo_root: str, db_path: str | None = None):
                  "required": ["issue", "reason"], "additionalProperties": False},
             ),
         ))
-        return str(response["choices"][0]["message"]["content"])
+        content = str(response["choices"][0]["message"]["content"])
+        # #799: report the prompt tokens llama-server reused from its cache:
+        # timings.cache_n (#685), normalized to tokens_cached on last_timings,
+        # so the planner_shadow row can store them as cached_prompt_tokens.
+        timings = client.last_timings or {}
+        cached = timings.get("tokens_cached")
+        cached_prompt_tokens = (int(cached)
+                                if isinstance(cached, (int, float))
+                                and not isinstance(cached, bool) else None)
+        return {"content": content, "cached_prompt_tokens": cached_prompt_tokens}
 
     return IssuePlanner(
         complete, explore=lambda prompt: _explore_with_claude(repo_root, prompt, db_path),
