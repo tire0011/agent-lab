@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -55,16 +57,6 @@ class WhitespaceFixResult:
         return sum(self.fixed_files.values())
 
 
-def _unquote_path(path: str) -> str:
-    """Undo git's C-style path quoting for the common escapes."""
-    if len(path) >= 2 and path.startswith('"') and path.endswith('"'):
-        escapes = {"n": "\n", "t": "\t", '"': '"', "\\": "\\"}
-        return re.sub(
-            r"\\(.)", lambda m: escapes.get(m.group(1), m.group(1)), path[1:-1]
-        )
-    return path
-
-
 def parse_diff_check_report(report: str) -> dict[str, list[tuple[int, str]]]:
     """Parse ``git diff --check`` output into ``path -> [(line, message)]``.
 
@@ -72,17 +64,18 @@ def parse_diff_check_report(report: str) -> dict[str, list[tuple[int, str]]]:
     can never be mistaken for a finding itself.
     """
     findings: dict[str, list[tuple[int, str]]] = {}
-    lines = report.splitlines()
+    lines = report.split("\n")
     index = 0
     while index < len(lines):
         line = lines[index]
         match = FINDING_RE.match(line)
-        if match and not line.startswith("+"):
-            path = _unquote_path(match.group("path"))
+        if match:
+            path = match.group("path")
             findings.setdefault(path, []).append(
                 (int(match.group("line")), match.group("message"))
             )
-            if index + 1 < len(lines) and lines[index + 1].startswith("+"):
+            if (BLANK_LINE_AT_EOF not in match.group("message")
+                    and index + 1 < len(lines) and lines[index + 1].startswith("+")):
                 index += 1  # the offending line echoed by git
         index += 1
     return findings
@@ -91,46 +84,67 @@ def parse_diff_check_report(report: str) -> dict[str, list[tuple[int, str]]]:
 def _safe_target(worktree: Path, rel_path: str) -> Path | None:
     """Absolute path of a reported file, or None when it leaves the worktree."""
     candidate = Path(rel_path)
-    if candidate.is_absolute():
+    if candidate.is_absolute() or ".." in candidate.parts:
         return None
     root = worktree.resolve()
     target = (root / candidate).resolve()
-    if not target.is_relative_to(root):
+    if target != root / candidate or not target.is_relative_to(root):
         return None
     return target
 
 
-def _run_diff_check(worktree_path: str, base_ref: str) -> subprocess.CompletedProcess:
-    """Run ``git diff --check <base_ref>`` over every worktree change.
-
-    A throwaway index (``read-tree <base>`` then ``add -A``) mirrors what the
-    verification phase does, so the report also covers brand-new files without
-    ever touching the worktree's real index.
-    """
+@contextmanager
+def _worktree_index(worktree_path: str, base_ref: str):
+    """Snapshot the worktree, including untracked files, in a throwaway index."""
     with tempfile.TemporaryDirectory(prefix="whitespace-fix-index-") as index_dir:
         env = dict(os.environ)
         env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
-        read_tree = subprocess.run(
+        subprocess.run(
             ["git", "read-tree", base_ref],
             cwd=worktree_path, capture_output=True, text=True, env=env, timeout=120,
+            check=True,
         )
-        if read_tree.returncode != 0:
-            raise RuntimeError(
-                f"git read-tree {base_ref} failed: {read_tree.stderr.strip() or read_tree.stdout.strip()}"
-            )
         subprocess.run(
             ["git", "add", "-A"],
             cwd=worktree_path, capture_output=True, text=True, env=env, timeout=300,
             check=True,
         )
-        return subprocess.run(
-            ["git", "diff", "--cached", "--check", base_ref],
-            cwd=worktree_path, capture_output=True, text=True, env=env, timeout=120,
-        )
+        yield env
 
 
-def _report_of(proc: subprocess.CompletedProcess) -> str:
-    return proc.stdout.strip() or (proc.returncode != 0 and proc.stderr.strip()) or ""
+def _run_diff_check(worktree_path: str, base_ref: str, env: dict[str, str]) -> str:
+    proc = subprocess.run(
+        ["git", "diff", "--cached", "--check", base_ref],
+        cwd=worktree_path, capture_output=True, env=env, timeout=120,
+    )
+    proc.stdout = os.fsdecode(proc.stdout)
+    proc.stderr = os.fsdecode(proc.stderr)
+    return diff_check_report(proc)
+
+
+def _added_lines(worktree_path: str, base_ref: str, env: dict[str, str], path: str) -> set[int]:
+    """Return destination line numbers from zero-context diff hunks."""
+    patch = subprocess.run(
+        ["git", "--literal-pathspecs", "diff", "--cached", "--no-ext-diff",
+         "--no-textconv", "--no-renames", "--unified=0", "--inter-hunk-context=0",
+         base_ref, "--", path],
+        cwd=worktree_path, capture_output=True, text=True, errors="surrogateescape",
+        env=env, timeout=120, check=True,
+    ).stdout
+    return {
+        line
+        for start, count in re.findall(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", patch, re.M)
+        for line in range(int(start), int(start) + int(count or "1"))
+    }
+
+
+def diff_check_report(proc: subprocess.CompletedProcess) -> str:
+    """Read findings and reject Git failures, including failures with no output."""
+    report = proc.stdout.rstrip("\n")
+    # Git diff --check exits 2 when it emits whitespace findings.
+    if proc.returncode != 2 or not report or proc.stderr.strip():
+        proc.check_returncode()
+    return report
 
 
 def _is_markdown_hard_break(body: str) -> bool:
@@ -150,49 +164,69 @@ def _fix_space_before_tab(body: str) -> str:
     return fixed + body[len(indent):]
 
 
-def _fix_file(target: Path, rel_path: str, findings: list[tuple[int, str]]) -> int:
-    """Rewrite only the reported lines of one file; returns the lines changed."""
+def _fix_file(
+    target: Path, rel_path: str, findings: list[tuple[int, str]], git_dir: Path,
+    eof_added_lines: set[int] | None = None,
+) -> int:
+    """Rewrite one file atomically and count each changed or deleted line once."""
     raw = target.read_bytes()
     if b"\0" in raw:
-        return 0  # binary file: never touched
-    text = raw.decode("utf-8", errors="surrogateescape")
-    lines = text.splitlines(keepends=True)
+        return 0
+    # Git counts LF-delimited lines, including when the file contains other
+    # control characters or Unicode line separators.
+    lines = raw.decode("utf-8", errors="surrogateescape").split("\n")
     is_markdown = rel_path.lower().endswith(".md")
-    wants_eof_trim = any(BLANK_LINE_AT_EOF in message for _, message in findings)
-    changed = 0
-    # Highest line numbers first, so edits cannot shift a later index.
-    for line_no, message in sorted(set(findings), key=lambda item: item[0], reverse=True):
-        if CONFLICT_MARKER in message:
-            continue  # conflict markers are never auto-fixed
-        if BLANK_LINE_AT_EOF in message:
-            continue  # handled once per file below
+    messages_by_line: dict[int, list[str]] = {}
+    for line_no, message in findings:
+        messages_by_line.setdefault(line_no, []).append(message)
+    changed_lines: set[int] = set()
+    eof_start = len(lines)
+    for line_no, messages in messages_by_line.items():
         index = line_no - 1
-        if index < 0 or index >= len(lines):
+        if not 0 <= index < len(lines):
+            continue
+        if any(CONFLICT_MARKER in message for message in messages):
             continue
         line = lines[index]
-        body = line.rstrip("\r\n")
+        body = line.removesuffix("\r")
         ending = line[len(body):]
+        if any(BLANK_LINE_AT_EOF in message for message in messages):
+            eof_start = min(eof_start, index)
         if is_markdown and _is_markdown_hard_break(body):
-            continue  # two trailing spaces in Markdown are a hard break, not dirt
+            continue
         new_body = body
-        if SPACE_BEFORE_TAB in message:
+        if any(SPACE_BEFORE_TAB in message for message in messages):
             new_body = _fix_space_before_tab(new_body)
-        if TRAILING_WHITESPACE in message or SPACE_BEFORE_TAB in message:
+        if any(TRAILING_WHITESPACE in message for message in messages):
             new_body = new_body.rstrip(" \t")
         if new_body != body:
             lines[index] = new_body + ending
-            changed += 1
-    if wants_eof_trim:
-        # git reports only the first blank line at EOF; remove the extra ones too.
-        end = len(lines)
-        while end > 0 and not lines[end - 1].strip(" \t\r\n"):
-            end -= 1
-        if end < len(lines):
-            changed += len(lines) - end
-            lines = lines[:end]
-    if changed:
-        target.write_bytes("".join(lines).encode("utf-8", errors="surrogateescape"))
-    return changed
+            changed_lines.add(index)
+
+    # The EOF diagnostic may point at a pre-existing blank. Use the actual
+    # additions in the snapshot to preserve every unchanged blank in the suffix.
+    deleted_lines: set[int] = set()
+    if eof_added_lines:
+        end = len(lines) - int(lines[-1] == "")
+        for index in range(end - 1, eof_start - 1, -1):
+            body = lines[index].removesuffix("\r")
+            if body.strip(" \t"):
+                break
+            if index + 1 in eof_added_lines and not (is_markdown and _is_markdown_hard_break(body)):
+                deleted_lines.add(index)
+        changed_lines.update(deleted_lines)
+        if len(lines) - 1 in deleted_lines:
+            lines.append("")  # Keep the preceding line terminator.
+        lines = [line for index, line in enumerate(lines) if index not in deleted_lines]
+    if changed_lines:
+        # Keep temporary files in Git metadata so a killed worker cannot leave
+        # a partial file that a subsequent git add -A would pick up.
+        with tempfile.TemporaryDirectory(prefix="whitespace-fix-", dir=git_dir) as temp_dir:
+            replacement = Path(temp_dir) / "replacement"
+            replacement.write_bytes("\n".join(lines).encode("utf-8", errors="surrogateescape"))
+            replacement.chmod(stat.S_IMODE(target.stat().st_mode))
+            replacement.replace(target)
+    return len(changed_lines)
 
 
 def fix_whitespace(worktree_path: str, base_ref: str = "HEAD") -> WhitespaceFixResult:
@@ -205,20 +239,43 @@ def fix_whitespace(worktree_path: str, base_ref: str = "HEAD") -> WhitespaceFixR
     callers then keep the original report.
     """
     worktree = Path(worktree_path)
-    report = _report_of(_run_diff_check(worktree_path, base_ref))
-    findings = parse_diff_check_report(report)
+    with _worktree_index(worktree_path, base_ref) as env:
+        report = _run_diff_check(worktree_path, base_ref, env)
+        if not report:
+            return WhitespaceFixResult()
+        paths = subprocess.run(
+            ["git", "diff", "--cached", "--name-only", "-z", "--no-renames", base_ref],
+            cwd=worktree_path, capture_output=True, env=env, timeout=120, check=True,
+        ).stdout
+        # Git prints raw filenames in --check, so a filename containing LF
+        # makes the corresponding report ambiguous.
+        if b"\n" in paths:
+            return WhitespaceFixResult(remaining_report=report)
+        findings = parse_diff_check_report(report)
+        eof_added_lines = {
+            path: _added_lines(worktree_path, base_ref, env, path)
+            for path, messages in findings.items()
+            if any(BLANK_LINE_AT_EOF in message for _, message in messages)
+        }
     fixed_files: dict[str, int] = {}
+    if not findings:
+        return WhitespaceFixResult({}, report)
+    git_dir = Path(subprocess.run(
+        ["git", "rev-parse", "--absolute-git-dir"], cwd=worktree_path,
+        capture_output=True, text=True, timeout=120, check=True,
+    ).stdout.rstrip("\n"))
     for rel_path, file_findings in findings.items():
         target = _safe_target(worktree, rel_path)
         if target is None or not target.is_file():
             continue  # outside the worktree or gone: leave it to the report
         try:
-            changed = _fix_file(target, rel_path, file_findings)
+            changed = _fix_file(target, rel_path, file_findings, git_dir, eof_added_lines.get(rel_path))
         except OSError:
             continue
         if changed:
             fixed_files[rel_path] = changed
     if not fixed_files:
         return WhitespaceFixResult({}, report)
-    remaining = _report_of(_run_diff_check(worktree_path, base_ref))
+    with _worktree_index(worktree_path, base_ref) as env:
+        remaining = _run_diff_check(worktree_path, base_ref, env)
     return WhitespaceFixResult(fixed_files, remaining)

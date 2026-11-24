@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 from modules.experiment_evaluation import EvaluationResult
 from modules.experiment_service import ExperimentService, STATUS_VERIFYING
+from modules.experiment_service.service_parts import verification
 from modules.experiment_service.whitespace_fix import (
     _fix_file,
     _safe_target,
@@ -48,7 +49,9 @@ class WhitespaceFixUnitTests(unittest.TestCase):
 
     def _commit_all(self, message: str = "base") -> None:
         self._git("add", "-A")
-        self._git("commit", "-q", "-m", message)
+        tree = self._git("write-tree").stdout.strip()
+        commit = self._git("commit-tree", tree, "-m", message).stdout.strip()
+        self._git("update-ref", "HEAD", commit)
 
     def _fix(self):
         return fix_whitespace(str(self.repo), "HEAD")
@@ -83,6 +86,49 @@ class WhitespaceFixUnitTests(unittest.TestCase):
         self.assertEqual(result.remaining_report, "")
         self.assertEqual(result.fixed_files, {"notes.txt": 2})
         self.assertEqual(self._read("notes.txt"), "hello\n")
+
+    def test_existing_blank_at_eof_is_preserved(self) -> None:
+        self._write("notes.txt", "hello\n\n")
+        self._commit_all()
+        self._write("notes.txt", "hello\n\n\n")
+
+        self.assertEqual(self._fix().fixed_files, {"notes.txt": 1})
+        self.assertEqual(self._read("notes.txt"), "hello\n\n")
+        self.assertEqual(self._fix().fixed_files, {})
+
+    def test_interrupted_second_replacement_is_safe_to_retry(self) -> None:
+        self._write("a.txt", "old\n")
+        self._write("b.txt", "old\n")
+        self._commit_all()
+        self._write("a.txt", "new  \n")
+        self._write("b.txt", "new  \n")
+        replace = Path.replace
+
+        def interrupt(source, target):
+            if target.name == "b.txt":
+                raise KeyboardInterrupt
+            return replace(source, target)
+
+        with patch.object(Path, "replace", interrupt), self.assertRaises(KeyboardInterrupt):
+            self._fix()
+
+        self.assertEqual(self._read("a.txt"), "new\n")
+        self.assertEqual(self._read("b.txt"), "new  \n")
+        self.assertEqual(self._git("ls-files", "--others", "--exclude-standard").stdout, "")
+        self.assertEqual(self._fix().fixed_files, {"b.txt": 1})
+        self.assertEqual(self._fix().fixed_files, {})
+
+    def test_raw_git_paths_are_used_verbatim(self) -> None:
+        self._write("app.py", "old  \n")
+        self._commit_all()
+        for name in ('"app.py"', "+app.py", " spaced.py"):
+            self._write(name, "new  \n")
+
+        result = self._fix()
+
+        self.assertEqual(result.remaining_report, "")
+        self.assertEqual(result.fixed_files, {'"app.py"': 1, "+app.py": 1, " spaced.py": 1})
+        self.assertEqual(self._read("app.py"), "old  \n")
 
     def test_conflict_marker_stays_in_remaining_report(self) -> None:
         self._write("f.py", "base\n")
@@ -144,7 +190,7 @@ class WhitespaceFixUnitTests(unittest.TestCase):
         payload = b"\x00\x01\x02  \n"
         target.write_bytes(payload)
 
-        changed = _fix_file(target, "blob.bin", [(1, "trailing whitespace.")])
+        changed = _fix_file(target, "blob.bin", [(1, "trailing whitespace.")], self.repo / ".git")
 
         self.assertEqual(changed, 0)
         self.assertEqual(target.read_bytes(), payload)
@@ -187,7 +233,9 @@ class WhitespaceAutofixVerificationTests(unittest.TestCase):
         self._git("config", "user.email", "test@example.com")
         self._git("config", "user.name", "Test")
         self._git("add", "-A")
-        self._git("commit", "-q", "-m", "base")
+        tree = self._git("write-tree").strip()
+        commit = self._git("commit-tree", tree, "-m", "base").strip()
+        self._git("update-ref", "HEAD", commit)
         self.service = ExperimentService(
             db_path=str(root / "db.sqlite"), repo_root=str(self.repo),
             worktrees_root=str(root / "worktrees"), test_python_executable=sys.executable,
@@ -229,21 +277,71 @@ class WhitespaceAutofixVerificationTests(unittest.TestCase):
         return events
 
     def test_whitespace_only_diff_check_ends_succeeded_and_logs_autofix(self) -> None:
-        (self.repo / "app.py").write_text("VALUE = 'good'\nNEW = 1   \n", encoding="utf-8")
+        (self.repo / "app.py").write_text("VALUE = 'good'\nNEW = 1   \n\n", encoding="utf-8")
 
         experiment_id, result = self._verify()
 
         self.assertEqual(result.status, "succeeded", result.error)
         self.assertIsNone(result.error)
+        self.assertEqual(result.diff_text, self._git("diff", "--cached", "HEAD"))
+        self.assertEqual(result.diff_stat, self._git("diff", "--cached", "--stat", "HEAD"))
+        self.assertIn("+NEW = 1\n", result.diff_text)
+        self.assertNotIn("\n+\n", result.diff_text)
         # The worktree file was actually fixed.
         self.assertEqual((self.repo / "app.py").read_text(encoding="utf-8"), "VALUE = 'good'\nNEW = 1\n")
         # diff_check_autofixed is logged with the files and the line count.
         autofix = [e for e in self._log_events(experiment_id) if e.get("event") == "diff_check_autofixed"]
         self.assertEqual(len(autofix), 1)
         self.assertIn("app.py", autofix[0].get("files", []))
-        self.assertGreaterEqual(autofix[0].get("lines_fixed", 0), 1)
+        self.assertEqual(autofix[0].get("lines_fixed"), 2)
         # The auto-fix is mentioned in the verification summary (stored test output).
         self.assertIn("diff_check_autofixed", result.test_output or "")
+
+    def test_git_failure_after_fix_preserves_original_report(self) -> None:
+        run_git = verification._run_git
+        cases = [
+            (["read-tree", "HEAD"], 2, 1),
+            (["add", "-A"], 2, 1),
+            (["diff", "--cached", "--stat", "HEAD"], 2, 1),
+            (["diff", "--cached", "HEAD"], 2, 1),
+            (["diff", "--cached", "--check", "HEAD"], 2, 2),
+            (["--literal-pathspecs", "add", "--", "app.py"], 1, 1),
+        ]
+        for command, fail_on, exit_code in cases:
+            with self.subTest(command=command):
+                (self.repo / "app.py").write_text("NEW = 1   \n", encoding="utf-8")
+                calls = 0
+
+                def fail_git(args, **kwargs):
+                    nonlocal calls
+                    if args == command:
+                        calls += 1
+                        if calls == fail_on:
+                            return subprocess.CompletedProcess(args, exit_code, "", "")
+                    return run_git(args, **kwargs)
+
+                with patch.object(verification, "_run_git", side_effect=fail_git):
+                    experiment_id, result = self._verify()
+
+                self.assertEqual(result.status, "needs_review")
+                self.assertTrue(result.error.startswith("git diff --check reported issues"))
+                self.assertIn("app.py:1: trailing whitespace.", result.error)
+                events = [event["event"] for event in self._log_events(experiment_id)]
+                self.assertIn("diff_check_autofix_failed", events)
+                self.assertNotIn("diff_check_autofixed", events)
+                self.assertEqual(self._git("diff", "--cached", "HEAD"), "")
+
+        # A fresh verification can proceed with the fully written worktree.
+        _, retried = self._verify()
+        self.assertEqual(retried.status, "succeeded", retried.error)
+        self.assertIn("+NEW = 1\n", retried.diff_text)
+
+    def test_fixer_exception_preserves_original_report(self) -> None:
+        (self.repo / "app.py").write_text("NEW = 1   \n", encoding="utf-8")
+        with patch.object(verification, "fix_whitespace", side_effect=RuntimeError("failed")):
+            _, result = self._verify()
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("app.py:1: trailing whitespace.", result.error)
 
     def test_conflict_marker_still_ends_needs_review(self) -> None:
         (self.repo / "app.py").write_text("VALUE = 'good'\n<<<<<<< HEAD\n", encoding="utf-8")
