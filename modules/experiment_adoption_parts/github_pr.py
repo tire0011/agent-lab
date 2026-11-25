@@ -72,7 +72,7 @@ class GitHubPrMixin:
                         f"decision or outside change from review of {source}", body)
                 else:
                     opened = self.github_work_tracking.open_issue(
-                        f"Review follow-up for {source}: edge cases", body)
+                        f"Review follow-up for {source}", body)
                 if elog is not None:
                     elog.info("adoption", "review_follow_up_opened",
                               f"Deferred review findings ({kind}) -> issue #{opened.get('number')}",
