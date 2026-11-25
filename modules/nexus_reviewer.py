@@ -40,7 +40,11 @@ _AGENT_STALL_SECONDS = 300
 # BLOCKING_KINDS still block; the others go to a follow-up issue (edge_case)
 # or to the owner (elsewhere) - 2026-11-22: 66 blocked vs 56 adopted, and
 # issues like #782 and #763 took 3-4 rounds, each finding a new edge case.
-PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere")
+# after_merge: a step only possible once the change is merged and deployed
+# (measuring the next ticks, closing other issues, posting a report). It never
+# blocks, not even on the first review: 2026-11-24 #799 asked to measure the
+# next 20 ticks, and all three reviewers blocked every attempt for it.
+PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere", "after_merge")
 BLOCKING_KINDS = ("task", "bug", "regression")
 CONVERGE_AFTER_BLOCKS = 1
 # From the third attempt (two earlier blocks) a new bug blocks only when it
@@ -91,7 +95,10 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
         'the task covers; "regression" = it breaks existing behaviour or weakens '
         'a security, safety or budget check; "edge_case" = a rare case beyond '
         'what the task asks; "elsewhere" = it needs a change outside this '
-        'repository or a decision by the owner.\n\n'
+        'repository or a decision by the owner; "after_merge" = a step that '
+        'can only happen after this change is merged and deployed (measuring '
+        'future ticks or live data, closing other issues, posting a report) - '
+        'never block for it, it becomes a follow-up.\n\n'
         + (
             "QUALITY GATE FINDINGS: a deterministic check that reads file paths "
             "out of the task text flagged this change: "
@@ -158,9 +165,11 @@ def converge(verdict: str, summary: str, problems: list[tuple[str, str]],
              earlier_blocks: int) -> tuple[str, str, list[tuple[str, str]]]:
     """From the second block on: only task, bug and regression problems block;
     edge cases and outside work are deferred. Returns (verdict, summary, deferred)."""
-    if verdict != VERDICT_BLOCK or earlier_blocks < CONVERGE_AFTER_BLOCKS or not problems:
+    if verdict != VERDICT_BLOCK or not problems:
         return verdict, summary, []
-    if any(kind in BLOCKING_KINDS for kind, _text in problems):
+    deferrable = {"after_merge"} | (
+        {"edge_case", "elsewhere"} if earlier_blocks >= CONVERGE_AFTER_BLOCKS else set())
+    if any(kind not in deferrable for kind, _text in problems):
         return verdict, summary, []
     head = summary.split(" Blocking problems:")[0]
     listed = " ".join(f"({i}) [{kind}] {text[:400]}" for i, (kind, text) in enumerate(problems, 1))

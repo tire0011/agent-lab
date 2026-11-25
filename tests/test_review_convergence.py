@@ -40,6 +40,15 @@ class ParseTests(unittest.TestCase):
         self.assertIn("deferred to follow-up", summary)
         self.assertEqual(deferred, [("edge_case", "rare"), ("elsewhere", "mailbox client")])
 
+    def test_after_merge_steps_never_block_not_even_the_first_review(self):
+        """#799: 'measure the next 20 ticks' blocked every attempt with all three reviewers."""
+        verdict, _summary, deferred = converge(
+            "block", "s", [("after_merge", "run the probe on the next 20 ticks")], 0)
+        self.assertEqual(verdict, "approve")
+        self.assertEqual(deferred, [("after_merge", "run the probe on the next 20 ticks")])
+        self.assertEqual(converge("block", "s", [("after_merge", "x"), ("edge_case", "y")], 0)[0], "block")
+        self.assertIn('"after_merge"', nexus_reviewer.review_prompt("g", "d", can_read_files=True))
+
     def test_later_block_with_a_real_bug_still_blocks(self):
         self.assertEqual(converge("block", "s", [("edge_case", "rare"), ("regression", "drops check")], 3)[0],
                          "block")
@@ -83,7 +92,7 @@ class ReviewerTests(unittest.TestCase):
 
     def test_the_prompt_asks_for_problem_kinds(self):
         prompt = nexus_reviewer.review_prompt("g", "d", can_read_files=True)
-        for kind in ("task", "bug", "regression", "edge_case", "elsewhere"):
+        for kind in ("task", "bug", "regression", "edge_case", "elsewhere", "after_merge"):
             self.assertIn(f'"{kind}"', prompt)
 
 
