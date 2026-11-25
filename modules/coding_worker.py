@@ -136,7 +136,19 @@ def filtered_env(extra_keys: frozenset[str] | set[str] | tuple[str, ...] = ()) -
     plus the provider's *extra_keys*; application secrets (``AGENT_API_KEY`` and
     friends) are never handed to an external agent."""
     allowed = BASE_ENV_PASSTHROUGH | frozenset(extra_keys)
-    return {key: value for key, value in os.environ.items() if key in allowed}
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    # 2026-11-25: tests the agents run themselves left ~3000 entries a day in
+    # /tmp. Each agent run gets its own TMPDIR below the verification parent,
+    # which the tick prunes after 6 hours (verification_env.prune_test_tmp).
+    try:
+        from modules.verification_env import new_test_tmp_dir
+
+        run_tmp = str(new_test_tmp_dir())
+        for name in ("TMPDIR", "TEMP", "TMP"):
+            env[name] = run_tmp
+    except OSError:
+        pass
+    return env
 
 
 # Progress-aware agent runs (#327): every output line counts as progress, so the
