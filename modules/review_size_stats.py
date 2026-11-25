@@ -45,8 +45,22 @@ SPLIT_GUARD_REASON = (
     "instead of a plain retry"
 )
 
-_REVIEW_BLOCK_PREFIX = "Review by "
+# The adoption reason prefix that marks a paid review block (#396): the merge
+# was stopped by the reviewer, not by a test or a conflict.
+REVIEW_BLOCK_PREFIX = "Review by "
 _MERGED_ADOPTION_STATUSES = ("adopted", "succeeded")
+
+
+def is_review_block(adoption_status: Any, adoption_reason: Any) -> bool:
+    """True when the adoption was stopped by the paid review.
+
+    Judged from the adoption status and reason only, never from a flattened
+    error string: a generic experiment error may quote the same prefix.
+    """
+    return (
+        str(adoption_status or "") == "failed"
+        and str(adoption_reason or "").startswith(REVIEW_BLOCK_PREFIX)
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,13 +106,18 @@ def bucket_of(lines: int) -> str:
 
 
 def verdict_of(status: Any, adoption_status: Any, adoption_reason: Any) -> str:
-    """``merged``, ``review_blocked``, ``needs_review`` or ``other``."""
+    """``merged``, ``review_blocked``, ``needs_review`` or ``other``.
+
+    An experiment that passed verification and was then parked by the adoption
+    (adoption status ``needs_review``) counts as ``needs_review`` too: it stays
+    in the bucket denominator and must not vanish from every share.
+    """
     adoption_status = str(adoption_status or "")
     if adoption_status in _MERGED_ADOPTION_STATUSES:
         return "merged"
-    if adoption_status == "failed" and str(adoption_reason or "").startswith(_REVIEW_BLOCK_PREFIX):
+    if is_review_block(adoption_status, adoption_reason):
         return "review_blocked"
-    if str(status or "") == "needs_review":
+    if str(status or "") == "needs_review" or adoption_status == "needs_review":
         return "needs_review"
     return "other"
 
@@ -201,27 +220,60 @@ def split_guard_reason(blocked_sizes: Iterable[int | None], threshold: int | Non
     )
 
 
-def backfill_diff_sizes(db: Any, repo_root: str) -> dict[str, int]:
-    """Fill the diff size of older rows from branches that still exist.
+def resolve_branch_ref(repo_root: str, branch: str) -> str | None:
+    """The ref a stored branch still exists as, or ``None``.
 
-    Reads ``git diff --numstat <base> <branch>`` in *repo_root* (free, local
-    only). Rows whose branch or base is gone stay ``NULL``.
+    Local branches first, then the ``origin`` remote-tracking ref - the
+    re-verification path recognizes both (#718), so the backfill must too.
+    Local only: no fetch, no network.
+    """
+    branch = str(branch or "").strip()
+    if not branch:
+        return None
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                cwd=repo_root, capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode == 0 and proc.stdout.strip():
+            return ref
+    return None
+
+
+def backfill_diff_sizes(db: Any, repo_root: str) -> dict[str, int]:
+    """Fill the diff size of older *finished* rows from branches that still exist.
+
+    Reads ``git diff --numstat <base> <ref>`` in *repo_root* (free, local
+    only). Only rows that ended (``ended_at`` set) are eligible, so a
+    checkpoint size is never stored before verification completes. Rows
+    whose branch or base is gone stay ``NULL``. The write re-checks
+    eligibility and the stored base and branch, so a concurrent verification
+    of the same row is not overwritten.
     """
     conn, owned = _connect(db)
-    filled = missing = 0
+    filled = missing = skipped = 0
     try:
         try:
             rows = conn.execute(
                 "SELECT id, branch_name, base_commit_sha FROM experiments "
                 "WHERE diff_files IS NULL AND branch_name IS NOT NULL "
-                "AND base_commit_sha IS NOT NULL"
+                "AND base_commit_sha IS NOT NULL AND ended_at IS NOT NULL"
             ).fetchall()
         except sqlite3.OperationalError:
-            return {"filled": 0, "missing": 0}
+            return {"filled": 0, "missing": 0, "skipped": 0}
         for experiment_id, branch, base in rows:
+            branch = str(branch)
+            base = str(base)
+            ref = resolve_branch_ref(repo_root, branch)
+            if ref is None:
+                missing += 1
+                continue
             try:
                 proc = subprocess.run(
-                    ["git", "diff", "--numstat", "--no-color", str(base), str(branch), "--"],
+                    ["git", "diff", "--numstat", "--no-color", base, ref, "--"],
                     cwd=repo_root, capture_output=True, text=True, timeout=60, check=True,
                 )
             except (OSError, subprocess.SubprocessError):
@@ -229,13 +281,17 @@ def backfill_diff_sizes(db: Any, repo_root: str) -> dict[str, int]:
                 continue
             size = parse_numstat(proc.stdout)
             with conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE experiments SET diff_files = ?, diff_added = ?, diff_removed = ? "
-                    "WHERE id = ? AND diff_files IS NULL",
-                    (size.files, size.added, size.removed, experiment_id),
+                    "WHERE id = ? AND diff_files IS NULL AND branch_name = ? "
+                    "AND base_commit_sha = ? AND ended_at IS NOT NULL",
+                    (size.files, size.added, size.removed, experiment_id, branch, base),
                 )
-            filled += 1
+            if cursor.rowcount == 1:
+                filled += 1
+            else:
+                skipped += 1
     finally:
         if owned:
             conn.close()
-    return {"filled": filled, "missing": missing}
+    return {"filled": filled, "missing": missing, "skipped": skipped}
