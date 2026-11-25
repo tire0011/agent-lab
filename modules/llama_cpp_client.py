@@ -70,6 +70,81 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+class _OversizedInt(str):
+    """Marker for a JSON integer literal beyond ``sys.get_int_max_str_digits()``."""
+
+
+def _count_oversized(value: Any) -> int:
+    """How many :class:`_OversizedInt` markers survive in a decoded document."""
+    count = 0
+    stack = [value]
+    while stack:
+        item = stack.pop()
+        if isinstance(item, _OversizedInt):
+            count += 1
+        elif isinstance(item, dict):
+            stack.extend(item.values())
+        elif isinstance(item, list):
+            stack.extend(item)
+    return count
+
+
+def _tolerate_oversized_cache_n(raw: bytes | str, strict_error: ValueError) -> Any:
+    """Second pass after strict decoding of *raw* failed with *strict_error* (#830).
+
+    A JSON integer literal with more digits than ``sys.get_int_max_str_digits()``
+    makes strict decoding raise a plain ValueError. The *same* input (for a
+    response: its original bytes, never ``resp.text``) is parsed again with a
+    marker for such literals. The result is accepted only when the single
+    oversized literal is ``timings.cache_n``, which becomes ``None`` (the counter
+    is unknown); any other oversized literal re-raises *strict_error*, so the
+    rest of the document stays strict. The process-wide conversion limit is
+    never changed.
+    """
+    def parse_int(literal: str) -> Any:
+        try:
+            return int(literal)
+        except ValueError:
+            return _OversizedInt(literal)
+
+    data = json.loads(raw, parse_int=parse_int)
+    timings = data.get("timings") if isinstance(data, dict) else None
+    cache_n = timings.get("cache_n") if isinstance(timings, dict) else None
+    if not isinstance(cache_n, _OversizedInt) or _count_oversized(data) != 1:
+        raise strict_error
+    timings["cache_n"] = None
+    return data
+
+
+def _decode_completion(raw: bytes | str) -> Any:
+    """Decode one chat-completion stream chunk: strict, except an oversized
+    ``timings.cache_n``. Malformed JSON and invalid bytes are never retried."""
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise
+    except ValueError as exc:
+        strict_error = exc
+    return _tolerate_oversized_cache_n(raw, strict_error)
+
+
+def _completion_json(resp: httpx.Response) -> Any:
+    """Decode a non-streamed chat-completion response like :func:`_decode_completion`.
+
+    ``resp.json()`` (``json.loads(resp.content)`` in httpx) stays the strict
+    first pass; only the oversized-integer failure falls back to the original
+    ``resp.content`` bytes. ``JSONDecodeError`` and ``UnicodeDecodeError``
+    propagate unchanged.
+    """
+    try:
+        return resp.json()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise
+    except ValueError as exc:
+        strict_error = exc
+    return _tolerate_oversized_cache_n(resp.content, strict_error)
+
+
 def normalize_timings(timings: Any) -> dict[str, float | int] | None:
     """The ``last_timings`` shape from llama-server's ``timings`` object."""
     if not isinstance(timings, dict):
@@ -229,7 +304,7 @@ class LlamaCppClient:
                 f"llama-cpp server returned HTTP {resp.status_code}: {resp.text[:500]}"
             )
 
-        data = resp.json()
+        data = _completion_json(resp)
         self.last_timings = normalize_timings(data.get("timings") if isinstance(data, dict) else None)
         return data  # type: ignore[no-any-return]
 
@@ -374,7 +449,7 @@ class LlamaCppClient:
                         if raw == "[DONE]":
                             break
                         try:
-                            chunk = json.loads(raw)
+                            chunk = _decode_completion(raw)
                         except json.JSONDecodeError:
                             continue
                         if not isinstance(chunk, dict):
