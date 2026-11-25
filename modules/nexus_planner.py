@@ -426,7 +426,9 @@ def _json_object(raw: str) -> dict[str, Any] | None:
         return None
     try:
         value = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError, or an integer literal beyond sys.get_int_max_str_digits
+        # (#830): either way the answer is not a usable object.
         return None
     return value if isinstance(value, dict) else None
 

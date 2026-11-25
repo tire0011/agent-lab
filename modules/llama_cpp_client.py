@@ -70,6 +70,39 @@ def _number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _parse_int(value: str) -> Any:
+    """``parse_int`` hook for server responses (#830): a JSON integer literal
+    with more digits than ``sys.get_int_max_str_digits()`` (4300 by default)
+    makes the stdlib decoder raise ValueError. Keep such a value as its raw
+    string instead, so one oversized counter (e.g. ``timings.cache_n``) cannot
+    fail an otherwise valid response. The process-wide conversion limit is
+    never changed; numeric guards (``_number``, ``planner_shadow.record``)
+    treat a string as absent."""
+    try:
+        return int(value)
+    except ValueError:
+        return value
+
+
+def _loads(text: str | bytes) -> Any:
+    """``json.loads`` with the oversized-integer-tolerant ``parse_int`` hook."""
+    return json.loads(text, parse_int=_parse_int)
+
+
+def _response_json(resp: httpx.Response) -> Any:
+    """Decode a response body, tolerating oversized JSON integers (#830).
+
+    ``resp.json()`` is tried first; when it raises ValueError the body is
+    re-parsed with :func:`_loads`. Malformed JSON still raises
+    ``JSONDecodeError`` from the re-parse, so only the integer-conversion
+    failure is tolerated.
+    """
+    try:
+        return resp.json()
+    except ValueError:
+        return _loads(resp.text)
+
+
 def normalize_timings(timings: Any) -> dict[str, float | int] | None:
     """The ``last_timings`` shape from llama-server's ``timings`` object."""
     if not isinstance(timings, dict):
@@ -135,8 +168,8 @@ def extract_json(text: str) -> dict[str, Any]:
         )
     raw = text[start:end]
     try:
-        return json.loads(raw)  # type: ignore[no-any-return]
-    except json.JSONDecodeError as exc:
+        return _loads(raw)
+    except ValueError as exc:  # JSONDecodeError, or an oversized integer literal
         raise LlamaCppClientError(
             f"Failed to parse JSON from model output: {exc}\nRaw: {raw[:300]!r}"
         ) from exc
@@ -229,7 +262,7 @@ class LlamaCppClient:
                 f"llama-cpp server returned HTTP {resp.status_code}: {resp.text[:500]}"
             )
 
-        data = resp.json()
+        data = _response_json(resp)
         self.last_timings = normalize_timings(data.get("timings") if isinstance(data, dict) else None)
         return data  # type: ignore[no-any-return]
 
@@ -374,8 +407,8 @@ class LlamaCppClient:
                         if raw == "[DONE]":
                             break
                         try:
-                            chunk = json.loads(raw)
-                        except json.JSONDecodeError:
+                            chunk = _loads(raw)
+                        except ValueError:
                             continue
                         if not isinstance(chunk, dict):
                             continue
@@ -500,7 +533,7 @@ class LlamaCppClient:
             resp = await client.get(f"{self.server_root}/props")
         if resp.status_code != 200:
             raise LlamaCppClientError(f"llama-cpp /props returned HTTP {resp.status_code}")
-        data = resp.json()
+        data = _response_json(resp)
         settings = data.get("default_generation_settings") if isinstance(data, dict) else None
         for source in (settings, data):
             if isinstance(source, dict):
@@ -515,7 +548,7 @@ class LlamaCppClient:
             resp = await client.post(f"{self.server_root}/tokenize", json={"content": text})
         if resp.status_code != 200:
             raise LlamaCppClientError(f"llama-cpp /tokenize returned HTTP {resp.status_code}")
-        tokens = resp.json().get("tokens")
+        tokens = _response_json(resp).get("tokens")
         if not isinstance(tokens, list):
             raise LlamaCppClientError("llama-cpp /tokenize returned no token list")
         return tokens
@@ -545,7 +578,7 @@ class LlamaCppClient:
         if resp.status_code != 200:
             return None
         try:
-            data = resp.json()
+            data = _response_json(resp)
         except ValueError:
             return None
         if not isinstance(data, list):
