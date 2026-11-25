@@ -115,7 +115,10 @@ def _exhausted_section(exhausted: list[dict[str, Any]] | None) -> str:
     if not exhausted:
         return ""
     lines = [
-        f"#{i['number']} {i['title']}: {' '.join(str(i['last_reason']).split())[:_REASON_CHARS]}"
+        f"#{i['number']} {i['title']}"
+        # #821: two large review-blocked attempts; this one is marked for a split.
+        + (" [split required]" if i.get("split_guard") else "")
+        + f": {' '.join(str(i['last_reason']).split())[:_REASON_CHARS]}"
         for i in exhausted
     ]
     return (

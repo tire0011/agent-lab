@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger("modules.experiment_service")
+
 from modules.central_logging import ExperimentLogger, sanitize_command
 from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
+from modules.review_size_stats import DiffSize, parse_numstat
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
 from modules import timing_check as timing_check_module
@@ -32,6 +37,7 @@ from ..models import (
     STATUS_NEEDS_REVIEW,
     STATUS_SUCCEEDED,
     STATUS_TIMED_OUT,
+    STATUS_VERIFYING,
 )
 from ..text_utils import _truncate_text, _utcnow_iso
 from ..whitespace_fix import diff_check_report, fix_whitespace
@@ -437,6 +443,85 @@ class VerificationMixin:
             report = diff_check_report(check)
             return stat.stdout, diff.stdout, report
 
+    def _verification_numstat(
+        self, experiment_id: str, worktree_path: str, elog: ExperimentLogger,
+    ) -> DiffSize | None:
+        """``git diff --numstat <base>`` of the staged worktree (#821); free.
+
+        Staged in a throwaway index like :meth:`_verification_diff`, so new
+        files count too. ``None`` (stored as NULL) when it cannot be measured;
+        the size never changes a verdict.
+        """
+        base = self.get_experiment(experiment_id).base_commit_sha or "HEAD"
+        try:
+            with tempfile.TemporaryDirectory(prefix="experiment-git-index-") as index_dir:
+                index_env = dict(os.environ)
+                index_env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
+
+                def git(args: list[str]) -> subprocess.CompletedProcess:
+                    return _run_git(
+                        args, cwd=worktree_path, env=index_env, elog=elog, phase="verifying",
+                    )
+
+                git(["read-tree", "HEAD"]).check_returncode()
+                git(["add", "-A"]).check_returncode()
+                proc = git(["diff", "--cached", "--numstat", "--no-color", base])
+                proc.check_returncode()
+                size = parse_numstat(str(proc.stdout or ""))
+        except Exception as exc:  # noqa: BLE001 - a missing size is NULL, never a verdict
+            elog.warning(
+                "verifying", "diff_numstat_failed",
+                "Could not measure the diff size with git diff --numstat", exc=exc,
+            )
+            return None
+        elog.info(
+            "verifying", "diff_numstat_recorded",
+            f"Diff against {base[:12]}: {size.files} file(s), +{size.added} -{size.removed}",
+            diff_files=size.files, diff_added=size.added, diff_removed=size.removed,
+        )
+        return size
+
+    def _store_diff_size(self, experiment_id: str, size: DiffSize | None) -> None:
+        """Persist the measured diff size of the running verification (#821).
+
+        All three values are written together, immediately after staging, so
+        a monitored test that raises or an external stop afterwards cannot
+        lose the measurement. The UPDATE is guarded by the still-active
+        verification state, so a stale pipeline thread can never overwrite
+        the evidence of a newer attempt. ``None`` stores NULL (unmeasured).
+        """
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "UPDATE experiments SET diff_files = ?, diff_added = ?, diff_removed = ? "
+                    "WHERE id = ? AND status = ?",
+                    (
+                        size.files if size is not None else None,
+                        size.added if size is not None else None,
+                        size.removed if size is not None else None,
+                        experiment_id,
+                        STATUS_VERIFYING,
+                    ),
+                )
+        except sqlite3.Error as exc:  # noqa: BLE001 - a missing size is NULL, never a verdict
+            logger.warning("experiment %s: could not store the diff size: %s", experiment_id, exc)
+
+    def _clear_diff_size(self, experiment_id: str) -> None:
+        """Drop a stale size when a new verification starts (#821).
+
+        Same guard as :meth:`_store_diff_size`: a repair iteration or a fresh
+        run never keeps the previous attempt's numbers.
+        """
+        try:
+            with self._lock, self._conn:
+                self._conn.execute(
+                    "UPDATE experiments SET diff_files = NULL, diff_added = NULL, "
+                    "diff_removed = NULL WHERE id = ? AND status = ?",
+                    (experiment_id, STATUS_VERIFYING),
+                )
+        except sqlite3.Error as exc:  # noqa: BLE001 - the next measurement overwrites anyway
+            logger.warning("experiment %s: could not clear the diff size: %s", experiment_id, exc)
+
     def _autofix_diff_check_whitespace(
         self,
         worktree_path: str,
@@ -486,6 +571,9 @@ class VerificationMixin:
     ) -> Experiment:
         if elog is None:
             elog = self.get_experiment_logger(experiment_id)
+        # #821: a new verification starts from no size; the measurement below
+        # stores its own values immediately after staging.
+        self._clear_diff_size(experiment_id)
         if github_work_tracking is not None:
             try:
                 ref = github_work_tracking.checkpoint_experiment(
@@ -579,6 +667,17 @@ class VerificationMixin:
             if refreshed_diff is not None:
                 diff_stat, full_diff = refreshed_diff
         diff_text = _truncate_text(full_diff, self.max_diff_bytes, label="diff")
+        # #821: the size of the final staged diff, next to the later review verdict.
+        diff_size = self._verification_numstat(experiment_id, worktree_path, elog)
+        # Persisted right away, all three values together: a monitored test or
+        # timing check that raises, or an external stop, must not lose it.
+        self._store_diff_size(experiment_id, diff_size)
+        # NULL when unmeasured, so a repair iteration never keeps an older size.
+        diff_size_fields = {
+            "diff_files": diff_size.files if diff_size is not None else None,
+            "diff_added": diff_size.added if diff_size is not None else None,
+            "diff_removed": diff_size.removed if diff_size is not None else None,
+        }
 
         test_command_key = _DEFAULT_TEST_COMMAND_KEY
         test_command_template = self.test_command or _TEST_COMMANDS.get(test_command_key)
@@ -601,6 +700,7 @@ class VerificationMixin:
                 diff_stat=diff_stat,
                 diff_text=diff_text,
                 error="no safe test command could be determined for this worktree",
+                **diff_size_fields,
             )
             return self.get_experiment(experiment_id)
 
@@ -890,6 +990,7 @@ class VerificationMixin:
                 json.dumps(baseline_classifications)
                 if baseline_classifications is not None else None
             ),
+            **diff_size_fields,
         )
         if github_work_tracking is not None:
             try:

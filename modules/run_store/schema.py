@@ -501,6 +501,11 @@ _EXPERIMENTS_ADDITIVE_COLUMNS = [
     # The marked MODEL-WRITTEN TESTS block handed to the paid coder (#636), so the
     # reviewer sees the same suggestion; NULL when no generated tests were handed over.
     ("model_written_tests", "TEXT"),
+    # Size of the verified diff, `git diff --numstat <base>` (#821); NULL for
+    # rows verified before the columns existed and not back-filled yet.
+    ("diff_files", "INTEGER"),
+    ("diff_added", "INTEGER"),
+    ("diff_removed", "INTEGER"),
 ]
 
 # Same additive treatment for ``codex_tasks``: the table predates the second

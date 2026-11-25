@@ -167,6 +167,10 @@ class Experiment:
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
     baseline_test_classifications: dict[str, str] | None = None
+    # `git diff --numstat <base>` of the verified worktree (#821).
+    diff_files: int | None = None
+    diff_added: int | None = None
+    diff_removed: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -227,6 +231,9 @@ class Experiment:
             "policy_rule": self.policy_rule,
             "quality_evaluation": self.quality_evaluation,
             "baseline_test_classifications": self.baseline_test_classifications,
+            "diff_files": self.diff_files,
+            "diff_added": self.diff_added,
+            "diff_removed": self.diff_removed,
         }
 
 
@@ -303,6 +310,9 @@ def _row_to_experiment(row: sqlite3.Row) -> Experiment:
             _json_or_none(row["baseline_test_classifications_json"])
             if "baseline_test_classifications_json" in row.keys() else None
         ),
+        diff_files=row["diff_files"] if "diff_files" in row.keys() else None,
+        diff_added=row["diff_added"] if "diff_added" in row.keys() else None,
+        diff_removed=row["diff_removed"] if "diff_removed" in row.keys() else None,
     )
 
 

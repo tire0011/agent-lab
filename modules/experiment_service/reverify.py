@@ -25,6 +25,7 @@ _EVIDENCE_COLUMNS = (
     "test_command_json", "test_exit_code", "test_output", "git_status",
     "diff_stat", "diff_text", "quality_evaluation_json", "failure_phase",
     "failure_type", "baseline_test_classifications_json",
+    "diff_files", "diff_added", "diff_removed",
 )
 # Verdicts that did not really run the branch; they do not count toward the
 # per-job limit, so closed issues can never starve open ones.

@@ -10,7 +10,7 @@ from models import (
     PublicExperimentSummary,
     ReflectionsResponse,
 )
-from modules import experiment_reflection, local_shadow_replay, planner_shadow
+from modules import experiment_reflection, local_shadow_replay, planner_shadow, review_size_stats
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -36,6 +36,8 @@ LOCAL_REPLAYS_DEFAULT_LIMIT = 20
 LOCAL_REPLAYS_MAX_LIMIT = 200
 PLANNER_SHADOW_DEFAULT_LIMIT = 20
 PLANNER_SHADOW_MAX_LIMIT = 200
+REVIEW_SIZE_STATS_DEFAULT_DAYS = 30
+REVIEW_SIZE_STATS_MAX_DAYS = 365
 
 
 # Experiment and activity log endpoints: thin routes over the existing
@@ -179,6 +181,17 @@ def list_planner_shadow(
         if row.get("error"):
             row["error"] = redaction.redact(str(row["error"]))
     return payload
+
+
+@router.get("/review-size-stats")
+def get_review_size_stats(
+    x_api_key: str | None = Header(default=None),
+    days: int = Query(default=REVIEW_SIZE_STATS_DEFAULT_DAYS, ge=1, le=REVIEW_SIZE_STATS_MAX_DAYS),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> dict:
+    """Finished experiments by changed lines with their merge/review shares (#821)."""
+    api.authorize(x_api_key)
+    return review_size_stats.size_vs_verdict(_reflection_db_path(service), days)
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)

@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from modules import github_authorization
 from modules import issue_approvals
+from modules import review_size_stats
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
@@ -321,6 +322,8 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues: list[dict[str, Any]] = []
+        self._exhausted_bodies: dict[int, str] = {}
+        self._exhausted_trust: dict[int, bool] = {}
         self._planner_called = False
         self._current_tick_id: str | None = None
         if daily_budget is None:
@@ -683,7 +686,8 @@ class NexusInitiativeService:
         self._open_proposals = 0
         self._open_proposal_titles: list[str] = []
         self._exhausted_issues = []
-        self._exhausted_bodies: dict[int, str] = {}
+        self._exhausted_bodies = {}
+        self._exhausted_trust = {}
         unapproved_skips = self._unapproved_issue_skips()
         for issue in issues:
             number = issue.get("number")
@@ -701,7 +705,13 @@ class NexusInitiativeService:
                 continue
             if number is None or int(number) in linked:
                 if number is not None and int(number) in exhausted:
-                    self._note_exhausted(issue, exhausted[int(number)], reported, record=record_skips)
+                    attempts = exhausted[int(number)]
+                    if attempts.get("split_guard") and not self._issue_execution_allowed(issue):
+                        # #821 review: an approval revoked or invalidated by an
+                        # edit is not offered for a split; the issue is shown
+                        # as plainly out of attempts instead.
+                        attempts = {**attempts, "split_guard": False}
+                    self._note_exhausted(issue, attempts, reported, record=record_skips)
                 continue
             if int(number) in looping:
                 self._note_loop_guard(issue, looping[int(number)], record=record_skips)
@@ -755,6 +765,11 @@ class NexusInitiativeService:
             if self._fails_goal_policy(candidate, skipped, policy_hash, record=record_skips):
                 continue
             candidates.append(candidate)
+        if record_skips:
+            # Heal a split whose creation was interrupted (#821 review); the
+            # exhausted entries above hold the parents' text for the
+            # approval re-check inside _split_issue.
+            self._resume_incomplete_splits()
         return candidates
 
     def _comment_waiting_for_approval(self, number: int, reason: str) -> None:
@@ -782,6 +797,34 @@ class NexusInitiativeService:
         except sqlite3.OperationalError:
             return set()
         return {str(row["source_ref"]) for row in rows}
+
+    def _issue_author_trusted(self, issue: dict[str, Any]) -> bool:
+        author_login = github_authorization.api_actor_login(issue.get("author"))
+        return github_authorization.is_trusted_actor(author_login)
+
+    def _issue_execution_allowed(self, issue: dict[str, Any]) -> bool:
+        """The current approval verdict for one listed issue; fails closed.
+
+        Used before a split-guarded issue is offered to the planner and again
+        before its children are created (#821 review).
+        """
+        try:
+            number = int(issue.get("number"))
+        except (TypeError, ValueError):
+            return False
+        trusted = self._issue_author_trusted(issue)
+        verdict = issue_approvals.check_execution(
+            self._conn,
+            repository=self._repository,
+            issue_number=number,
+            title=str(issue.get("title") or f"Issue #{number}"),
+            body=str(issue.get("body") or ""),
+            skip_content_hash=trusted,
+            trusted_author=trusted,
+        )
+        if not verdict.allowed:
+            logger.info("initiative: issue #%s approval check failed: %s", number, verdict.reason)
+        return verdict.allowed
 
     def _execution_allowed(self, candidate: Candidate) -> issue_approvals.ExecutionVerdict:
         """Re-check one issue's approval against the snapshot taken this tick.
@@ -868,7 +911,7 @@ class NexusInitiativeService:
                 number = int(row["issue_number"])
             except (TypeError, ValueError):
                 continue
-            latest[number] = row["status"] == "failed" and str(row["reason"] or "").startswith("Review by ")
+            latest[number] = review_size_stats.is_review_block(row["status"], row["reason"])
         return {number for number, blocked in latest.items() if blocked}
 
     def _goal_policy_skips(self) -> set[tuple[str, str, str]]:
@@ -955,10 +998,13 @@ class NexusInitiativeService:
         """
         ref = str(issue["number"])
         title = str(issue.get("title") or f"Issue #{ref}")[:200]
-        self._exhausted_issues.append(
-            {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
-        )
+        entry = {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
+        if attempts.get("split_guard"):
+            entry["split_guard"] = True
+        self._exhausted_issues.append(entry)
         self._exhausted_bodies[int(ref)] = str(issue.get("body") or "")
+        # Kept for the approval re-check before any split child is created.
+        self._exhausted_trust[int(ref)] = self._issue_author_trusted(issue)
         if not record:
             return
         key = (ref, tuple(attempts["experiment_ids"]))
@@ -976,7 +1022,9 @@ class NexusInitiativeService:
                 )
             )
             reported[key] = (tick_id, detail)
-        if detail.get("commented") or self._issue_commenter is None:
+        # The split guard (#821) makes no GitHub writes of its own: the planner
+        # splits the issue through the existing mechanism, which comments then.
+        if detail.get("commented") or self._issue_commenter is None or attempts.get("split_guard"):
             return
         if attempts.get("pipeline_crash"):
             stop = f"Nexus paused this issue: its own pipeline crashed {_MAX_ISSUE_ATTEMPTS} times or more."
@@ -1018,6 +1066,10 @@ class NexusInitiativeService:
         """
         # issue -> experiment -> (when, why it failed)
         failed: dict[int, dict[str, tuple[str, str]]] = {}
+        # issue -> experiment ids whose adoption the paid review blocked
+        # (adoption status "failed" with a "Review by " reason, never a
+        # flattened error string that merely quotes the prefix)
+        review_blocked: dict[int, set[str]] = {}
         # issues with an adoption stopped by a merge conflict; exactly one
         # such stop, the newest, is left out of the count
         conflicted: set[int] = set()
@@ -1071,6 +1123,8 @@ class NexusInitiativeService:
                         str(row["created_at"] or row["ended_at"] or ""),
                         str(first or second or ""),
                     )
+                    if review_size_stats.is_review_block(row["adoption_status"], row["adoption_reason"]):
+                        review_blocked.setdefault(number, set()).add(str(row["experiment_id"]))
                     if merge_stopped and _is_integration_conflict(
                         row["adoption_status"], row["adoption_reason"]
                     ):
@@ -1085,7 +1139,7 @@ class NexusInitiativeService:
         limit = {
             number: (
                 _MAX_REVIEW_BLOCKED_ATTEMPTS
-                if all(why.startswith("Review by ") for _, why in attempts.values())
+                if all(exp_id in review_blocked.get(number, ()) for exp_id in attempts)
                 else _MAX_ISSUE_ATTEMPTS
             )
             for number, attempts in failed.items()
@@ -1098,7 +1152,24 @@ class NexusInitiativeService:
             for number, attempts in failed.items()
             if counted[number] >= limit[number] and number not in blocked
         }
+        # #821: two review-blocked attempts that were both large are not
+        # retried a third time; the issue goes to the planner to be split.
+        # This runs before the ordinary cap blocks the issue, so an older
+        # third block that already filled the cap still gets the split reason;
+        # active or successfully completed work keeps its plain block.
+        for number, attempts in failed.items():
+            if number in blocked:
+                continue
+            reason = self._split_guard_reason(attempts, review_blocked.get(number, set()))
+            if reason is None:
+                continue
+            exhausted[number] = {
+                "experiment_ids": sorted(attempts),
+                "last_reason": reason,
+                "split_guard": True,
+            }
         blocked.update(n for n, count in counted.items() if count >= limit[n])
+        blocked.update(exhausted)
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():
@@ -1113,6 +1184,41 @@ class NexusInitiativeService:
                 }
             blocked.add(number)
         return blocked, exhausted
+
+    def _split_guard_reason(
+        self, attempts: dict[str, tuple[str, str]], blocked_ids: set[str]
+    ) -> str | None:
+        """The split reason when the newest review blocks were all large (#821).
+
+        *blocked_ids* are the experiments whose adoption the paid review
+        blocked (adoption status and reason), so a generic experiment error
+        that quotes the review prefix never counts.
+        """
+        reviewed = sorted(
+            (when, experiment_id) for experiment_id, (when, why) in attempts.items()
+            if experiment_id in blocked_ids
+        )
+        if len(reviewed) < review_size_stats.SPLIT_GUARD_ATTEMPTS:
+            return None
+        ids = [experiment_id for _, experiment_id in reviewed]
+        try:
+            rows = self._conn.execute(
+                f"SELECT id, diff_added, diff_removed FROM experiments "
+                f"WHERE id IN ({', '.join('?' for _ in ids)})",
+                ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return None  # no size columns yet: nothing to judge by
+        stored = {
+            str(row[0]): (int(row[1]) + int(row[2]))
+            if row[1] is not None and row[2] is not None else None
+            for row in rows
+        }
+        sizes = [stored.get(experiment_id) for experiment_id in ids]
+        threshold = review_size_stats.split_diff_lines()
+        if not review_size_stats.split_guard_applies(sizes, threshold):
+            return None
+        return review_size_stats.split_guard_reason(sizes, threshold)
 
     def _loop_guarded_issues(self) -> dict[int, dict[str, Any]]:
         """Issues stopped by the loop guard (#753): ``issue -> detail``.
@@ -1560,14 +1666,91 @@ class NexusInitiativeService:
                 continue
         return found
 
+    @staticmethod
+    def _split_plan(detail: dict[str, Any]) -> list[tuple[str, str]] | None:
+        """The stored parts of a recorded split, or ``None`` when it has none."""
+        plan = detail.get("plan")
+        if not isinstance(plan, list):
+            return None
+        cleaned = [
+            (str(part["title"]), str(part["body"]))
+            for part in plan
+            if isinstance(part, dict) and part.get("title") and part.get("body")
+        ]
+        return cleaned or None
+
+    def _split_parent_approved(self, parent: int, issues: list[Candidate]) -> bool:
+        """Re-check the parent's current approval before children are created.
+
+        #821 review: an approval revoked or invalidated by an edit since the
+        split was offered must not produce runnable child issues. Fails closed.
+        """
+        for candidate in issues:
+            if int(candidate.ref) == parent:
+                verdict = issue_approvals.check_execution(
+                    self._conn,
+                    repository=self._repository,
+                    issue_number=parent,
+                    title=str(candidate.payload.get("raw_title") or candidate.title),
+                    body=str(candidate.payload.get("raw_body") or candidate.payload.get("body") or ""),
+                    skip_content_hash=bool(candidate.payload.get("author_trusted")),
+                    trusted_author=bool(candidate.payload.get("author_trusted")),
+                )
+                if not verdict.allowed:
+                    logger.info("initiative: not splitting #%s: %s", parent, verdict.reason)
+                return verdict.allowed
+        entry = next(
+            (e for e in getattr(self, "_exhausted_issues", [])
+             if int(e.get("number")) == parent),
+            None,
+        )
+        body = getattr(self, "_exhausted_bodies", {}).get(parent, "")
+        if entry is None and not body:
+            logger.info(
+                "initiative: not splitting #%s: no issue text to re-check the approval against",
+                parent,
+            )
+            return False
+        title = str(entry.get("title") or f"Issue #{parent}") if entry else f"Issue #{parent}"
+        trusted = bool(getattr(self, "_exhausted_trust", {}).get(parent, False))
+        verdict = issue_approvals.check_execution(
+            self._conn,
+            repository=self._repository,
+            issue_number=parent,
+            title=title,
+            body=body,
+            skip_content_hash=trusted,
+            trusted_author=trusted,
+        )
+        if not verdict.allowed:
+            logger.info("initiative: not splitting #%s: %s", parent, verdict.reason)
+        return verdict.allowed
+
     def _split_issue(self, parent: int, parts: list[tuple[str, str]], reason: str,
                      issues: list[Candidate]) -> None:
         """Open the parts as issues of their own and note the split on the parent.
 
         The parts are Nexus' own issues, so they need no new approval; the
-        parent was approved already. One level of splitting a part is allowed.
+        parent's current approval is re-checked before any child is created.
+        One level of splitting a part is allowed. The record is updated after
+        every created part, so an interrupted split resumes on a later tick
+        without duplicating the parts that were already created (#821 review).
         """
-        if self._issue_creator is None or parent in self._splits():
+        if self._issue_creator is None:
+            return
+        existing = self._splits().get(parent)
+        if existing is not None:
+            tick_id, detail = existing
+            plan = self._split_plan(detail)
+            if plan is None:
+                return  # a record without a stored plan cannot resume safely
+        else:
+            tick_id, detail = uuid.uuid4().hex, {}
+            plan = [(str(title), str(text)) for title, text in parts]
+        if not plan:
+            return
+        # Re-check the parent's approval before creating (more) children.
+        if not self._split_parent_approved(parent, issues):
             return
         body = next((str(c.payload.get("body") or "") for c in issues if int(c.ref) == parent), None)
         if body is None:
@@ -1576,28 +1759,47 @@ class NexusInitiativeService:
         if depth >= _MAX_SPLIT_DEPTH:
             logger.info("initiative: #%s is already a part of a part; not split again", parent)
             return
-        children: list[int] = []
-        for index, (title, text) in enumerate(parts, 1):
+        children = [int(n) for n in detail.get("children") or []]
+        for index in range(len(children), len(plan)):
+            title, text = plan[index]
             try:
                 number = self._issue_creator(
                     title,
-                    f"{text}\n\n---\nPart {index} of {len(parts)} of #{parent}, split by the "
+                    f"{text}\n\n---\nPart {index + 1} of {len(plan)} of #{parent}, split by the "
                     f"Nexus planning step: {reason}\n{_SPLIT_MARKER.format(depth=depth + 1)}",
                 )
             except Exception as exc:  # noqa: BLE001 - the parts made so far stay
-                logger.warning("initiative: could not open part %s of #%s: %s", index, parent, exc)
+                logger.warning("initiative: could not open part %s of #%s: %s", index + 1, parent, exc)
                 break
-            if number:
-                children.append(int(number))
+            if not number:
+                continue
+            children.append(int(number))
+            detail.update({
+                "children": children,
+                "parts": len(plan),
+                "plan": [{"title": t, "body": b} for t, b in plan],
+                "reason": reason,
+                "closed": False,
+            })
+            # Persist after every single child: a crash mid-loop keeps the
+            # progress and the next tick creates only the missing parts.
+            self._record(InitiativeDecision(
+                DECISION_SPLIT,
+                candidate=Candidate(KIND_ISSUE, str(parent), "", reason),
+                detail=json.dumps(detail),
+                tick_id=tick_id,
+            ), update=existing is not None)
         if not children:
             return
-        tick_id = uuid.uuid4().hex
+        if len(children) < len(plan) or detail.get("commented"):
+            return  # partial or already announced; the resume finishes it
+        detail["commented"] = True
         self._record(InitiativeDecision(
             DECISION_SPLIT,
             candidate=Candidate(KIND_ISSUE, str(parent), "", reason),
-            detail=json.dumps({"children": children, "closed": False}),
+            detail=json.dumps(detail),
             tick_id=tick_id,
-        ))
+        ), update=True)
         if self._issue_commenter is not None:
             try:
                 self._issue_commenter(
@@ -1605,17 +1807,43 @@ class NexusInitiativeService:
                     f"Nexus split this issue into {', '.join(f'#{n}' for n in children)}: {reason}\n\n"
                     "It closes this issue once all parts are closed.",
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001 - tried again on resume
                 logger.warning("initiative: split comment failed for #%s: %s", parent, exc)
 
+    def _resume_incomplete_splits(self) -> None:
+        """Create the parts an interrupted split did not finish (#821 review).
+
+        Runs once per tick next to the closing pass, so a crash between two
+        child creations is healed even when the planner does not pick the
+        split again; already created parts are never created twice.
+        """
+        if self._issue_creator is None:
+            return
+        for parent, (_tick_id, detail) in self._splits().items():
+            plan = self._split_plan(detail)
+            if plan is None or detail.get("closed"):
+                continue
+            children = [int(n) for n in detail.get("children") or []]
+            if len(children) >= len(plan):
+                continue
+            logger.info(
+                "initiative: resuming interrupted split of #%s (%d of %d parts created)",
+                parent, len(children), len(plan),
+            )
+            self._split_issue(parent, plan, str(detail.get("reason") or "split"), [])
+
     def _close_finished_splits(self, open_numbers: set[int]) -> None:
-        """Close a split issue once none of its parts is open any more."""
+        """Close a split issue once the whole split exists and no part is open."""
         if self._issue_closer is None or not open_numbers:
             return
         for parent, (tick_id, detail) in self._splits().items():
             children = [int(n) for n in detail.get("children") or []]
+            plan = self._split_plan(detail)
+            parts = len(plan) if plan is not None else len(children)
             if detail.get("closed") or parent not in open_numbers or not children:
                 continue
+            if len(children) < parts:
+                continue  # the split is not fully created yet (#821 review)
             if any(n in open_numbers for n in children):
                 continue
             try:
