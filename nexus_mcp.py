@@ -406,6 +406,20 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
         value = 50 if limit is None else _validate_limit(limit, minimum=1, maximum=200)
         return {"reverifications": list_reverifications(_api()._resolve_experiment_service(), value)}
 
+    @mcp.tool(
+        description="Tests main already has that fail under the timing check's clock drift "
+        "on the base commit too (#725): count, first commit, issue.",
+        structured_output=True,
+    )
+    def known_drift_tests_list(limit: int | None = None) -> dict[str, Any]:
+        from modules.known_drift_tests import list_known_drift
+
+        value = 50 if limit is None else _validate_limit(limit, minimum=1, maximum=200)
+        service = _api()._resolve_experiment_service()
+        with service._lock:
+            rows = list_known_drift(service._conn, value)
+        return {"known_drift_tests": rows, "count": len(rows)}
+
     @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
     def experiment_get(experiment_id: str) -> dict[str, Any]:
         nexus_api = _api()

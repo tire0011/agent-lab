@@ -259,6 +259,7 @@ class OperationsRegistry:
             "experiment_reflection": OperationSpec("experiment_reflection", "Gespeicherte Reflexion (Verbesserungsvorschläge) zu einem Experiment.", [experiment_id], ["experiment", "reflection", "suggestions", "lessons", "ideas"], mutates_state=False),
             "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
             "local_replays_list": OperationSpec("local_replays_list", "Lokale Shadow-Replays gemergter Experimente mit lokaler Test-Passrate je Prompt-Variante.", [limit10], ["local", "replay", "benchmark", "pass rate", "variant", "local model"], mutates_state=False),
+            "known_drift_tests_list": OperationSpec("known_drift_tests_list", "Tests auf main, die unter der Uhr-Drift des Timing-Checks auch auf dem Basis-Commit fehlschlagen (#725), mit Zähler und Issue.", [limit10], ["timing", "drift", "clock", "known drift", "flaky", "test"], mutates_state=False),
             "reverifications_list": OperationSpec("reverifications_list", "Neueste kostenlose Re-Verifikationen geparkter Experimente.", [limit10], ["experiment", "reverification", "parked", "timing", "ready"], mutates_state=False),
             "measurement_health": OperationSpec(
                 "measurement_health", "Status der lokalen Messpipelines und wiederholte Fehler.",
@@ -717,6 +718,25 @@ class OperationsRegistry:
         for stored in list_reflections(limit, db_path=self.db_path):
             lines.extend(self._reflection_lines(stored))
         return OperationResult("reflections_list", True, lines or ["(no reflections stored)"], 0)
+
+    def _op_known_drift_tests_list(self, args: dict[str, Any]) -> OperationResult:
+        from modules.known_drift_tests import list_known_drift
+
+        limit = self._limit(args, default=10, maximum=200)
+        conn = init_db(self.db_path)
+        try:
+            rows = list_known_drift(conn, limit)
+        finally:
+            conn.close()
+        lines = [
+            redact(
+                f"{row['test_id']}: seen {row['count']}x, first on "
+                f"{str(row['first_seen_commit'])[:12]}, last {row['last_seen_at']}, issue "
+                + (f"#{row['issue_number']}" if row.get("issue_number") else "-")
+            )[:500]
+            for row in rows
+        ]
+        return OperationResult("known_drift_tests_list", True, lines or ["(no known drift tests stored)"], 0)
 
     def _op_reverifications_list(self, args: dict[str, Any]) -> OperationResult:
         from modules.run_store import init_db
