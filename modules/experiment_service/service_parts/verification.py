@@ -59,6 +59,8 @@ TIMING_CHECK_ENV_VAR = "NEXUS_TIMING_CHECK"
 TIMING_CHECK_HINT = (
     "inject the clock or compute the value from configured values, not from wall time"
 )
+# #725: every flagged test fails under the same drift on the base commit too.
+TIMING_VERDICT_KNOWN_DRIFT = "passed_with_known_drift"
 
 
 def timing_check_enabled() -> bool:
@@ -292,6 +294,7 @@ class VerificationMixin:
     def _run_timing_check(
         self, experiment_id: str, worktree_path: str, head_diff: str,
         elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None,
+        github_work_tracking: Any | None = None,
     ) -> tuple[str, str] | None:
         """Slow-machine check (#689): rerun the affected tests with clock drift.
 
@@ -299,7 +302,11 @@ class VerificationMixin:
         A flagged test fails verification with a hint for the retry; anything
         without a verdict (a check error, a crash, an interruption) is
         ``needs_review`` - an enabled check that could not run never approves.
+        A flagged test that fails under the same drift on the base commit too
+        (#725) is known drift, not this change's fault: when all flagged tests
+        are, the verdict is ``passed_with_known_drift`` and the change proceeds.
         """
+        drift_env: dict[str, str] | None = None
         if not timing_check_enabled():
             elog.info(
                 "verifying", "timing_check_skipped",
@@ -331,9 +338,11 @@ class VerificationMixin:
                 self._track_process(experiment_id, process)
 
             options = {"watchdog": watchdog, "run_id": f"{experiment_id}-timing"} if watchdog else {}
+            # One drift environment for the branch run and the base rerun (#725).
+            drift_env = timing_check_module.drift_env()
             result = timing_check_module.run_timing_check(
                 worktree_path, tests, on_process=track, python=self.test_python_executable,
-                tails=drift_tails, **options,
+                tails=drift_tails, env=drift_env, **options,
             )
             control = None
             flagged = timing_check_module.flagged_tests(result)
@@ -361,6 +370,22 @@ class VerificationMixin:
         if control is not None:
             drift_only, fails_without_drift = control
             if drift_only:
+                base = self._timing_base_drift(
+                    experiment_id, worktree_path, drift_only, drift_env, drift_tails, elog,
+                    watchdog=watchdog, github_work_tracking=github_work_tracking,
+                )
+                if base is not None:
+                    regressed, base_drift = base
+                    if not regressed:
+                        elog.warning(
+                            "verifying", "timing_check_passed_with_known_drift",
+                            "Every flagged test fails under the same drift on the base "
+                            "commit too; the change did not cause it",
+                            verdict=TIMING_VERDICT_KNOWN_DRIFT, known_drift_tests=base_drift,
+                            tails={t: drift_tails[t] for t in base_drift if t in drift_tails},
+                        )
+                        return None
+                    drift_only = regressed
                 error = (
                     f"{timing_check_module.TIMING_SENSITIVE_PREFIX}{', '.join(drift_only)}"
                     f"; hint: {TIMING_CHECK_HINT}"
@@ -386,6 +411,113 @@ class VerificationMixin:
         error = f"timing check failed closed: {result}"
         elog.warning("verifying", "timing_check_failed_closed", error, tails=tails)
         return STATUS_NEEDS_REVIEW, error
+
+
+    def _timing_base_drift(
+        self, experiment_id: str, worktree_path: str, flagged: list[str],
+        drift_env: dict[str, str] | None, drift_tails: dict[str, str],
+        elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None,
+        github_work_tracking: Any | None = None,
+    ) -> tuple[list[str], list[str]] | None:
+        """``(regressed, base_drift)`` against the base commit (#725), else None.
+
+        None (no base commit, no verdict, a crash) keeps the flag a failure -
+        the old fail-closed behaviour. Base-drift tests are stored in
+        ``known_drift_tests`` whatever the verdict for the others.
+        """
+        base_commit = self.get_experiment(experiment_id).base_commit_sha
+        if not base_commit or drift_env is None:
+            elog.info(
+                "verifying", "timing_base_check_skipped",
+                "Experiment has no recorded base commit", reason="no_base_commit",
+            )
+            return None
+        options: dict[str, Any] = (
+            {"watchdog": watchdog, "run_id": f"{experiment_id}-timing-base"} if watchdog else {}
+        )
+        try:
+            base = timing_check_module.base_drift_check(
+                base_commit, worktree_path, flagged, drift_env,
+                python=self.test_python_executable,
+                on_process=lambda process: self._track_process(experiment_id, process),
+                **options,
+            )
+        except HungTest:
+            raise
+        except Exception as exc:  # noqa: BLE001 - no base verdict keeps the failure
+            elog.error(
+                "verifying", "timing_base_check_failed",
+                "Could not rerun the flagged tests on the base commit", exc=exc,
+            )
+            return None
+        if base is None:
+            elog.warning(
+                "verifying", "timing_base_check_failed",
+                "The drift rerun on the base commit gave no verdict", base_commit=base_commit,
+            )
+            return None
+        regressed, base_drift = base
+        elog.info(
+            "verifying", "timing_base_check_classified",
+            "Classified flagged tests against the base commit under the same drift",
+            base_commit=base_commit, regressed=regressed, base_drift=base_drift,
+        )
+        if base_drift:
+            try:
+                self._remember_known_drift(
+                    experiment_id, base_commit, base_drift, drift_tails, elog,
+                    github_work_tracking=github_work_tracking,
+                )
+            except Exception as exc:  # noqa: BLE001 - bookkeeping never changes the verdict
+                elog.error(
+                    "verifying", "known_drift_record_failed",
+                    "Could not store the known drift tests", exc=exc,
+                )
+        return regressed, base_drift
+
+
+    def _remember_known_drift(
+        self, experiment_id: str, base_commit: str, test_ids: list[str],
+        drift_tails: dict[str, str], elog: ExperimentLogger, *,
+        github_work_tracking: Any | None = None,
+    ) -> None:
+        """Count each sighting; a test without an issue yet gets exactly one."""
+        from modules import known_drift_tests
+        from modules.redaction import redact
+
+        now = _utcnow_iso()
+        for test_id in test_ids:
+            with self._lock:
+                new = known_drift_tests.record_sighting(
+                    self._conn, test_id, base_commit, now, experiment_id,
+                )
+                wants_issue = known_drift_tests.needs_issue(self._conn, test_id)
+            open_issue = getattr(github_work_tracking, "open_issue", None)
+            if not wants_issue or open_issue is None:
+                continue
+            try:
+                opened = open_issue(
+                    known_drift_tests.issue_title(test_id),
+                    redact(known_drift_tests.issue_body(
+                        test_id, base_commit, drift_tails.get(test_id),
+                        experiment_id=experiment_id,
+                    )),
+                )
+            except Exception as exc:  # noqa: BLE001 - retried at the next sighting
+                elog.warning(
+                    "verifying", "known_drift_issue_failed",
+                    f"Could not open the issue for {test_id}: {type(exc).__name__}",
+                )
+                continue
+            number = (opened or {}).get("number")
+            if number:
+                with self._lock:
+                    known_drift_tests.set_issue(self._conn, test_id, int(number))
+                elog.info(
+                    "verifying", "known_drift_issue_opened",
+                    f"Known drift test {test_id} -> issue #{number}",
+                    test_id=test_id, issue_number=int(number), first_sighting=new,
+                )
 
 
     def _next_verification_iteration(self, experiment_id: str) -> int:
@@ -896,7 +1028,8 @@ class VerificationMixin:
             try:
                 options = {"watchdog": self._get_test_watchdog_config()} if abort_on_test_stall else {}
                 timing_failure = self._run_timing_check(
-                    experiment_id, worktree_path, full_diff, elog, **options,
+                    experiment_id, worktree_path, full_diff, elog,
+                    github_work_tracking=github_work_tracking, **options,
                 )
             except HungTest as exc:
                 self._record_verification_run(

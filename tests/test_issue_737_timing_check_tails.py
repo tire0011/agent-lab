@@ -183,7 +183,7 @@ def _verify(svc, repo: Path, base: str):
 
 
 def _fake_run(drift_tails: dict[str, str], control_tails: dict[str, str], control_result: str):
-    def run(repo, tests, drift_ms=50, *, on_process=None, python=None, tails=None):
+    def run(repo, tests, drift_ms=50, *, on_process=None, python=None, tails=None, env=None):
         if tails is not None:
             tails.update(drift_tails if drift_ms else control_tails)
         if drift_ms:
