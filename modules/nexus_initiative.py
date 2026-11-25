@@ -22,6 +22,7 @@ from typing import Any, Callable
 
 from modules import github_authorization
 from modules import issue_approvals
+from modules import review_size_stats
 from modules.experiment_evaluation import summarize_error
 from modules.experiment_service import policy as goal_policy
 from modules.experiment_service.models import PIPELINE_CRASH_ERROR_PREFIX
@@ -955,9 +956,10 @@ class NexusInitiativeService:
         """
         ref = str(issue["number"])
         title = str(issue.get("title") or f"Issue #{ref}")[:200]
-        self._exhausted_issues.append(
-            {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
-        )
+        entry = {"number": int(ref), "title": title, "last_reason": attempts["last_reason"]}
+        if attempts.get("split_guard"):
+            entry["split_guard"] = True
+        self._exhausted_issues.append(entry)
         self._exhausted_bodies[int(ref)] = str(issue.get("body") or "")
         if not record:
             return
@@ -976,7 +978,9 @@ class NexusInitiativeService:
                 )
             )
             reported[key] = (tick_id, detail)
-        if detail.get("commented") or self._issue_commenter is None:
+        # The split guard (#821) makes no GitHub writes of its own: the planner
+        # splits the issue through the existing mechanism, which comments then.
+        if detail.get("commented") or self._issue_commenter is None or attempts.get("split_guard"):
             return
         if attempts.get("pipeline_crash"):
             stop = f"Nexus paused this issue: its own pipeline crashed {_MAX_ISSUE_ATTEMPTS} times or more."
@@ -1099,6 +1103,20 @@ class NexusInitiativeService:
             if counted[number] >= limit[number] and number not in blocked
         }
         blocked.update(n for n, count in counted.items() if count >= limit[n])
+        # #821: two review-blocked attempts that were both large are not
+        # retried a third time; the issue goes to the planner to be split.
+        for number, attempts in failed.items():
+            if number in blocked:
+                continue
+            reason = self._split_guard_reason(attempts)
+            if reason is None:
+                continue
+            exhausted[number] = {
+                "experiment_ids": sorted(attempts),
+                "last_reason": reason,
+                "split_guard": True,
+            }
+            blocked.add(number)
         crash_limited = {n: a for n, a in crashes.items() if len(a) >= _MAX_ISSUE_ATTEMPTS}
         main_commit = self._main_commit_time() if crash_limited else None
         for number, attempts in crash_limited.items():
@@ -1113,6 +1131,34 @@ class NexusInitiativeService:
                 }
             blocked.add(number)
         return blocked, exhausted
+
+    def _split_guard_reason(self, attempts: dict[str, tuple[str, str]]) -> str | None:
+        """The split reason when the newest review blocks were all large (#821)."""
+        reviewed = sorted(
+            (when, experiment_id) for experiment_id, (when, why) in attempts.items()
+            if why.startswith("Review by ")
+        )
+        if len(reviewed) < review_size_stats.SPLIT_GUARD_ATTEMPTS:
+            return None
+        ids = [experiment_id for _, experiment_id in reviewed]
+        try:
+            rows = self._conn.execute(
+                f"SELECT id, diff_added, diff_removed FROM experiments "
+                f"WHERE id IN ({', '.join('?' for _ in ids)})",
+                ids,
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return None  # no size columns yet: nothing to judge by
+        stored = {
+            str(row[0]): (int(row[1]) + int(row[2]))
+            if row[1] is not None and row[2] is not None else None
+            for row in rows
+        }
+        sizes = [stored.get(experiment_id) for experiment_id in ids]
+        threshold = review_size_stats.split_diff_lines()
+        if not review_size_stats.split_guard_applies(sizes, threshold):
+            return None
+        return review_size_stats.split_guard_reason(sizes, threshold)
 
     def _loop_guarded_issues(self) -> dict[int, dict[str, Any]]:
         """Issues stopped by the loop guard (#753): ``issue -> detail``.

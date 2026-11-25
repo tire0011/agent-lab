@@ -335,6 +335,10 @@ class ExperimentDetail(BaseModel):
     error: str | None = None
     policy_rule: str | None = None
     quality_evaluation: dict[str, Any] | None = None
+    # `git diff --numstat <base>` of the verified worktree (#821).
+    diff_files: int | None = None
+    diff_added: int | None = None
+    diff_removed: int | None = None
     adoption: ExperimentAdoptionStatus | None = None
 
 

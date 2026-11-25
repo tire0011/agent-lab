@@ -492,6 +492,22 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(
+        description="GET /review-size-stats - finished experiments grouped by changed diff lines "
+        "(<=80, 81-200, 201-500, >500) with the share that merged, was blocked by the review "
+        "or ended needs_review (#821)",
+        structured_output=True,
+    )
+    def review_size_stats(days: int | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        days = nexus_api.REVIEW_SIZE_STATS_DEFAULT_DAYS if days is None else days
+        days = _validate_limit(days, minimum=1, maximum=nexus_api.REVIEW_SIZE_STATS_MAX_DAYS)
+        return _call_api(
+            nexus_api.get_review_size_stats,
+            x_api_key=_internal_api_key(), days=days,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,

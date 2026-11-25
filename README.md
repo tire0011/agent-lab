@@ -281,6 +281,12 @@ Available MCP tools mirror the current **read-only** Nexus API surface:
 - `local_replays_list` (local shadow replays of merged paid experiments with
   the local pass rate per prompt variant; `GET /local-replays?limit=`, #637;
   see `OPERATIONS.md` "Local shadow replay")
+- `review_size_stats` (finished experiments grouped by changed diff lines,
+  `<=80`/`81-200`/`201-500`/`>500`, with the merged, review-blocked and
+  needs_review share per bucket; `GET /review-size-stats?days=`, #821. The size
+  comes from `git diff --numstat <base>` at verification; two review-blocked
+  attempts both over `NEXUS_SPLIT_DIFF_LINES` (default 300) changed lines are
+  offered to the planner for a split instead of a third retry)
 - `activity_public_list`, `activity_list`, `diagnostics_public_get`
 - `operations_catalog_get`, `operation_chains_list`, `operation_chain_get`
 - `maintenance_status_get`, `maintenance_audit_get`

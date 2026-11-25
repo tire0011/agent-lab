@@ -693,6 +693,14 @@ class ExperimentServiceTestCase(unittest.TestCase):
         serialized = reloaded.to_dict()
         self.assertIn(untracked_path, serialized["diff_stat"])
         self.assertIn("+new untracked contents", serialized["diff_text"])
+        # #821: numstat of the staged worktree against the base, stored on the row.
+        # The worker leaves no commit, so the base is HEAD and --stat sums the same diff.
+        summary = (reloaded.diff_stat or "").strip().splitlines()[-1]
+        numbers = dict((word.rstrip("s(+)-,"), int(n)) for n, word in re.findall(r"(\d+) (\w+)", summary))
+        self.assertEqual(serialized["diff_files"], numbers["file"])
+        self.assertEqual(serialized["diff_added"], numbers.get("insertion", 0))
+        self.assertEqual(serialized["diff_removed"], numbers.get("deletion", 0))
+        self.assertGreaterEqual(serialized["diff_added"], 2)  # the two untracked lines
 
     def test_usage_of_implementation_phase_persisted(self):
         # Single-call pipeline: only implementation usage is recorded.
