@@ -49,3 +49,16 @@ class TestTmpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CodingAgentTmpTests(unittest.TestCase):
+    def test_a_coding_agent_run_gets_its_own_pruned_tmpdir(self):
+        """2026-11-25: tests the agents ran themselves left ~3000 /tmp entries a day."""
+        from modules.coding_worker import filtered_env
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(verification_env.tempfile, "gettempdir", return_value=tmp):
+            first, second = filtered_env(), filtered_env()
+            self.assertEqual(Path(first["TMPDIR"]).parent, verification_tmp_parent())
+            self.assertNotEqual(first["TMPDIR"], second["TMPDIR"])
+            self.assertEqual(first["TMPDIR"], first["TEMP"])
