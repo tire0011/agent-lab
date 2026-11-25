@@ -588,6 +588,30 @@ success at 1.4 or above and a negative result below 1.2. Compare
 `memory.before`/`after` with `free -m`. After a switch, delete the rates file:
 the old rates were measured without a draft.
 
+## Counterfactual tick replay (#755)
+
+How many paid starts a gate or policy would have saved, from the real
+experiment history (read-only, free):
+
+```bash
+python3 scripts/tick_replay.py --since 2026-11-01 --policy provider_cooldown,issue_loop_guard
+python3 scripts/tick_replay.py --since 2026-11-01 --json      # all policies, JSON
+```
+
+It prints the actual vs. simulated paid starts, the saved starts, the lost
+merges (skipped runs that really merged) and the first 5 skipped rows with
+their reason. The same report is `GET /tick-replay?since=&policies=` and the
+read-only MCP tool `tick_replay_get`. Policies live in
+`modules/tick_replay.py::POLICIES` as pure functions
+`policy(history, candidate) -> "allow" | ("skip", reason)`: `provider_cooldown`
+and `issue_loop_guard` (#753), and `same_gate_reason_x3` (#730). `--history
+simulated` lets the policies see only the runs they allowed. The default,
+`actual`, uses every real run and gives an upper bound. A skipped start's
+replacement (another issue or provider) is not simulated.
+
+A new gate or policy issue adds its policy there with one fixture test and
+gives its replay number (saved starts vs. lost merges) before it counts as done.
+
 ## Known limitations
 
 - External ChatGPT direct access to project HTTP endpoint was not reliable; do not depend on this path yet.

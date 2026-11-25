@@ -287,6 +287,12 @@ Available MCP tools mirror the current **read-only** Nexus API surface:
   comes from `git diff --numstat <base>` at verification; two review-blocked
   attempts both over `NEXUS_SPLIT_DIFF_LINES` (default 300) changed lines are
   offered to the planner for a split instead of a third retry)
+- `tick_replay_get` (counterfactual replay of finished experiments: actual vs
+  simulated paid starts, saved starts and lost merges per policy;
+  `GET /tick-replay?since=&policies=`, #755. Same report on the VM:
+  `python scripts/tick_replay.py --since 2026-11-01 --policy provider_cooldown,issue_loop_guard [--json]`.
+  A new gate or policy adds one pure function to `modules/tick_replay.py::POLICIES`
+  and quotes its replay number - saved starts vs. lost merges - before it counts as done)
 - `activity_public_list`, `activity_list`, `diagnostics_public_get`
 - `operations_catalog_get`, `operation_chains_list`, `operation_chain_get`
 - `maintenance_status_get`, `maintenance_audit_get`

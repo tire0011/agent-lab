@@ -814,6 +814,7 @@ from api_routers.experiments import (  # noqa: E402
     get_experiment_reflection,
     get_public_experiment,
     get_review_size_stats,
+    get_tick_replay,
     list_experiments,
     list_local_replays,
     list_planner_shadow,
