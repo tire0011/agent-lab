@@ -49,6 +49,35 @@ from modules.experiment_adoption_parts.core import (
 class PipelineMixin:
     """The adoption pipeline of :class:`ExperimentAdoptionService`."""
 
+    def _recheck_switched_off_gates(self, experiment_id: str, elog) -> None:
+        """After a merged repair, run a switched-off gate once on main (#714)."""
+        from modules import gate_self_repair
+
+        try:
+            with self._lock:
+                if not gate_self_repair.gates_off(self._conn):
+                    return
+            python = getattr(self.experiment_service, "test_python_executable", None)
+            decision = gate_self_repair.GateSelfRepair(
+                self._conn,
+                repo_root=str(self.repo_root),
+                lock=self._lock,
+                main_checks={
+                    gate_self_repair.TIMING_CHECK_GATE: lambda root, tests: (
+                        gate_self_repair.timing_check_on_main(root, tests, python=python)
+                    ),
+                },
+            ).after_merge(experiment_id, github=self.github_work_tracking)
+        except Exception as exc:  # noqa: BLE001 - the merge already happened
+            elog.error("adoption", "gate_recheck_failed", "Switched-off gate recheck failed", exc=exc)
+            return
+        if decision.action != "none":
+            elog.warning(
+                "adoption", f"gate_{decision.action}",
+                f"Gate {decision.gate} after merge of {experiment_id}: {decision.action} ({decision.detail})",
+                issue_number=decision.issue_number,
+            )
+
     def _run_adoption_pipeline(
         self, adoption_id: str, experiment_id: str, *, resume: bool = False
     ) -> ExperimentAdoption:
@@ -624,6 +653,7 @@ class PipelineMixin:
                 f"Merged into {_DEFAULT_TARGET_BRANCH}"
                 + (f" as {published_sha[:12]}." if published_sha else "."),
             )
+            self._recheck_switched_off_gates(experiment_id, elog)
             return self.get(experiment_id)
         except ExperimentAdoptionError as exc:
             return self._finish_failure(experiment_id, reason=str(exc), elog=elog)

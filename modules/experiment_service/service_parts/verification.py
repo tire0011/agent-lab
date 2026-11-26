@@ -21,6 +21,7 @@ from modules.github_work_tracking import failing_test_names
 from modules.review_size_stats import DiffSize, parse_numstat
 from modules.run_store import get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
+from modules import gate_self_repair
 from modules import timing_check as timing_check_module
 from modules.verification_runner import (
     HungTest,
@@ -313,6 +314,19 @@ class VerificationMixin:
                 f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
             )
             return None
+        with self._lock:
+            switched_off = gate_self_repair.gate_state(
+                self._conn, gate_self_repair.TIMING_CHECK_GATE,
+            )
+        if switched_off is not None:
+            # Persisted switch-off by the host-blocker self-repair (#714).
+            elog.warning(
+                "verifying", "timing_check_skipped",
+                f"Slow-machine check switched off as host_blocker:"
+                f"{gate_self_repair.TIMING_CHECK_GATE} ({TIMING_CHECK_ENV_VAR}=0 persisted): "
+                f"{switched_off.get('reason')}",
+            )
+            return None
         # Per-test failure text by exact node id (#737), for the events below.
         drift_tails: dict[str, str] = {}
         control_tails: dict[str, str] = {}
@@ -415,8 +429,10 @@ class VerificationMixin:
         triaged: list[dict[str, Any]] = []
         try:
             # #727: group the tails by error signature and label the top groups.
+            # The computed reason is kept even when persisting the triage fails.
             triage_note, triaged = self._triage_timing_failures(
                 experiment_id, tails, changed_files, worktree_path, elog,
+                error=error,
             )
             if triage_note:
                 error = f"{error}{triage_note}"
@@ -441,15 +457,18 @@ class VerificationMixin:
 
     def _triage_timing_failures(
         self, experiment_id: str, tails: dict[str, str], changed_files: set[str],
-        worktree_path: str, elog: ExperimentLogger,
+        worktree_path: str, elog: ExperimentLogger, *, error: str = "",
     ) -> tuple[str, list[dict[str, Any]]]:
         """#727: group the failure tails by signature and label the top groups.
 
         Returns the suffix for the needs_review reason and the labelled
-        groups. The groups are stored in the run_store table
-        ``failure_triage`` (MCP tool ``failure_triage_list``); one
-        ``host_blocker`` group is fed to #714's detector as an early signal,
-        so it then needs 2 experiments instead of 3. Never raises.
+        groups. The groups are stored in the run_store table ``failure_triage``
+        (MCP tool ``failure_triage_list``, distinguished by verification
+        attempt so a retry replaces its own rows); one ``host_blocker`` group
+        is fed to #714's detector as an early signal in the same transaction,
+        so it then needs 2 experiments instead of 3. The reason is computed
+        before anything is persisted and returned even when persistence fails;
+        this method never raises.
         """
         from modules import failure_triage
 
@@ -464,16 +483,37 @@ class VerificationMixin:
             f"{group['label']}: {group['signature']} ({group['count']} tests)"
             for group in triaged
         )
-        with self._lock:
-            failure_triage.record_triage(self._conn, experiment_id, triaged)
         host = next(
             (group for group in triaged
              if group.get("label") == failure_triage.LABEL_HOST_BLOCKER),
             None,
         )
-        if host is not None:
+        # The gate failure reason the #714 detector normalises, so the signal
+        # only ever lowers the threshold for the same failure.
+        gate_reason = None
+        failure = gate_self_repair.classify_gate_failure(error)
+        if failure is not None:
+            gate_reason = failure.reason
+        try:
+            attempt = str(self._next_verification_iteration(experiment_id))
+        except Exception:  # noqa: BLE001 - no attempt id: store without one
+            attempt = None
+        try:
+            # Rows and early signal in one transaction under one lock: a
+            # half-failed write can neither lose the signal nor leave rows
+            # without it.
             with self._lock:
-                failure_triage.record_early_signal(self._conn, experiment_id, host)
+                failure_triage.persist_triage(
+                    self._conn, experiment_id, triaged,
+                    reason=gate_reason, attempt=attempt,
+                )
+        except Exception as exc:  # noqa: BLE001 - the computed reason still goes out
+            elog.error(
+                "verifying", "failure_triage_persist_failed",
+                "Could not persist the failure triage; the needs_review reason keeps the labels",
+                exc=exc,
+            )
+        if host is not None and gate_reason is not None:
             elog.info(
                 "verifying", "failure_triage_host_blocker",
                 "A host_blocker failure group is fed to the #714 detector as an early "
@@ -483,6 +523,7 @@ class VerificationMixin:
         elog.info(
             "verifying", "failure_triage_done",
             f"Triaged {len(triaged)} failure group(s) of the failed-closed timing check",
+            attempt=attempt,
             groups=[
                 {
                     "signature": group.get("signature"), "label": group.get("label"),

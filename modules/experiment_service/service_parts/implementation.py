@@ -193,7 +193,65 @@ class ImplementationMixin:
             result = self.get_experiment(experiment_id)
         for state, detail in _final_issue_progress(result):
             _report_issue_progress(github_work_tracking, experiment_id, state, detail)
+        self._observe_gate_outcome(result, github_work_tracking, elog)
         return result
+
+
+    def gate_self_repair(self) -> Any:
+        """The host-blocker self-repair (#714) on this service's database."""
+        from modules import gate_self_repair
+
+        python = self.test_python_executable
+        return gate_self_repair.GateSelfRepair(
+            self._conn,
+            repo_root=self.repo_root,
+            lock=self._lock,
+            main_checks={
+                gate_self_repair.TIMING_CHECK_GATE: lambda root, tests: (
+                    gate_self_repair.timing_check_on_main(root, tests, python=python)
+                ),
+            },
+        )
+
+
+    def _observe_gate_outcome(
+        self, result: Experiment, github_work_tracking: Any | None, elog: Any,
+    ) -> None:
+        """Count gate failures in a row; switch a host-blocked gate off (#714).
+
+        A ``host_blocker`` failure group from the #727 triage arrives as an
+        early signal inside :meth:`record_outcome`, so the detector then needs
+        2 experiments instead of 3 - scoped to the same gate and reason.
+        """
+        if result.status == STATUS_CANCELLED:
+            return  # stopped from outside: neither a gate verdict nor a pass
+        try:
+            from modules.gate_self_repair import issue_number_from_goal
+
+            issue_number = issue_number_from_goal(result.goal)
+            if issue_number is None and github_work_tracking is not None:
+                ref = github_work_tracking.for_experiment(result.id)
+                issue_number = getattr(ref, "issue_number", None) or None
+            error = None if result.status == STATUS_SUCCEEDED else result.error
+            decision = self.gate_self_repair().record_outcome(
+                result.id, error, issue_number=issue_number, github=github_work_tracking,
+            )
+        except Exception as exc:  # noqa: BLE001 - the self-repair never fails a run
+            elog.error("finalizing", "gate_self_repair_failed", "Host-blocker check failed", exc=exc)
+            return
+        if decision.classification:
+            elog.warning(
+                "finalizing", "gate_host_blocker",
+                f"{decision.classification}: {decision.reason} ({decision.action}; "
+                f"experiments {', '.join(decision.experiment_ids)})",
+                issue_number=decision.issue_number,
+            )
+        elif decision.action in {"main_passes", "no_verdict"}:
+            elog.info(
+                "finalizing", "gate_host_blocker_rejected",
+                f"Gate {decision.gate} failed {len(decision.experiment_ids)} times in a row, "
+                f"but not as a host blocker: {decision.detail}",
+            )
 
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import json
+import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -302,6 +305,9 @@ class VerificationTriageTests(unittest.TestCase):
         self.repo = root / "repo"
         (self.repo / "tests").mkdir(parents=True)
         (self.repo / "README.md").write_text("x\n", encoding="utf-8")
+        # Pre-existing test file that fails on the host; the experiment does
+        # not touch it, so the triage rule can fire without a model call.
+        (self.repo / "tests" / "test_other.py").write_text(PLAIN, encoding="utf-8")
         self._git("init", "-q")
         self._git("config", "user.email", "test@example.com")
         self._git("config", "user.name", "Test")
@@ -406,6 +412,436 @@ class VerificationTriageTests(unittest.TestCase):
         self.assertFalse(result.error)
         self.assertEqual(ft.list_triage(self.service._conn), [])
         self.assertEqual(ft.required_streak_length(self.service._conn), 3)
+
+    def test_the_early_signal_carries_the_gate_reason(self) -> None:
+        from modules import gate_self_repair as gsr
+
+        tails = {
+            f"tests/test_other.py::test_{n}": "E   AssertionError: assert 401 == 200\n"
+            for n in range(12)
+        }
+        with patch("modules.timing_check.run_timing_check",
+                   side_effect=self._failing_run(tails)), \
+                patch.object(ft, "_default_client", side_effect=AssertionError("no model call")):
+            experiment_id, result = self._verify("1")
+        signal = ft.early_signal(self.service._conn)
+        self.assertIsNotNone(signal)
+        self.assertEqual(signal["experiment_id"], experiment_id)
+        # The detector can only match the signal to the same failure reason.
+        self.assertEqual(
+            signal["reason"],
+            gsr.classify_gate_failure(result.error).reason,
+        )
+        self.assertEqual(ft.required_streak_length(
+            self.service._conn, reason=signal["reason"]), 2)
+
+    def test_persistence_failure_keeps_the_labels_in_the_reason(self) -> None:
+        tails = {
+            f"tests/test_other.py::test_{n}": "E   AssertionError: assert 401 == 200\n"
+            for n in range(12)
+        }
+        with patch("modules.timing_check.run_timing_check",
+                   side_effect=self._failing_run(tails)), \
+                patch.object(ft, "_default_client", side_effect=AssertionError("no model call")), \
+                patch.object(ft, "persist_triage", side_effect=sqlite3.OperationalError("db locked")):
+            _, result = self._verify("1")
+        self.assertEqual(result.status, "needs_review")
+        # The computed triage is in the reason even though storing it failed.
+        self.assertIn("failure triage", result.error)
+        self.assertIn("host_blocker", result.error)
+        self.assertEqual(ft.list_triage(self.service._conn), [])
+
+    def test_an_interrupted_timing_check_is_still_triaged(self) -> None:
+        tails = {
+            f"tests/test_other.py::test_{n}": "E   AssertionError: assert 401 == 200\n"
+            for n in range(12)
+        }
+
+        def interrupted(repo, tests, *args, **kwargs):
+            sink = kwargs.get("tails")
+            if sink is not None:
+                sink.update(tails)
+            raise KeyboardInterrupt
+
+        with patch("modules.timing_check.run_timing_check", side_effect=interrupted), \
+                patch.object(ft, "_default_client", side_effect=AssertionError("no model call")):
+            _, result = self._verify("1")
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("interrupted", result.error)
+        self.assertIn("host_blocker", result.error)
+
+    def test_a_crashed_timing_check_is_still_triaged(self) -> None:
+        tails = {"tests/test_other.py::test_a": "E   AssertionError: assert 401 == 200\n"}
+
+        def crashing(repo, tests, *args, **kwargs):
+            sink = kwargs.get("tails")
+            if sink is not None:
+                sink.update(tails)
+            raise RuntimeError("boom")
+
+        client = FakeClient(json.dumps({"label": "unclear", "why": "?"}))
+        with patch("modules.timing_check.run_timing_check", side_effect=crashing), \
+                patch.object(ft, "_default_client", return_value=client):
+            _, result = self._verify("1")
+        self.assertEqual(result.status, "needs_review")
+        self.assertIn("RuntimeError: boom", result.error)
+        self.assertIn("failure triage", result.error)
+
+    def test_retried_verification_does_not_duplicate_rows(self) -> None:
+        tails = {
+            f"tests/test_other.py::test_{n}": "E   AssertionError: assert 401 == 200\n"
+            for n in range(12)
+        }
+        with patch("modules.timing_check.run_timing_check",
+                   side_effect=self._failing_run(tails)), \
+                patch.object(ft, "_default_client", side_effect=AssertionError("no model call")):
+            experiment_id, first = self._verify("1")
+            # A second verification of the same experiment is a new attempt.
+            with patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1"}):
+                second = self.service._verify(experiment_id, str(self.repo))
+        self.assertEqual(first.status, "needs_review")
+        self.assertEqual(second.status, "needs_review")
+        rows = ft.list_triage(self.service._conn, experiment_id=experiment_id)
+        self.assertEqual(len(rows), 2)  # one row per attempt, no duplicates
+        self.assertEqual({row["attempt"] for row in rows}, {"0", "1"})
+        # Calling the triage again within the same attempt replaces, not appends.
+        for _ in range(2):
+            note, triaged = self.service._triage_timing_failures(
+                experiment_id, tails, {"tests/test_new.py"}, str(self.repo), MagicMock(),
+                error="timing check failed closed: error",
+            )
+            self.assertIn("host_blocker", note)
+        rows = ft.list_triage(self.service._conn, experiment_id=experiment_id)
+        self.assertEqual(len(rows), 3)
+        self.assertEqual({row["attempt"] for row in rows}, {"0", "1", "2"})
+
+
+class RuleConservatismTests(unittest.TestCase):
+    """The rule never fires on missing evidence: unknown dependencies go to the model."""
+
+    def _repo(self) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        (repo / "modules").mkdir(parents=True)
+        (repo / "modules" / "foo.py").write_text("X = 1\n", encoding="utf-8")
+        (repo / "tests").mkdir()
+        return repo
+
+    def _groups(self, test_file: str, count: int = 12) -> list[dict]:
+        return group_failures({
+            f"{test_file}::test_{n}": "E   AssertionError: assert 401 == 200\n"
+            for n in range(count)
+        })
+
+    def _triage(self, groups, changed, repo):
+        client = FakeClient(json.dumps({"label": "experiment_fault", "why": "touches"}))
+        result = triage(groups, changed, client=client, repo=repo)
+        return result, client
+
+    def test_unparseable_test_file_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        (repo / "tests" / "test_bad.py").write_text("def broken(:\n", encoding="utf-8")
+        result, client = self._triage(self._groups("tests/test_bad.py"), ["modules/foo.py"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_unreadable_test_file_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        (repo / "tests" / "test_dir.py").mkdir()  # a directory is unreadable as a file
+        result, client = self._triage(self._groups("tests/test_dir.py"), ["modules/foo.py"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_missing_test_file_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        result, client = self._triage(self._groups("tests/test_gone.py"), ["modules/foo.py"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_relative_import_of_a_changed_module_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        (repo / "modules" / "__init__.py").write_text("", encoding="utf-8")
+        (repo / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (repo / "tests" / "test_rel.py").write_text("from ..modules import foo\n", encoding="utf-8")
+        result, client = self._triage(self._groups("tests/test_rel.py"), ["modules/foo.py"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_src_lib_alias_of_a_changed_module_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        src = repo / "src" / "foo"
+        src.mkdir(parents=True)
+        (src / "__init__.py").write_text("", encoding="utf-8")
+        (src / "bar.py").write_text("X = 1\n", encoding="utf-8")
+        (repo / "tests" / "test_alias.py").write_text("import foo.bar\n", encoding="utf-8")
+        result, client = self._triage(self._groups("tests/test_alias.py"), ["src/foo/bar.py"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_changed_non_python_file_in_the_test_directory_goes_to_the_model(self) -> None:
+        repo = self._repo()
+        (repo / "tests" / "test_data.py").write_text(PLAIN, encoding="utf-8")
+        (repo / "tests" / "data.json").write_text("{}\n", encoding="utf-8")
+        result, client = self._triage(self._groups("tests/test_data.py"), ["tests/data.json"], repo)
+        self.assertEqual(result[0]["source"], "model")
+        self.assertEqual(len(client.calls), 1)
+
+    def test_a_readable_unrelated_test_file_still_fires_the_rule(self) -> None:
+        repo = self._repo()
+        (repo / "tests" / "test_other.py").write_text(PLAIN, encoding="utf-8")
+        client = ExplodingClient()
+        result = triage(self._groups("tests/test_other.py"), ["modules/foo.py"],
+                        client=client, repo=repo)
+        self.assertEqual(result[0]["label"], "host_blocker")
+        self.assertEqual(result[0]["source"], "rule")
+        self.assertEqual(client.calls, 0)
+
+
+class StrictParseTests(unittest.TestCase):
+    def test_valid_answer_is_parsed(self) -> None:
+        self.assertEqual(
+            ft._parse_answer('{"label": "experiment_fault", "why": "the changed file fails"}'),
+            ("experiment_fault", "the changed file fails"),
+        )
+
+    def test_malformed_answers_are_rejected(self) -> None:
+        bad = [
+            "not json at all",
+            "[1, 2, 3]",
+            "42",
+            '{"label": "host_blocker"}',                              # missing why
+            '{"label": "host_blocker", "why": ""}',                   # empty why
+            '{"label": "host_blocker", "why": "   "}',                 # whitespace-only why
+            '{"label": "bogus", "why": "x"}',                          # invalid label
+            '{"label": 5, "why": "x"}',                                # wrong label type
+            '{"label": "host_blocker", "why": 7}',                     # wrong why type
+            '{"label": "host_blocker", "why": "ok", "extra": 1}',      # additionalProperties
+            '{"why": "no label"}',
+            'prose before {"label": "host_blocker", "why": "x"} prose after',  # no recovery
+            '{"label": "host_blocker", "why": "' + "x" * 400 + '"}',   # over maxLength
+        ]
+        for raw in bad:
+            with self.subTest(raw=raw[:60]):
+                self.assertIsNone(ft._parse_answer(raw))
+        self.assertIsNone(ft._parse_answer(None))
+        self.assertIsNone(ft._parse_answer({"label": "host_blocker", "why": "x"}))  # not a str
+
+    def test_malformed_answers_give_unclear_through_triage(self) -> None:
+        groups = group_failures({"tests/test_changed.py::test_a": "AssertionError: boom 1"})
+        for answer in ('{"label": "host_blocker"}',
+                       'see {"label": "host_blocker", "why": "x"} inside'):
+            with self.subTest(answer=answer):
+                result = triage(groups, ["tests/test_changed.py"], client=FakeClient(answer))
+                self.assertEqual(result[0]["label"], "unclear")
+                self.assertEqual(result[0]["source"], "model_error")
+
+    def test_a_valid_answer_with_a_secret_in_why_is_redacted(self) -> None:
+        raw = json.dumps({"label": "unclear", "why": "token=supersecret99 leaked"})
+        label, why = ft._parse_answer(raw)
+        self.assertEqual(label, "unclear")
+        self.assertNotIn("supersecret99", why)
+        self.assertIn("[REDACTED]", why)
+
+
+class RedactionTests(unittest.TestCase):
+    SECRET_TAIL = (
+        "E   RuntimeError: auth failed for token=supersecret99 Bearer sk-abcdefghijklmnop "
+        "ghp_ABCDEFGHIJKLMNOP1234\n"
+    )
+
+    def test_signature_redacts_credentials_before_normalising(self) -> None:
+        sig = signature(self.SECRET_TAIL)
+        for secret in ("supersecret99", "sk-abcdefghijklmnop", "ghp_ABCDEFGHIJKLMNOP1234"):
+            self.assertNotIn(secret, sig)
+        self.assertTrue(sig.startswith("RuntimeError: "))
+
+    def test_sample_tails_in_the_prompt_are_redacted(self) -> None:
+        tails = {"tests/test_changed.py::test_a": self.SECRET_TAIL}
+        groups = group_failures(tails)
+        client = FakeClient(json.dumps({"label": "unclear", "why": "?"}))
+        triage(groups, ["tests/test_changed.py"], client=client, tails=tails)
+        prompt, _ = client.calls[0]
+        for secret in ("supersecret99", "sk-abcdefghijklmnop", "ghp_ABCDEFGHIJKLMNOP1234"):
+            self.assertNotIn(secret, prompt)
+
+    def test_persisted_rows_are_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = init_db(str(Path(tmp) / "db.sqlite"))
+            try:
+                groups = [{
+                    "signature": signature(self.SECRET_TAIL), "test_ids": ["t1"], "count": 1,
+                    "label": "unclear", "why": "token=supersecret99 in why", "source": "model",
+                }]
+                ft.persist_triage(conn, "exp1", groups, reason="r", attempt="0")
+                row = ft.list_triage(conn, experiment_id="exp1")[0]
+                self.assertNotIn("supersecret99", row["why"])
+                self.assertNotIn("supersecret99", row["signature"])
+                self.assertNotIn("sk-abcdefghijklmnop", row["signature"])
+            finally:
+                conn.close()
+
+
+class DeadlineTests(unittest.TestCase):
+    def test_a_slow_model_call_is_cut_off_by_the_wall_clock_budget(self) -> None:
+        class SlowClient(FakeClient):
+            async def complete(self, prompt, **kwargs):
+                self.calls.append((prompt, kwargs))
+                await asyncio.sleep(30)
+                return self.answer  # pragma: no cover - cancelled first
+
+        groups = group_failures({"tests/test_changed.py::test_a": "AssertionError: boom 1"})
+        with patch.object(ft, "MIN_CALL_TIMEOUT_SECONDS", 0.2):
+            started = time.monotonic()
+            result = triage(groups, ["tests/test_changed.py"], client=SlowClient("{}"),
+                            rates=(10 ** 9, 10 ** 9))
+            elapsed = time.monotonic() - started
+        self.assertEqual(result[0]["label"], "unclear")
+        self.assertEqual(result[0]["source"], "model_error")
+        self.assertIn("budget", result[0]["why"])
+        self.assertLess(elapsed, 5)  # not the 30 s the client would have taken
+        self.assertIsNotNone(result[0]["seconds"])
+
+
+class PersistTriageTests(unittest.TestCase):
+    def _groups(self) -> list[dict]:
+        return [{
+            "signature": "AssertionError: assert N == N", "test_ids": ["a", "b"],
+            "count": 12, "label": "host_blocker", "why": "rule", "source": "rule",
+        }]
+
+    def test_idempotent_per_attempt_and_distinguished_by_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = init_db(str(Path(tmp) / "db.sqlite"))
+            try:
+                self.assertEqual(ft.persist_triage(conn, "exp1", self._groups(),
+                                                   reason="r", attempt="0"), 1)
+                ft.persist_triage(conn, "exp1", self._groups(), reason="r", attempt="0")
+                rows = ft.list_triage(conn, experiment_id="exp1")
+                self.assertEqual(len(rows), 1)  # same attempt: replaced, not duplicated
+                self.assertEqual(rows[0]["attempt"], "0")
+                ft.persist_triage(conn, "exp1", self._groups(), reason="r", attempt="1")
+                rows = ft.list_triage(conn, experiment_id="exp1")
+                self.assertEqual(len(rows), 2)
+                self.assertEqual({row["attempt"] for row in rows}, {"0", "1"})
+                # The early signal was written in the same transaction.
+                signal = ft.early_signal(conn)
+                self.assertIsNotNone(signal)
+                self.assertEqual(signal["reason"], "r")
+                self.assertEqual(signal["signature"], "AssertionError: assert N == N")
+            finally:
+                conn.close()
+
+    def test_no_host_blocker_group_writes_no_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = init_db(str(Path(tmp) / "db.sqlite"))
+            try:
+                groups = [dict(self._groups()[0], label="unclear")]
+                ft.persist_triage(conn, "exp1", groups, reason="r", attempt="0")
+                self.assertIsNone(ft.early_signal(conn))
+                self.assertEqual(len(ft.list_triage(conn, experiment_id="exp1")), 1)
+            finally:
+                conn.close()
+
+    def test_a_half_failed_write_leaves_no_rows_and_no_signal(self) -> None:
+        """A crash mid-persist rolls the whole transaction back (#727 review)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = init_db(str(Path(tmp) / "db.sqlite"))
+            try:
+                groups = [self._groups()[0], dict(self._groups()[0], signature="TimeoutError")]
+                original = ft._triage_row_values
+                calls = {"n": 0}
+
+                def failing(*args, **kwargs):
+                    calls["n"] += 1
+                    if calls["n"] == 2:
+                        raise sqlite3.OperationalError("simulated crash mid-transaction")
+                    return original(*args, **kwargs)
+
+                with patch.object(ft, "_triage_row_values", side_effect=failing):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        ft.persist_triage(conn, "exp1", groups, reason="r", attempt="0")
+                # Nothing half-written: no rows, and the signal is absent too.
+                self.assertEqual(ft.list_triage(conn, experiment_id="exp1"), [])
+                self.assertIsNone(ft.early_signal(conn))
+            finally:
+                conn.close()
+
+
+class ReplayTests(unittest.TestCase):
+    """The #727 measure: replay the stored tails of the historical failed-closed runs."""
+
+    @staticmethod
+    def _run_401(experiment_id: str, count: int = 40) -> dict:
+        return {
+            "experiment_id": experiment_id,
+            "tails": {
+                f"tests/test_api.py::TestApi::test_secure_{n}": (
+                    f'  File "/tmp/x{n}/tests/test_api.py", line {n}, in test_secure_{n}\n'
+                    "E   AssertionError: assert 401 == 200\n"
+                )
+                for n in range(count)
+            },
+            "changed_files": ["modules/api_service.py"],
+        }
+
+    def test_the_2026_11_14_runs_give_one_dominant_401_host_blocker_group(self) -> None:
+        # #694, #705, #709 (twice), #710, #696 on 2026-11-14: the 401s from the
+        # real AGENT_API_KEY (#713) behind one shared signature.
+        runs = [self._run_401(exp) for exp in ("e694", "e705", "e709a", "e709b", "e710", "e696")]
+        client = FakeClient(json.dumps({"label": "host_blocker", "why": "credential rejected"}))
+        report = ft.replay(runs, client=client)
+        self.assertEqual(len(report["runs"]), 6)
+        for run in report["runs"]:
+            self.assertEqual(len(run["groups"]), 1)
+            group = run["groups"][0]
+            self.assertEqual(group["count"], 40)
+            self.assertIn("AssertionError", group["signature"])
+            self.assertEqual(group["label"], "host_blocker")
+            self.assertEqual(group["source"], "rule")
+            # The model agrees with the rule label on every replayed run.
+            self.assertEqual(group["model_label"], "host_blocker")
+        self.assertEqual(report["rule_agreement"]["agree"], 6)
+        self.assertEqual(report["rule_agreement"]["disagree"], 0)
+        self.assertEqual(report["model_calls"], 6)
+        self.assertIsNotNone(report["median_seconds_per_group"])
+
+    def test_the_718_run_gives_at_most_three_groups_with_the_dominant_one_host_blocker(self) -> None:
+        # #718 on 2026-11-16: about 90 tests in test_task_orchestrator/177/202/
+        # 218/234/public_logs with one shared cause.
+        files = [
+            "tests/test_task_orchestrator.py", "tests/test_issue_177_resolved_tool_execution.py",
+            "tests/test_issue_202_*.py", "tests/test_issue_218_*.py",
+            "tests/test_issue_234_*.py", "tests/test_public_logs.py",
+        ]
+        tails = {}
+        for index in range(88):
+            test_file = files[index % len(files)]
+            tails[f"{test_file}::test_{index}"] = (
+                f'  File "/tmp/y{index}/{test_file}", line {index}\n'
+                "E   AssertionError: assert 401 == 200\n"
+            )
+        tails["tests/test_task_orchestrator.py::test_timeout"] = "TimeoutError"
+        tails["tests/test_public_logs.py::test_value"] = "ValueError: boom 7"
+        run = {"experiment_id": "e718", "tails": tails,
+               "changed_files": ["modules/nexus_tick.py"]}
+        client = FakeClient(json.dumps({"label": "experiment_fault", "why": "single test"}))
+        report = ft.replay([run], client=client)
+        groups = report["runs"][0]["groups"]
+        self.assertLessEqual(len(groups), 3)
+        self.assertEqual(groups[0]["count"], 88)
+        self.assertEqual(groups[0]["label"], "host_blocker")
+        self.assertEqual(groups[0]["source"], "rule")
+        # The small tail groups went to the model, not the rule.
+        self.assertTrue(all(g["source"] == "model" for g in groups[1:]))
+
+    def test_replay_without_a_model_labels_rule_groups_and_marks_the_rest_unavailable(self) -> None:
+        report = ft.replay([self._run_401("e694", count=12)], client=None,
+                           repo=None, check_rule_against_model=False)
+        group = report["runs"][0]["groups"][0]
+        self.assertEqual(group["label"], "host_blocker")
+        self.assertEqual(group["source"], "rule")
+        self.assertIsNone(report["median_seconds_per_group"])
 
 
 if __name__ == "__main__":
