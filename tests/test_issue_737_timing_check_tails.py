@@ -221,11 +221,20 @@ def test_failed_closed_without_control_carries_drift_tails(service):
     svc, repo, base = service
     b = "tests/test_new.py::test_x[b]"
     run = _fake_run({b: "drift b"}, {}, "error")
-    with patch("modules.timing_check.run_timing_check", side_effect=run):
+    # #727: the failed-closed reason also carries the triage note; the local
+    # model is unavailable here (a plain MagicMock is not awaitable), so the
+    # single-test group is labelled unclear.
+    with patch("modules.timing_check.run_timing_check", side_effect=run), \
+            patch("modules.failure_triage._default_client", return_value=MagicMock()):
         experiment_id, result = _verify(svc, repo, base)
-    assert result.error == "timing check failed closed: error: control run without drift gave no verdict"
+    assert result.error == (
+        "timing check failed closed: error: control run without drift gave no verdict"
+        "; failure triage: unclear: drift b (1 tests)"
+    )
     (event,) = _events(svc, experiment_id, "timing_check_failed_closed")
     assert event["tails"] == {b: "drift b"}
+    # Lists are stringified by the logger; the triage note is in there.
+    assert "unclear" in event["failure_triage"] and "drift b" in event["failure_triage"]
 
 
 def test_logger_keeps_a_flat_text_map_structured_but_sanitized(tmp_path: Path):

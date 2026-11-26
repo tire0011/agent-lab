@@ -316,6 +316,8 @@ class VerificationMixin:
         # Per-test failure text by exact node id (#737), for the events below.
         drift_tails: dict[str, str] = {}
         control_tails: dict[str, str] = {}
+        # #727: the files this experiment changed, for the failure triage.
+        changed_files: set[str] = set()
         try:
             # The HEAD diff alone misses work a GitHub checkpoint already
             # committed, so the paths changed since the base count too.
@@ -324,6 +326,7 @@ class VerificationMixin:
                 self._files_changed_since(base_commit, worktree_path, elog)
                 if base_commit else set()
             )
+            changed_files = set(paths) | timing_check_module._changed_paths(head_diff)
             diff = head_diff + "\n" + "".join(
                 f"diff --git a/{path} b/{path}\n" for path in sorted(paths)
             )
@@ -409,8 +412,86 @@ class VerificationMixin:
         else:
             tails = dict(drift_tails)
         error = f"timing check failed closed: {result}"
-        elog.warning("verifying", "timing_check_failed_closed", error, tails=tails)
+        triaged: list[dict[str, Any]] = []
+        try:
+            # #727: group the tails by error signature and label the top groups.
+            triage_note, triaged = self._triage_timing_failures(
+                experiment_id, tails, changed_files, worktree_path, elog,
+            )
+            if triage_note:
+                error = f"{error}{triage_note}"
+        except Exception as exc:  # noqa: BLE001 - triage never changes the verdict
+            elog.error(
+                "verifying", "failure_triage_failed",
+                "Could not triage the failed-closed timing check's failure tails", exc=exc,
+            )
+        elog.warning(
+            "verifying", "timing_check_failed_closed", error, tails=tails,
+            failure_triage=[
+                {
+                    "signature": group.get("signature"), "label": group.get("label"),
+                    "why": group.get("why"), "count": group.get("count"),
+                    "source": group.get("source"),
+                }
+                for group in triaged
+            ],
+        )
         return STATUS_NEEDS_REVIEW, error
+
+
+    def _triage_timing_failures(
+        self, experiment_id: str, tails: dict[str, str], changed_files: set[str],
+        worktree_path: str, elog: ExperimentLogger,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """#727: group the failure tails by signature and label the top groups.
+
+        Returns the suffix for the needs_review reason and the labelled
+        groups. The groups are stored in the run_store table
+        ``failure_triage`` (MCP tool ``failure_triage_list``); one
+        ``host_blocker`` group is fed to #714's detector as an early signal,
+        so it then needs 2 experiments instead of 3. Never raises.
+        """
+        from modules import failure_triage
+
+        groups = failure_triage.group_failures(tails)
+        if not groups:
+            return "", []
+        triaged = failure_triage.triage(
+            groups[:failure_triage.TOP_GROUPS], sorted(changed_files),
+            tails=tails, repo=worktree_path,
+        )
+        note = "; failure triage: " + "; ".join(
+            f"{group['label']}: {group['signature']} ({group['count']} tests)"
+            for group in triaged
+        )
+        with self._lock:
+            failure_triage.record_triage(self._conn, experiment_id, triaged)
+        host = next(
+            (group for group in triaged
+             if group.get("label") == failure_triage.LABEL_HOST_BLOCKER),
+            None,
+        )
+        if host is not None:
+            with self._lock:
+                failure_triage.record_early_signal(self._conn, experiment_id, host)
+            elog.info(
+                "verifying", "failure_triage_host_blocker",
+                "A host_blocker failure group is fed to the #714 detector as an early "
+                "signal: it now needs 2 experiments instead of 3",
+                signature=host.get("signature"), count=host.get("count"),
+            )
+        elog.info(
+            "verifying", "failure_triage_done",
+            f"Triaged {len(triaged)} failure group(s) of the failed-closed timing check",
+            groups=[
+                {
+                    "signature": group.get("signature"), "label": group.get("label"),
+                    "count": group.get("count"), "source": group.get("source"),
+                }
+                for group in triaged
+            ],
+        )
+        return note, triaged
 
 
     def _timing_base_drift(

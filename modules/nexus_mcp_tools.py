@@ -23,6 +23,7 @@ READ_ONLY_TOOLS: tuple[str, ...] = (
     "experiments_gate_recheck",
     "reverifications_list",
     "known_drift_tests_list",
+    "failure_triage_list",
     "experiment_get",
     "experiment_drift_get",
     "experiment_reflection_get",
