@@ -486,8 +486,10 @@ class NexusInitiativeService:
             return 0
 
     def _provider_extra_left(self) -> str | None:
-        """A coding provider with an unused ``extra_budget_<provider>`` (mailbox,
-        valid 24 hours), installed and not cooling down; ``None`` if there is none."""
+        """A coding provider with unused extra starts, installed and not cooling
+        down; ``None`` if there is none. Its allowance per rolling 24 hours is the
+        standing ``daily_extra_<provider>`` plus an ``extra_budget_<provider>``
+        set within the last 24 hours (both by mailbox)."""
         from modules.coding_provider import available_providers, provider_cooldowns
 
         try:
@@ -496,28 +498,36 @@ class NexusInitiativeService:
         except Exception:  # noqa: BLE001 - no extra start rather than a broken tick
             return None
         now = _utcnow()
+        day_ago = now - timedelta(days=1)
         for provider in providers:
             if provider in cooled:
                 continue
             try:
+                allowance = 0
+                daily = self._conn.execute(
+                    "SELECT value FROM service_settings WHERE key = ?",
+                    (f"nexus.daily_extra.{provider}",),
+                ).fetchone()
+                if daily:
+                    allowance += int(daily[0])
                 row = self._conn.execute(
                     "SELECT value, updated_at FROM service_settings WHERE key = ?",
                     (f"nexus.extra_budget.{provider}",),
                 ).fetchone()
-                if not row:
+                if row:
+                    set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+                    if set_at.tzinfo is None:
+                        set_at = set_at.replace(tzinfo=timezone.utc)
+                    if now - set_at <= timedelta(days=1):
+                        allowance += int(row[0])
+                if allowance <= 0:
                     continue
-                set_at = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
-                if set_at.tzinfo is None:
-                    set_at = set_at.replace(tzinfo=timezone.utc)
-                if now - set_at > timedelta(days=1):
-                    continue
-                since = max(set_at, now - timedelta(days=1)).isoformat()
                 used = self._conn.execute(
                     "SELECT COUNT(*) FROM nexus_initiative_log "
                     "WHERE decision = 'dispatched' AND detail = ? AND created_at >= ?",
-                    (PROVIDER_EXTRA_PREFIX + provider, since),
+                    (PROVIDER_EXTRA_PREFIX + provider, day_ago.isoformat()),
                 ).fetchone()[0]
-                if int(row[0]) > int(used):
+                if allowance > int(used):
                     return provider
             except (sqlite3.Error, ValueError, TypeError):
                 continue

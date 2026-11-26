@@ -26,7 +26,8 @@ from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-REVIEWERS: tuple[str, ...] = ("claude", "codex", "azure")
+# Mistral reviews through the Vibe CLI on the owner's subscription (2026-11-26).
+REVIEWERS: tuple[str, ...] = ("claude", "codex", "mistral", "azure")
 VERDICT_APPROVE = "approve"
 VERDICT_BLOCK = "block"
 
@@ -217,6 +218,7 @@ class NexusReviewer:
         self._runners = runners if runners is not None else {
             "claude": lambda prompt, root: _run_claude(prompt, root, self.db_path),
             "codex": lambda prompt, root: _run_codex(prompt, root, self.db_path),
+            "mistral": lambda prompt, root: _run_mistral(prompt, root, self.db_path),
             "azure": lambda prompt, root: _run_azure(prompt, root, self.db_path),
         }
         with self._connect() as conn:
@@ -375,8 +377,25 @@ def _run_codex(prompt: str, worktree_path: str, db_path: str | None = None) -> s
     return result.final_message or ""
 
 
+def _run_mistral(prompt: str, worktree_path: str, db_path: str | None = None,
+                 *, phase: str = "review", timeout_seconds: int = 2 * _AGENT_TIMEOUT_SECONDS) -> str:
+    from modules.vibe_worker import VibeWorker, vibe_available
+
+    if not vibe_available():
+        raise RuntimeError("vibe CLI not installed")
+    # Vibe is slower than the other agents (about 30 min per implementation).
+    result = VibeWorker(db_path=db_path).run(
+        task=prompt, working_dir=worktree_path, sandbox="read-only",
+        timeout_seconds=timeout_seconds, stall_seconds=2 * _AGENT_STALL_SECONDS, phase=phase,
+    )
+    if not result.success:
+        raise RuntimeError(result.error or "mistral review failed")
+    return result.final_message or ""
+
+
+# 3000, not 1500: 2026-11-25 a follow-up review answer did not fit (#834).
 def _run_azure(prompt: str, worktree_path: str, db_path: str | None = None,
-               *, phase: str = "review", max_tokens: int = 1500) -> str:
+               *, phase: str = "review", max_tokens: int = 3000) -> str:
     import asyncio
     import os
     import time
