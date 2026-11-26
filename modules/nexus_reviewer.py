@@ -96,7 +96,8 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
         'what the task asks; "elsewhere" = it needs a change outside this '
         'repository or a decision by the owner; "after_merge" = a step that '
         'can only happen after this change is merged and deployed (measuring '
-        'future ticks or live data, closing other issues, posting a report) - '
+        'future ticks or live data, closing other issues, posting a report), '
+        'or a measurement on production data such as stored history - '
         'never block for it, it becomes a follow-up.\n\n'
         + (
             "QUALITY GATE FINDINGS: a deterministic check that reads file paths "
@@ -136,7 +137,8 @@ def follow_up_prompt(goal: str, diff: str, findings: str, *, can_read_files: boo
         "behaviour or weakens a security, safety or budget check (kind \"regression\"). "
         "Any other new finding does NOT block: list it with kind \"follow_up\"; it "
         "becomes a follow-up issue. Steps only possible after the merge (measuring "
-        "future ticks, closing other issues) are \"follow_up\" too.\n\n"
+        "future ticks, closing other issues) and missing measurements on production "
+        "data (stored history, the live database) are \"follow_up\" too.\n\n"
         "Answer with exactly one JSON object and nothing else:\n"
         '{"verdict": "approve" or "block", "summary": "<one or two sentences>", '
         '"problems": [{"kind": "unfixed|regression|follow_up", "problem": "<what and where>"}]}\n\n'
