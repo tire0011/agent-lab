@@ -420,6 +420,23 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             rows = list_known_drift(service._conn, value)
         return {"known_drift_tests": rows, "count": len(rows)}
 
+    @mcp.tool(
+        description="Failure-triage groups of failed-closed no-drift verification runs (#727): "
+        "error signature, local-model label (host_blocker|experiment_fault|unclear), why, "
+        "and the test ids per group.",
+        structured_output=True,
+    )
+    def failure_triage_list(
+        limit: int | None = None, experiment_id: str | None = None,
+    ) -> dict[str, Any]:
+        from modules.failure_triage import list_triage
+
+        value = 50 if limit is None else _validate_limit(limit, minimum=1, maximum=200)
+        service = _api()._resolve_experiment_service()
+        with service._lock:
+            rows = list_triage(service._conn, experiment_id=experiment_id, limit=value)
+        return {"failure_triage": rows, "count": len(rows)}
+
     @mcp.tool(description="GET /experiments/{experiment_id}", structured_output=True)
     def experiment_get(experiment_id: str) -> dict[str, Any]:
         nexus_api = _api()

@@ -1222,6 +1222,14 @@ class OperationsRegistry:
                 reason = sanitized_reason(check.error_summary) or "Statusprüfung fehlgeschlagen."
                 failure_details.append(f"{unit}: {reason}")
 
+        try:
+            from modules.gate_self_repair import status_lines
+
+            gate_lines = status_lines(self._conn)
+        except Exception:  # noqa: BLE001 - informational only
+            gate_lines = []
+        output_lines.append("gates switched off: " + ("; ".join(gate_lines) if gate_lines else "none"))
+
         return OperationResult(
             operation="mailbox_status",
             success=not failed_checks,

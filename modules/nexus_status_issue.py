@@ -43,6 +43,15 @@ def render(conn: sqlite3.Connection, *, now: datetime, budget: int, spent: int,
         state = "idle, waiting for the next tick (every 15 min)"
     lines.append(f"**State:** {state}")
     lines.append(f"**Budget:** {spent} of {budget or 'unlimited'} paid starts used in the last 24h")
+    try:
+        from modules.gate_self_repair import status_lines
+
+        gate_lines = status_lines(conn)
+    except Exception:  # noqa: BLE001 - the status never fails on one section
+        gate_lines = []
+    if gate_lines:
+        lines += ["", "**Gates switched off (host_blocker, #714)**", ""]
+        lines += [f"- {line}" for line in gate_lines]
     lines += ["", "**Recent experiments**", ""]
     try:
         rows = conn.execute(

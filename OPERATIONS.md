@@ -198,7 +198,16 @@ run continues for as long as tests keep starting and finishing.
   tests; `timing_check_failed_closed` has the control run's text for tests
   that fail without drift too, else the drift run's (#737).
   The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
-  `tests/conftest.py`); tests of the check opt in. To replay merged commits,
+  `tests/conftest.py`); tests of the check opt in. When the check fails
+  closed, the tails are also grouped by error signature and labelled
+  (#727, `modules/failure_triage.py`): the top 3 groups and their labels
+  (`host_blocker` | `experiment_fault` | `unclear`, from a deterministic
+  rule first, else the local 7B) are appended to the `needs_review` reason
+  and stored per verification attempt in the run_store table
+  `failure_triage` - read them with the MCP tool `failure_triage_list`.
+  One `host_blocker` group is fed to the #714 gate-self-repair detector as
+  an early signal, so it then needs 2 experiments instead of 3
+  (`modules/gate_self_repair.py`). To replay merged commits,
   run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`
   (`--drift-ms`, `--timeout` per commit, default 900 s; `--last` walks HEAD
   unless `--ref` is given, so use `--ref main` from an experiment branch). It
