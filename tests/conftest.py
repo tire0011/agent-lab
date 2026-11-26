@@ -199,3 +199,5 @@ os.environ["NEXUS_HEALTH_CHECK"] = "0"
 os.environ["NEXUS_CLI_UPDATE"] = "0"
 # Nor the weekly open review, which would start a real coding agent (modules/weekly_review).
 os.environ["NEXUS_WEEKLY_REVIEW"] = "0"
+# Nor prune this machine's real experiment or Vibe logs (modules/log_retention).
+os.environ["NEXUS_LOG_RETENTION"] = "0"
