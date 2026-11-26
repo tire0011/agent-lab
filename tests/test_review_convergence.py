@@ -31,11 +31,11 @@ class ParseTests(unittest.TestCase):
         self.assertIn("(2) rare", parse_review(raw)[1])
 
     def test_first_block_always_blocks(self):
-        self.assertEqual(converge("block", "s", [("edge_case", "rare")], 0)[0], "block")
+        self.assertEqual(converge("block", "s", [("edge_case", "rare")], False)[0], "block")
 
     def test_later_block_with_only_edge_cases_approves_and_defers_them(self):
         verdict, summary, deferred = converge(
-            "block", "s Blocking problems: (1) rare", [("edge_case", "rare"), ("elsewhere", "mailbox client")], 1)
+            "block", "s Blocking problems: (1) rare", [("edge_case", "rare"), ("elsewhere", "mailbox client")], True)
         self.assertEqual(verdict, "approve")
         self.assertIn("deferred to follow-up", summary)
         self.assertEqual(deferred, [("edge_case", "rare"), ("elsewhere", "mailbox client")])
@@ -43,14 +43,14 @@ class ParseTests(unittest.TestCase):
     def test_after_merge_steps_never_block_not_even_the_first_review(self):
         """#799: 'measure the next 20 ticks' blocked every attempt with all three reviewers."""
         verdict, _summary, deferred = converge(
-            "block", "s", [("after_merge", "run the probe on the next 20 ticks")], 0)
+            "block", "s", [("after_merge", "run the probe on the next 20 ticks")], False)
         self.assertEqual(verdict, "approve")
         self.assertEqual(deferred, [("after_merge", "run the probe on the next 20 ticks")])
-        self.assertEqual(converge("block", "s", [("after_merge", "x"), ("edge_case", "y")], 0)[0], "block")
+        self.assertEqual(converge("block", "s", [("after_merge", "x"), ("edge_case", "y")], False)[0], "block")
         self.assertIn('"after_merge"', nexus_reviewer.review_prompt("g", "d", can_read_files=True))
 
     def test_later_block_with_a_real_bug_still_blocks(self):
-        self.assertEqual(converge("block", "s", [("edge_case", "rare"), ("regression", "drops check")], 3)[0],
+        self.assertEqual(converge("block", "s", [("edge_case", "rare"), ("regression", "drops check")], True)[0],
                          "block")
 
 
@@ -76,19 +76,34 @@ class ReviewerTests(unittest.TestCase):
         self.assertEqual(second.verdict, "approve")
         self.assertEqual(second.deferred, [("edge_case", "a late worker start can outrun the deadline")])
 
-    def test_from_the_third_attempt_new_bugs_must_be_named_in_the_task(self):
+    def test_later_reviews_only_check_the_first_reviews_findings(self):
+        """Owner rule 2026-11-25: the 2nd and 3rd review check that the first
+        review's findings are fixed; other new findings never block."""
         prompts = []
-        answer = _answer(("bug", "concurrent push publishes a pending job"))
+        answers = iter([
+            _answer(("bug", "migration runs without a lock")),           # 1st review
+            _answer(("unfixed", "migration runs without a lock")),       # 2nd: not fixed
+            _answer(("follow_up", "a 5000-digit cache value is slow")),  # 3rd: only new
+        ])
         reviewer = NexusReviewer(db_path=self.db, runners={
-            n: (lambda p, w, n=n: prompts.append((n, p)) or answer) for n in ("codex", "claude")})
+            n: (lambda p, w, n=n: prompts.append((n, p)) or next(answers)) for n in ("codex", "claude")})
         with sqlite3.connect(self.db) as conn:
             conn.execute("INSERT INTO github_experiment_links VALUES (797, 'e3')")
         with mock.patch.object(nexus_reviewer, "REVIEWERS", ("codex", "claude")):
-            for exp in ("e1", "e2", "e3"):
-                reviewer.review(experiment_id=exp, goal="g", worktree_path=".", base_sha="")
-        self.assertNotIn("STRICT SCOPE", prompts[1][1])
-        self.assertIn("STRICT SCOPE: this task has been blocked 2 times already", prompts[2][1])
+            results = [reviewer.review(experiment_id=e, goal="g", worktree_path=".", base_sha="")
+                       for e in ("e1", "e2", "e3")]
+        self.assertEqual([r.verdict for r in results], ["block", "block", "approve"])
+        self.assertEqual(results[2].deferred, [("follow_up", "a 5000-digit cache value is slow")])
+        self.assertNotIn("FOLLOW-UP REVIEW", prompts[0][1])
+        for _name, prompt in prompts[1:]:
+            self.assertIn("Check ONLY whether each of these findings is fixed", prompt)
+            self.assertIn("migration runs without a lock", prompt)  # the FIRST review's findings
         self.assertEqual([name for name, _ in prompts], ["codex", "claude", "codex"])
+
+    def test_a_plain_problem_in_a_follow_up_counts_as_unfixed(self):
+        self.assertEqual(converge("block", "s", [("unfixed", "x")], True)[0], "block")
+        raw = json.dumps({"verdict": "block", "summary": "s", "problems": ["still broken"]})
+        self.assertEqual(parse_problems(raw, "unfixed"), [("unfixed", "still broken")])
 
     def test_the_prompt_asks_for_problem_kinds(self):
         prompt = nexus_reviewer.review_prompt("g", "d", can_read_files=True)
