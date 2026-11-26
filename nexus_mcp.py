@@ -522,6 +522,21 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(
+        description="GET /tick-replay - counterfactual replay of finished experiments since an ISO "
+        "date (default 30 days): actual vs simulated paid starts, saved starts and lost merges for "
+        "comma-separated policies (provider_cooldown, issue_loop_guard, same_gate_reason_x3; "
+        "default all) (#755)",
+        structured_output=True,
+    )
+    def tick_replay_get(since: str | None = None, policies: str | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        return _call_api(
+            nexus_api.get_tick_replay,
+            x_api_key=_internal_api_key(), since=since, policies=policies,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,

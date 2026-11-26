@@ -11,6 +11,7 @@ from models import (
     ReflectionsResponse,
 )
 from modules import experiment_reflection, local_shadow_replay, planner_shadow, review_size_stats
+from modules import tick_replay_store
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -192,6 +193,26 @@ def get_review_size_stats(
     """Finished experiments by changed lines with their merge/review shares (#821)."""
     api.authorize(x_api_key)
     return review_size_stats.size_vs_verdict(_reflection_db_path(service), days)
+
+
+@router.get("/tick-replay")
+def get_tick_replay(
+    x_api_key: str | None = Header(default=None),
+    since: str | None = Query(default=None, description="ISO date or time; default 30 days ago"),
+    policies: str | None = Query(default=None, description="comma-separated; default all"),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> dict:
+    """Paid starts the given policies would have saved, and merges they would have lost (#755)."""
+    api.authorize(x_api_key)
+    try:
+        report = tick_replay_store.report_dict(_reflection_db_path(service), since, policies)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=503, detail="run store not available") from exc
+    for row in report["first_skipped"] + report["lost_merges"]:
+        row["reason"] = redaction.redact(str(row["reason"]))
+    return report
 
 
 @router.post("/experiments/{experiment_id}/cancel", response_model=ExperimentDetail)
