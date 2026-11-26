@@ -20,25 +20,44 @@ def ensure_table(conn: sqlite3.Connection) -> None:
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
             error TEXT,
-            created_at TEXT
+            created_at TEXT,
+            prompt_variant TEXT,
+            cached_prompt_tokens INTEGER
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}
+    if "created_at" not in columns:
+        conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
+    if "prompt_variant" not in columns:
+        conn.execute("ALTER TABLE planner_shadow ADD COLUMN prompt_variant TEXT")
+    if "cached_prompt_tokens" not in columns:
+        conn.execute("ALTER TABLE planner_shadow ADD COLUMN cached_prompt_tokens INTEGER")
 
 
 def record(db_path: str, **values: Any) -> None:
     """Keep the first completed observation for each tick, including retries."""
+    cached = values.get("cached_prompt_tokens")
+    # Check the range before converting. The integer comparison also rejects
+    # NaN and infinities without converting large Python integers to floats.
+    values["cached_prompt_tokens"] = (
+        int(cached)
+        if (type(cached) is int or (type(cached) is float and cached.is_integer()))
+        and 0 <= cached <= 2**63 - 1
+        else None
+    )
+    values.setdefault("prompt_variant", None)
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
-        if "created_at" not in {row[1] for row in conn.execute("PRAGMA table_info(planner_shadow)")}:
-            conn.execute("ALTER TABLE planner_shadow ADD COLUMN created_at TEXT")
         values.setdefault("created_at", datetime.now(timezone.utc).isoformat())
         conn.execute(
             """INSERT INTO planner_shadow
-               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, created_at)
+               (tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error,
+                created_at, prompt_variant, cached_prompt_tokens)
                SELECT :tick_id, :paid_issue, :local_issue, :local_valid,
-                      :prompt_tokens, :seconds, :error, :created_at
+                      :prompt_tokens, :seconds, :error, :created_at, :prompt_variant,
+                      :cached_prompt_tokens
                WHERE NOT EXISTS (SELECT 1 FROM planner_shadow WHERE tick_id = :tick_id)""",
             values,
         )
@@ -47,9 +66,11 @@ def record(db_path: str, **values: Any) -> None:
 def list_shadow(db_path: str, limit: int = 20) -> dict[str, Any]:
     with sqlite3.connect(db_path, timeout=30) as conn:
         conn.row_factory = sqlite3.Row
+        conn.execute("BEGIN IMMEDIATE")
         ensure_table(conn)
         rows = [dict(row) for row in conn.execute(
-            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error "
+            "SELECT tick_id, paid_issue, local_issue, local_valid, prompt_tokens, seconds, error, "
+            "prompt_variant, cached_prompt_tokens "
             "FROM planner_shadow ORDER BY id DESC LIMIT ?", (limit,)
         )]
         all_rows = conn.execute(

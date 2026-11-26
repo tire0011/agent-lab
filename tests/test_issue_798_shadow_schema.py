@@ -178,7 +178,7 @@ class NexusTickShadowSchemaTests(unittest.TestCase):
             shadow = planner._shadow
             self.assertIsNotNone(shadow)
             result = shadow("the compact prompt", 123.0, allowed)
-        self.assertEqual(result, '{"issue": 3, "reason": "x"}')
+        self.assertEqual(result, ('{"issue": 3, "reason": "x"}', None))
         self.assertEqual(captured["timeout"], 123.0)
         self.assertIs(captured["stream"], False)
         self.assertEqual(captured["messages"], [{"role": "user", "content": "the compact prompt"}])
@@ -204,7 +204,7 @@ class NexusTickShadowSchemaTests(unittest.TestCase):
         import nexus_tick
 
         source = inspect.getsource(nexus_tick._planner)
-        self.assertIn("def shadow(prompt: str, timeout: float, allowed: set[int]) -> str:", source)
+        self.assertIn("def shadow(prompt: str, timeout: float, allowed: set[int])", source)
         self.assertIn('"enum": sorted(allowed)', source)
         self.assertIn('"maxLength": 160', source)
 

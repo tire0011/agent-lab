@@ -26,7 +26,8 @@ from modules.run_store import DEFAULT_DB_PATH
 
 logger = logging.getLogger(__name__)
 
-REVIEWERS: tuple[str, ...] = ("claude", "codex", "azure")
+# Mistral reviews through the Vibe CLI on the owner's subscription (2026-11-26).
+REVIEWERS: tuple[str, ...] = ("claude", "codex", "mistral", "azure")
 VERDICT_APPROVE = "approve"
 VERDICT_BLOCK = "block"
 
@@ -36,21 +37,18 @@ _AGENT_TIMEOUT_SECONDS = 900
 _AGENT_STALL_SECONDS = 300
 
 
-# Kinds of a blocking problem. From the second block on the same issue only
-# BLOCKING_KINDS still block; the others go to a follow-up issue (edge_case)
-# or to the owner (elsewhere) - 2026-11-22: 66 blocked vs 56 adopted, and
-# issues like #782 and #763 took 3-4 rounds, each finding a new edge case.
-# after_merge: a step only possible once the change is merged and deployed
-# (measuring the next ticks, closing other issues, posting a report). It never
-# blocks, not even on the first review: 2026-11-24 #799 asked to measure the
-# next 20 ticks, and all three reviewers blocked every attempt for it.
-PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere", "after_merge")
-BLOCKING_KINDS = ("task", "bug", "regression")
-CONVERGE_AFTER_BLOCKS = 1
-# From the third attempt (two earlier blocks) a new bug blocks only when it
-# breaks a case the task names (2026-11-23: Codex blocked five adoptions in a
-# row, each retry with a new finding).
-STRICT_AFTER_BLOCKS = 2
+# Kinds of a blocking problem. after_merge: a step only possible once the
+# change is merged and deployed (measuring the next ticks, closing other issues,
+# posting a report); it never blocks (2026-11-24: #799 was blocked by all three
+# reviewers for a 20-tick probe).
+PROBLEM_KINDS = ("task", "bug", "regression", "edge_case", "elsewhere", "after_merge",
+                 "unfixed", "follow_up")
+# Follow-up reviews (owner rule 2026-11-25): the second and later review of an
+# issue only checks that the first review's findings are fixed. Only an unfixed
+# finding or a regression blocks; any other new finding goes to a follow-up
+# issue (2026-11-23: Codex found a new problem in every round, five blocks in
+# a row).
+FOLLOW_UP_BLOCKING_KINDS = ("unfixed", "regression")
 
 
 @dataclass(slots=True)
@@ -58,7 +56,7 @@ class ReviewResult:
     reviewer: str
     verdict: str
     summary: str
-    # (kind, problem) deferred instead of blocking; see CONVERGE_AFTER_BLOCKS.
+    # (kind, problem) deferred instead of blocking; see converge().
     deferred: list[tuple[str, str]] = field(default_factory=list)
 
     @property
@@ -67,8 +65,9 @@ class ReviewResult:
 
 
 def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: str = "",
-                  earlier_findings: str = "", model_written_tests: str = "",
-                  earlier_blocks: int = 0) -> str:
+                  earlier_findings: str = "", model_written_tests: str = "") -> str:
+    if earlier_findings:
+        return follow_up_prompt(goal, diff, earlier_findings, can_read_files=can_read_files)
     look = (
         "You are in the repository with the change applied and may read any file "
         "to check the change in context.\n\n"
@@ -109,24 +108,6 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
             "task that asks for tests only: approve and say why).\n\n"
             if gate_findings else ""
         )
-        + (
-            "FOLLOW-UP REVIEW: an earlier review blocked a previous attempt at this "
-            f"task with these findings:\n{earlier_findings[:4000]}\n"
-            "First check each of them against this new attempt. Block again if "
-            "one of them is not fixed. Block for a NEW problem only when it is "
-            "serious: it breaks existing behaviour, loses data, weakens a "
-            "security, safety or budget check, or can loop. Mention smaller new "
-            "findings in the summary without blocking.\n\n"
-            if earlier_findings else ""
-        )
-        + (
-            f"STRICT SCOPE: this task has been blocked {earlier_blocks} times already. "
-            "A new problem counts as \"bug\" only when it breaks a case the TASK text "
-            "explicitly names; any other new problem is an \"edge_case\", however "
-            "serious it seems, unless it is a \"regression\". An earlier finding that "
-            "is still not fixed keeps its kind.\n\n"
-            if earlier_blocks >= STRICT_AFTER_BLOCKS else ""
-        )
         + f"TASK:\n{goal[:8000]}\n\n"
         + (
             # #636: the coder got these as suggestions; they are not part of the
@@ -141,42 +122,67 @@ def review_prompt(goal: str, diff: str, *, can_read_files: bool, gate_findings: 
     )
 
 
-def _problems(problems: list) -> list[tuple[str, str]]:
-    """``(kind, text)`` per problem; a plain string or unknown kind is a ``bug``."""
+def follow_up_prompt(goal: str, diff: str, findings: str, *, can_read_files: bool) -> str:
+    """Second and later reviews: check the first review's findings, nothing else blocks."""
+    look = ("You are in the repository with the change applied and may read any file.\n\n"
+            if can_read_files else "")
+    return (
+        "FOLLOW-UP REVIEW of a change Nexus, a self-developing agent, made to its own "
+        "code. Its tests already pass. The first review of this task blocked an earlier "
+        "attempt with these findings:\n"
+        f"{findings[:4000]}\n\n" + look +
+        "Check ONLY whether each of these findings is fixed in this attempt. Block if one "
+        "is not fixed (kind \"unfixed\"), or if the change clearly breaks existing "
+        "behaviour or weakens a security, safety or budget check (kind \"regression\"). "
+        "Any other new finding does NOT block: list it with kind \"follow_up\"; it "
+        "becomes a follow-up issue. Steps only possible after the merge (measuring "
+        "future ticks, closing other issues) are \"follow_up\" too.\n\n"
+        "Answer with exactly one JSON object and nothing else:\n"
+        '{"verdict": "approve" or "block", "summary": "<one or two sentences>", '
+        '"problems": [{"kind": "unfixed|regression|follow_up", "problem": "<what and where>"}]}\n\n'
+        f"TASK:\n{goal[:4000]}\n\nDIFF:\n{diff[:_DIFF_CHARS]}"
+    )
+
+
+def _problems(problems: list, default: str = "bug") -> list[tuple[str, str]]:
+    """``(kind, text)`` per problem; a plain string or unknown kind gets *default*."""
     out = []
     for item in problems:
         if isinstance(item, dict):
             kind = str(item.get("kind") or "").strip().lower()
             text = " ".join(str(item.get("problem") or "").split())
         else:
-            kind, text = "bug", " ".join(str(item).split())
+            kind, text = default, " ".join(str(item).split())
         if text:
-            out.append((kind if kind in PROBLEM_KINDS else "bug", text))
+            out.append((kind if kind in PROBLEM_KINDS else default, text))
     return out
 
 
-def parse_problems(raw: str) -> list[tuple[str, str]]:
+def parse_problems(raw: str, default: str = "bug") -> list[tuple[str, str]]:
     data = _json_object(raw or "")
     problems = data.get("problems") if data else None
-    return _problems(problems) if isinstance(problems, list) else []
+    return _problems(problems, default) if isinstance(problems, list) else []
 
 
 def converge(verdict: str, summary: str, problems: list[tuple[str, str]],
-             earlier_blocks: int) -> tuple[str, str, list[tuple[str, str]]]:
-    """From the second block on: only task, bug and regression problems block;
-    edge cases and outside work are deferred. Returns (verdict, summary, deferred)."""
-    if verdict != VERDICT_BLOCK or not problems:
+             follow_up: bool) -> tuple[str, str, list[tuple[str, str]]]:
+    """after_merge never blocks; in a follow-up review only unfixed findings and
+    regressions block. Returns (verdict, summary, deferred)."""
+    if not problems:
         return verdict, summary, []
-    deferrable = {"after_merge"} | (
-        {"edge_case", "elsewhere"} if earlier_blocks >= CONVERGE_AFTER_BLOCKS else set())
-    if any(kind not in deferrable for kind, _text in problems):
-        return verdict, summary, []
+    blocking = [k for k, _t in problems
+                if (k in FOLLOW_UP_BLOCKING_KINDS if follow_up else k != "after_merge")]
+    deferred = [(k, t) for k, t in problems
+                if (k not in FOLLOW_UP_BLOCKING_KINDS if follow_up else k == "after_merge")]
+    if verdict != VERDICT_BLOCK or blocking:
+        # An approval keeps its non-blocking findings as follow-ups.
+        return verdict, summary, (deferred if verdict == VERDICT_APPROVE else [])
     head = summary.split(" Blocking problems:")[0]
-    listed = " ".join(f"({i}) [{kind}] {text[:400]}" for i, (kind, text) in enumerate(problems, 1))
+    listed = " ".join(f"({i}) [{kind}] {text[:400]}" for i, (kind, text) in enumerate(deferred, 1))
     return (VERDICT_APPROVE,
-            f"{head} Approved after {earlier_blocks} earlier block(s): no remaining task, bug or "
-            f"regression problem; deferred to follow-up: {listed}"[:4000],
-            problems)
+            f"{head} Approved: no unfixed finding or regression remains; deferred to "
+            f"follow-up: {listed}"[:4000],
+            deferred)
 
 
 def parse_review(raw: str) -> tuple[str, str] | None:
@@ -212,6 +218,7 @@ class NexusReviewer:
         self._runners = runners if runners is not None else {
             "claude": lambda prompt, root: _run_claude(prompt, root, self.db_path),
             "codex": lambda prompt, root: _run_codex(prompt, root, self.db_path),
+            "mistral": lambda prompt, root: _run_mistral(prompt, root, self.db_path),
             "azure": lambda prompt, root: _run_azure(prompt, root, self.db_path),
         }
         with self._connect() as conn:
@@ -239,9 +246,9 @@ class NexusReviewer:
         start = (REVIEWERS.index(row[0]) + 1) % len(REVIEWERS) if row and row[0] in REVIEWERS else 0
         return [REVIEWERS[(start + i) % len(REVIEWERS)] for i in range(len(REVIEWERS))]
 
-    def _earlier_block(self, experiment_id: str) -> tuple[str, str] | None:
-        """``(reviewer, findings)`` of the latest review that blocked another
-        attempt at the same issue, so that reviewer checks its own findings."""
+    def _earlier_block(self, experiment_id: str, *, first: bool = False) -> tuple[str, str] | None:
+        """``(reviewer, findings)`` of the latest (or *first*) review that blocked
+        another attempt at the same issue."""
         try:
             with self._connect() as conn:
                 row = conn.execute(
@@ -250,30 +257,13 @@ class NexusReviewer:
                     JOIN github_experiment_links other ON other.experiment_id = r.experiment_id
                     JOIN github_experiment_links mine ON mine.issue_number = other.issue_number
                     WHERE mine.experiment_id = ? AND r.experiment_id != ? AND r.verdict = ?
-                    ORDER BY r.id DESC LIMIT 1
-                    """,
+                    ORDER BY r.id {order} LIMIT 1
+                    """.format(order="ASC" if first else "DESC"),
                     (experiment_id, experiment_id, VERDICT_BLOCK),
                 ).fetchone()
         except sqlite3.Error:
             return None
         return (str(row[0]), str(row[1])) if row and row[0] in REVIEWERS else None
-
-    def _earlier_block_count(self, experiment_id: str) -> int:
-        """Blocking reviews of other attempts at the same issue."""
-        try:
-            with self._connect() as conn:
-                row = conn.execute(
-                    """
-                    SELECT COUNT(*) FROM nexus_pr_reviews r
-                    JOIN github_experiment_links other ON other.experiment_id = r.experiment_id
-                    JOIN github_experiment_links mine ON mine.issue_number = other.issue_number
-                    WHERE mine.experiment_id = ? AND r.experiment_id != ? AND r.verdict = ?
-                    """,
-                    (experiment_id, experiment_id, VERDICT_BLOCK),
-                ).fetchone()
-        except sqlite3.Error:
-            return 0
-        return int(row[0]) if row else 0
 
     def latest_blocking_review(self, experiment_id: str) -> tuple[str, str] | None:
         """Return the persisted findings before the adoption reason's clipping."""
@@ -293,27 +283,23 @@ class NexusReviewer:
         diff = (_diff(worktree_path, base_sha, exact_base=True) if earlier_review
                 else _diff(worktree_path, base_sha))
         result = None
-        earlier = earlier_review or self._earlier_block(experiment_id)
+        latest = earlier_review or self._earlier_block(experiment_id)
+        # The findings to check are the first review's (owner rule 2026-11-25).
+        first = earlier_review or self._earlier_block(experiment_id, first=True)
         order = [earlier_review[0]] if earlier_review else self._order()
-        if earlier is not None and earlier_review is None:
-            # A retry goes to another reviewer, which checks the earlier findings
-            # first; the blocking one only stands in. Sending retries back to it
-            # (#642) let one reviewer find a new problem in every round
-            # (2026-11-23: five Codex blocks in a row). The strict scope from the
-            # third attempt stops new edge cases from blocking.
-            order = [*[name for name in order if name != earlier[0]], earlier[0]]
-        earlier_blocks = self._earlier_block_count(experiment_id) if earlier_review is None else 0
+        if latest is not None and earlier_review is None:
+            # A retry goes to another reviewer; the latest blocking one only
+            # stands in (2026-11-23: five Codex blocks in a row).
+            order = [*[name for name in order if name != latest[0]], latest[0]]
+        follow_up = first is not None
         for name in order:
             runner = self._runners.get(name)
             if runner is None:
                 continue
             prompt = review_prompt(
                 goal, diff, can_read_files=name != "azure", gate_findings=gate_findings,
-                # A stand-in for that reviewer checks the same findings (#642: claude
-                # gave no verdict, and codex reviewed the retry from scratch).
-                earlier_findings=earlier[1] if earlier is not None else "",
+                earlier_findings=first[1] if first is not None else "",
                 model_written_tests=model_written_tests,
-                earlier_blocks=earlier_blocks,
             )
             try:
                 raw = runner(prompt, worktree_path)
@@ -322,9 +308,12 @@ class NexusReviewer:
                 logger.warning("review: %s could not review: %s", name, exc)
                 continue
             if parsed is None:
-                logger.warning("review: %s gave no usable verdict", name)
+                # 2026-11-25: azure and claude both failed on a follow-up; the
+                # answer's start shows why next time.
+                logger.warning("review: %s gave no usable verdict: %r", name, (raw or "")[:400])
                 continue
-            verdict, summary, deferred = converge(*parsed, parse_problems(raw), earlier_blocks)
+            verdict, summary, deferred = converge(
+                *parsed, parse_problems(raw, "unfixed" if follow_up else "bug"), follow_up)
             result = ReviewResult(name, verdict, summary, deferred)
             break
         if result is None:
@@ -388,8 +377,25 @@ def _run_codex(prompt: str, worktree_path: str, db_path: str | None = None) -> s
     return result.final_message or ""
 
 
+def _run_mistral(prompt: str, worktree_path: str, db_path: str | None = None,
+                 *, phase: str = "review", timeout_seconds: int = 2 * _AGENT_TIMEOUT_SECONDS) -> str:
+    from modules.vibe_worker import VibeWorker, vibe_available
+
+    if not vibe_available():
+        raise RuntimeError("vibe CLI not installed")
+    # Vibe is slower than the other agents (about 30 min per implementation).
+    result = VibeWorker(db_path=db_path).run(
+        task=prompt, working_dir=worktree_path, sandbox="read-only",
+        timeout_seconds=timeout_seconds, stall_seconds=2 * _AGENT_STALL_SECONDS, phase=phase,
+    )
+    if not result.success:
+        raise RuntimeError(result.error or "mistral review failed")
+    return result.final_message or ""
+
+
+# 3000, not 1500: 2026-11-25 a follow-up review answer did not fit (#834).
 def _run_azure(prompt: str, worktree_path: str, db_path: str | None = None,
-               *, phase: str = "review", max_tokens: int = 1500) -> str:
+               *, phase: str = "review", max_tokens: int = 3000) -> str:
     import asyncio
     import os
     import time

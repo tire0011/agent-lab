@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -239,6 +240,126 @@ def _failed_ids(output: str) -> list[str]:
     return list(dict.fromkeys(_FAILED_TEST.findall(summary)))
 
 
+def drift_env(drift_ms: int | float = 50) -> dict[str, str]:
+    """The environment of a drift run.
+
+    The same isolated environment as the normal verification run (#736): no
+    production API key or provider credentials, AGENT_API_KEY = test key, and
+    no inherited drift - *drift_ms* is the only drift the child sees. The
+    drift fixture is deterministic (no random seed), so passing one dict to
+    two runs gives both the identical setup.
+    """
+    env = build_verification_test_env()
+    env[CLOCK_DRIFT_ENV] = str(drift_ms)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _collected_ids(
+    repo: Path, files: Iterable[str], env: dict[str, str], python: str | None,
+) -> set[str] | None:
+    """Node ids pytest collects from *files* in *repo*; None without an answer."""
+    file_list = sorted(set(files))
+    if not file_list:
+        return set()
+    try:
+        proc = subprocess.run(
+            [python or sys.executable, "-m", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", *file_list],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=300,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # 0 = collected, 5 = nothing collected; anything else is a collection error.
+    if proc.returncode not in (0, 5):
+        return None
+    return {line.strip() for line in proc.stdout.splitlines() if "::" in line}
+
+
+def base_drift_check(
+    base_commit: str,
+    repo: str | os.PathLike[str],
+    test_ids: Iterable[str],
+    env: dict[str, str],
+    *,
+    python: str | None = None,
+    on_process: Callable[[subprocess.Popen[str] | None], None] | None = None,
+    tails: dict[str, str] | None = None,
+    watchdog: WatchdogConfig | None = None,
+    run_id: str = "timing-check-base",
+) -> tuple[list[str], list[str]] | None:
+    """Rerun flagged tests on *base_commit* under the same drift (#725).
+
+    Returns ``(regressed, base_drift)``: ``regressed`` passes on the base under
+    drift (or does not exist there - a new test), ``base_drift`` fails on the
+    base under drift too, so the change did not make it timing-sensitive.
+    *env* must be the environment of the branch's drift run. The base is
+    checked out in a temporary detached worktree of *repo*, removed afterwards.
+    None when the base run gives no verdict - the caller then keeps failing.
+    """
+    tests = list(dict.fromkeys(test_ids))
+    if not tests:
+        return [], []
+    parent = Path(tempfile.mkdtemp(prefix="nexus-timing-base-"))
+    base_path = parent / "worktree"
+    added = False
+    try:
+        add = subprocess.run(
+            ["git", "worktree", "add", "--detach", str(base_path), base_commit],
+            cwd=Path(repo), capture_output=True, text=True, timeout=120,
+        )
+        if add.returncode != 0:
+            return None
+        added = True
+        present_files = {
+            test.split("::", 1)[0] for test in tests
+            if (base_path / test.split("::", 1)[0]).is_file()
+        }
+        collected = _collected_ids(base_path, present_files, env, python)
+        if collected is None:
+            return None
+        on_base = [test for test in tests if test in collected]
+        missing = [test for test in tests if test not in collected]
+        kwargs: dict[str, object] = {"tails": tails} if tails is not None else {}
+        if watchdog is not None:
+            kwargs.update(watchdog=watchdog, run_id=run_id)
+        result = _run_timing_check_env(
+            base_path, on_base, env, on_process=on_process, python=python, **kwargs,
+        )
+        if result == "ok":
+            failing_on_base: set[str] = set()
+        else:
+            failing_on_base = set(flagged_tests(result))
+            if not failing_on_base:
+                return None
+        regressed = [
+            test for test in tests if test in missing or test not in failing_on_base
+        ]
+        base_drift = [test for test in on_base if test in failing_on_base]
+        return regressed, base_drift
+    except HungTest:
+        raise
+    except (OSError, subprocess.SubprocessError):
+        return None
+    finally:
+        if added:
+            try:
+                subprocess.run(
+                    ["git", "worktree", "remove", "--force", str(base_path)],
+                    cwd=Path(repo), capture_output=True, text=True, timeout=120,
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
+        shutil.rmtree(parent, ignore_errors=True)
+        try:
+            subprocess.run(
+                ["git", "worktree", "prune"], cwd=Path(repo),
+                capture_output=True, text=True, timeout=120,
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
 def run_timing_check(
     repo: str | os.PathLike[str],
     tests: Iterable[str],
@@ -249,6 +370,7 @@ def run_timing_check(
     tails: dict[str, str] | None = None,
     watchdog: WatchdogConfig | None = None,
     run_id: str = "timing-check",
+    env: dict[str, str] | None = None,
 ) -> str:
     """Run every selected test under clock drift and summarize the outcome.
 
@@ -256,15 +378,12 @@ def run_timing_check(
     verification can use the same interpreter as its normal test run. When
     *tails* is a dict, it receives ``{node_id: failure text}`` (at most
     TAIL_MAX_LINES lines each) from pytest's junitxml report; the result
-    string stays the same either way.
+    string stays the same either way. *env* replaces ``drift_env(drift_ms)``
+    (then *drift_ms* is ignored), so a rerun elsewhere - the base commit
+    (#725) - sees exactly the same drift setup.
     """
 
-    # The same isolated environment as the normal verification run (#736): no
-    # production API key or provider credentials, AGENT_API_KEY = test key, and
-    # no inherited drift - the drift below is the only one this child sees.
-    env = build_verification_test_env()
-    env[CLOCK_DRIFT_ENV] = str(drift_ms)
-    env["PYTHONUNBUFFERED"] = "1"
+    env = drift_env(drift_ms) if env is None else env
     return _run_timing_check_env(
         repo, tests, env, on_process=on_process, python=python, tails=tails,
         watchdog=watchdog, run_id=run_id,

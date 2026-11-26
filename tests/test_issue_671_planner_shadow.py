@@ -48,6 +48,71 @@ class PlannerShadowTests(unittest.TestCase):
                          ("tick-a", 2, 1))
         self.assertEqual(row["local_valid"], 1)
         self.assertGreater(row["prompt_tokens"], 0)
+        self.assertEqual(row["prompt_variant"], "compact_v1")
+        self.assertIsNone(row["cached_prompt_tokens"])
+
+    def test_cache_metadata_does_not_affect_validity(self):
+        for value, expected in (
+            (0, 0), (2**63 - 1, 2**63 - 1), (3.0, 3), (None, None),
+            (float("nan"), None), (float("inf"), None), (float("-inf"), None),
+            (2**63, None), (float(2**63), None), (10**400, None), (-1, None),
+            ("12", None), (True, None), (1.5, None), ([], None), ({}, None),
+        ):
+            with self.subTest(value=value):
+                # Use a fresh database so wait_for_row waits for this observation.
+                self.db = str(Path(self.tmp.name) / f"cache-{time.monotonic_ns()}.db")
+                self.planner(
+                    lambda prompt, timeout, allowed: ('{"issue": 1, "reason": "local"}', value)
+                ).choose(ISSUES)
+                row = self.wait_for_row()
+                self.assertEqual(row["cached_prompt_tokens"], expected)
+                self.assertEqual((row["local_issue"], row["local_valid"], row["error"]), (1, 1, None))
+
+    def create_legacy_table(self):
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("""
+                CREATE TABLE planner_shadow (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, tick_id TEXT NOT NULL,
+                    paid_issue INTEGER NOT NULL, local_issue INTEGER, local_valid INTEGER NOT NULL,
+                    prompt_tokens INTEGER NOT NULL, seconds REAL NOT NULL, error TEXT
+                )
+            """)
+            conn.execute("INSERT INTO planner_shadow VALUES (1, 'legacy', 2, 1, 1, 12, 0.5, NULL)")
+
+    def test_list_migrates_legacy_table_and_preserves_rows(self):
+        self.create_legacy_table()
+        self.assertEqual(list_shadow(self.db)["rows"], [
+            dict(tick_id="legacy", paid_issue=2, local_issue=1, local_valid=1,
+                 prompt_tokens=12, seconds=0.5, error=None, prompt_variant=None,
+                 cached_prompt_tokens=None),
+        ])
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute("SELECT created_at FROM planner_shadow").fetchall(), [(None,)])
+
+    def test_concurrent_list_and_record_migrate_legacy_table(self):
+        self.create_legacy_table()
+        ready = Barrier(2, timeout=2)
+
+        def read():
+            ready.wait()
+            return list_shadow(self.db)["rows"]
+
+        def write():
+            ready.wait()
+            record(self.db, tick_id="new", paid_issue=2, local_issue=1, local_valid=1,
+                   prompt_tokens=12, seconds=0.5, error=None, prompt_variant="compact_v1",
+                   cached_prompt_tokens=8)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            reader = pool.submit(read)
+            writer = pool.submit(write)
+            self.assertEqual(reader.result()[-1]["tick_id"], "legacy")
+            writer.result()
+
+        rows = list_shadow(self.db)["rows"]
+        self.assertEqual([row["tick_id"] for row in rows], ["new", "legacy"])
+        self.assertEqual(rows[0]["prompt_variant"], "compact_v1")
+        self.assertEqual(rows[0]["cached_prompt_tokens"], 8)
 
     def test_outside_allowed_is_invalid(self):
         self.planner(lambda prompt, timeout, allowed: '{"issue": 99, "reason": "local"}').choose(ISSUES)
@@ -105,7 +170,8 @@ class PlannerShadowTests(unittest.TestCase):
         rows = list_shadow(self.db)["rows"]
         self.assertEqual(len(rows), 1)
         self.assertIn(rows[0], [
-            dict(tick_id="replayed-tick", paid_issue=2, **values)
+            dict(tick_id="replayed-tick", paid_issue=2, prompt_variant=None,
+                 cached_prompt_tokens=None, **values)
             for values in (result, skip)
         ])
 

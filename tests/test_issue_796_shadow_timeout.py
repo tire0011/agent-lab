@@ -208,7 +208,10 @@ class NexusTickShadowWiringTests(unittest.TestCase):
                 captured["messages"] = messages
                 captured["max_tokens"] = max_tokens
                 captured["response_format"] = kwargs.get("response_format")
-                return {"choices": [{"message": {"content": '{"issue": 1, "reason": "x"}'}}]}
+                return {
+                    "choices": [{"message": {"content": '{"issue": 1, "reason": "x"}'}}],
+                    "timings": {"cache_n": 42},
+                }
 
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(llama_cpp_client, "LlamaCppClient", FakeClient):
@@ -216,7 +219,7 @@ class NexusTickShadowWiringTests(unittest.TestCase):
             shadow = planner._shadow
             self.assertIsNotNone(shadow)
             result = shadow("the compact prompt", 123.0, {1, 2})
-        self.assertEqual(result, '{"issue": 1, "reason": "x"}')
+        self.assertEqual(result, ('{"issue": 1, "reason": "x"}', 42))
         # LlamaCppClient(timeout=T, stream=False) with the same T the monitor used.
         self.assertEqual(captured["timeout"], 123.0)
         self.assertIs(captured["stream"], False)

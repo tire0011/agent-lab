@@ -426,7 +426,9 @@ def _json_object(raw: str) -> dict[str, Any] | None:
         return None
     try:
         value = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
+    except ValueError:
+        # JSONDecodeError, or an integer literal beyond sys.get_int_max_str_digits
+        # (#830): either way the answer is not a usable object.
         return None
     return value if isinstance(value, dict) else None
 
@@ -497,7 +499,7 @@ class IssuePlanner:
         explore: Callable[[str], str] | None = None,
         # #798: the shadow callable also receives the allowed issue numbers
         # (prompt, timeout, allowed) so it can pin them in its json_schema enum.
-        shadow: Callable[[str, float, set[int]], str] | None = None,
+        shadow: Callable[[str, float, set[int]], str | tuple[str, object]] | None = None,
         *,
         db_path: str | None = None,
         rates: Any = None,
@@ -577,7 +579,7 @@ class IssuePlanner:
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=None, local_valid=0,
                        prompt_tokens=0, seconds=0.0,
-                       error="skipped: prompt_over_budget")
+                       error="skipped: prompt_over_budget", prompt_variant="compact_v1")
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store skip: %s", exc)
             return
@@ -590,7 +592,7 @@ class IssuePlanner:
         join_timeout = timeout + SHADOW_MONITOR_GRACE_SECONDS
 
         def monitor() -> None:
-            result: list[str] = []
+            result: list[str | tuple[str, object]] = []
             failure: list[BaseException] = []
 
             def call() -> None:
@@ -609,6 +611,7 @@ class IssuePlanner:
             local_issue: int | None = None
             valid = False
             error: str | None = None
+            cached_prompt_tokens = None
             if worker.is_alive():
                 error = f"timeout after {join_timeout:g}s"
             elif failure:
@@ -617,7 +620,10 @@ class IssuePlanner:
                 # #798: kept even though the shadow's json_schema enum now
                 # constrains the wire format - the monitor still validates
                 # independently, each failure with its own error string.
-                data = _json_object(result[0] if result else "")
+                content = result[0] if result else ""
+                if isinstance(content, tuple):
+                    content, cached_prompt_tokens = content
+                data = _json_object(content)
                 if data is None:
                     error = "invalid JSON"
                 else:
@@ -633,7 +639,8 @@ class IssuePlanner:
                 from modules.planner_shadow import record
                 record(self._db_path, tick_id=tick_id, paid_issue=paid_issue,
                        local_issue=local_issue, local_valid=int(valid),
-                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error)
+                       prompt_tokens=prompt_tokens, seconds=elapsed, error=error,
+                       prompt_variant="compact_v1", cached_prompt_tokens=cached_prompt_tokens)
             except Exception as exc:  # noqa: BLE001 - shadow persistence is best effort
                 logger.warning("planner shadow: could not store result: %s", exc)
 

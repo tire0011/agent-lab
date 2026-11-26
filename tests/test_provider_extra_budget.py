@@ -90,7 +90,8 @@ class NextPinTests(unittest.TestCase):
 
 
 class InitiativeTests(unittest.TestCase):
-    def _service(self, extra: str | None, *, set_at: datetime | None = None, issues=(1, 2, 3)):
+    def _service(self, extra: str | None, *, set_at: datetime | None = None, issues=(1, 2, 3),
+                 daily: str | None = None):
         fx = InitiativeFixture()
         with sqlite3.connect(fx.db_path) as conn:
             conn.execute("CREATE TABLE IF NOT EXISTS service_settings "
@@ -98,6 +99,10 @@ class InitiativeTests(unittest.TestCase):
             if extra is not None:
                 conn.execute("INSERT INTO service_settings VALUES ('nexus.extra_budget.mistral', ?, ?)",
                              (extra, (set_at or datetime.now(timezone.utc)).isoformat()))
+            if daily is not None:
+                old = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+                conn.execute("INSERT INTO service_settings VALUES ('nexus.daily_extra.mistral', ?, ?)",
+                             (daily, old))
         patchers = [
             mock.patch("modules.coding_provider.available_providers", return_value=list(PROVIDERS)),
             mock.patch("modules.coding_provider.provider_cooldowns", return_value={}),
@@ -143,6 +148,24 @@ class InitiativeTests(unittest.TestCase):
             self._link(fx, svc.tick())
             self.assertEqual(svc.tick().decision, "budget_exhausted")
             self.assertIsNone(self._pin(fx))
+
+    def test_a_standing_daily_extra_never_expires(self):
+        """daily_extra_mistral (owner 2026-11-26) counts per rolling 24 h, set days ago."""
+        fx, svc = self._service(None, daily="1", issues=(1, 2, 3))
+        self._link(fx, svc.tick())
+        extra = svc.tick()
+        self.assertEqual(extra.detail, PROVIDER_EXTRA_PREFIX + "mistral")
+        self._link(fx, extra)
+        self.assertEqual(svc.tick().decision, "budget_exhausted")
+
+    def test_daily_extra_is_a_mailbox_setting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = init_db(str(Path(tmp) / "agent.db"))
+            try:
+                reply, _ = _process_setting(_msg(key="daily_extra_mistral", value="10"), Path("."), conn, 1)
+                self.assertEqual(reply, "Setting daily_extra_mistral is now 10.")
+            finally:
+                conn.close()
 
     def test_a_cooling_provider_gets_no_extra_start(self):
         fx, svc = self._service("2")

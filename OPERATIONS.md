@@ -169,6 +169,21 @@ run continues for as long as tests keep starting and finishing.
     `timing_sensitive: <test ids>; hint: inject the clock or compute the value
     from configured values, not from wall time`; the repair retry receives
     that error as feedback (event `timing_check_flagged`).
+    Before that, the drift-only tests are rerun on the experiment's
+    `base_commit_sha` in a temporary detached worktree under the identical
+    drift environment (`timing_check.base_drift_check`, #725). A test that
+    fails there too is `base_drift` (main already has the problem); a test
+    that passes there, or does not exist there (new on the branch), is
+    `regressed`. All `base_drift` - verdict `passed_with_known_drift` (event
+    `timing_check_passed_with_known_drift`), verification continues. Any
+    `regressed` - `failed` as above, listing only the regressed ids. Without
+    a base commit or a base verdict the flag stays `failed` (fail closed).
+    Base-drift tests are counted in the run_store table
+    `known_drift_tests(test_id, first_seen_commit, last_seen_at, count, ...)`;
+    the first sighting opens one issue per test, `Make <test> independent of
+    wall-clock time` (small, local coding worker first, judged by the drift
+    rerun; retried at the next sighting if opening failed). Read them with
+    the operation / MCP tool `known_drift_tests_list`.
   - `error` (pytest missing, collection error, no test collected, a crash), an
     interruption, or flagged tests that fail on this host without drift too
     (e.g. `pytest-asyncio` missing on the VM, or `test_public_logs_api`

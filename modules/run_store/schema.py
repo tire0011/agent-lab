@@ -352,7 +352,9 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             prompt_tokens INTEGER NOT NULL,
             seconds REAL NOT NULL,
             error TEXT,
-            created_at TEXT
+            created_at TEXT,
+            prompt_variant TEXT,
+            cached_prompt_tokens INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS local_localizations (
@@ -385,6 +387,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_known_drift_tests(conn)
     conn.commit()
     with conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -398,6 +401,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         conn.execute("BEGIN IMMEDIATE")
         _backfill_run_costs_once(conn)
     return conn
+
+
+def _migrate_known_drift_tests(conn: sqlite3.Connection) -> None:
+    """#725: tests main already has that fail under the timing check's drift."""
+    from modules.known_drift_tests import ensure_schema
+
+    ensure_schema(conn)
 
 
 def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:
