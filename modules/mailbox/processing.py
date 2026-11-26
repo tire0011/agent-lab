@@ -365,6 +365,11 @@ SETTINGS: dict[str, tuple[str, int, int]] = {
     "extra_budget_codex": ("nexus.extra_budget.codex", 0, 20),
     "extra_budget_claude": ("nexus.extra_budget.claude", 0, 20),
     "extra_budget_mistral": ("nexus.extra_budget.mistral", 0, 20),
+    # Standing extra starts per rolling 24 hours for one provider, until changed
+    # (owner 2026-11-26: Mistral runs on the flat Vibe subscription).
+    "daily_extra_codex": ("nexus.daily_extra.codex", 0, 20),
+    "daily_extra_claude": ("nexus.daily_extra.claude", 0, 20),
+    "daily_extra_mistral": ("nexus.daily_extra.mistral", 0, 20),
     # 1 pauses all new work (no starts, adoptions or retries); 0 resumes.
     "paused": ("nexus.paused", 0, 1),
     # 0 disables the free post-experiment reflection sweep; 1 enables it.

@@ -105,6 +105,10 @@ class ReviewerTests(unittest.TestCase):
         raw = json.dumps({"verdict": "block", "summary": "s", "problems": ["still broken"]})
         self.assertEqual(parse_problems(raw, "unfixed"), [("unfixed", "still broken")])
 
+    def test_mistral_is_one_of_the_reviewers(self):
+        self.assertIn("mistral", nexus_reviewer.REVIEWERS)
+        self.assertIn("mistral", NexusReviewer(db_path=self.db)._runners)
+
     def test_the_prompt_asks_for_problem_kinds(self):
         prompt = nexus_reviewer.review_prompt("g", "d", can_read_files=True)
         for kind in ("task", "bug", "regression", "edge_case", "elsewhere", "after_merge"):

@@ -26,7 +26,7 @@ STALL_SECONDS = 600
 LAST_AT = "nexus.weekly_review.last_at"
 LAST_MODEL = "nexus.weekly_review.last_model"
 LAST_REPORT = "nexus.weekly_review.last_report"
-EXPLORERS = ("codex", "claude")  # take turns; azure only stands in
+EXPLORERS = ("codex", "claude", "mistral")  # take turns; azure only stands in
 TITLE_PREFIX = "Wochenreview Nexus"
 
 
@@ -209,17 +209,25 @@ def _run_azure(prompt: str, repo_root: str, db_path: str | None = None) -> str:
     return run(prompt, repo_root, db_path, phase="weekly_review")
 
 
+def _run_mistral(prompt: str, repo_root: str, db_path: str | None = None) -> str:
+    from modules.nexus_reviewer import _run_mistral as run
+
+    return run(prompt, repo_root, db_path, phase="weekly_review", timeout_seconds=TIMEOUT_SECONDS)
+
+
 def default_runners(db_path: str) -> dict[str, Callable[[str, str], str]]:
     """The production runners, bound to *db_path* so their runs are audited (#810)."""
     return {
         "codex": lambda prompt, root: _run_codex(prompt, root, db_path),
         "claude": lambda prompt, root: _run_claude(prompt, root, db_path),
+        "mistral": lambda prompt, root: _run_mistral(prompt, root, db_path),
         "azure": lambda prompt, root: _run_azure(prompt, root, db_path),
     }
 
 
-RUNNERS: dict[str, Callable[[str, str], str]] = {"codex": _run_codex, "claude": _run_claude, "azure": _run_azure}
-ABILITIES = {"codex": (True, True), "claude": (False, True), "azure": (False, False)}
+RUNNERS: dict[str, Callable[[str, str], str]] = {
+    "codex": _run_codex, "claude": _run_claude, "mistral": _run_mistral, "azure": _run_azure}
+ABILITIES = {"codex": (True, True), "claude": (False, True), "mistral": (False, True), "azure": (False, False)}
 
 
 def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
