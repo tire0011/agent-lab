@@ -850,7 +850,7 @@ class WeeklyReviewWiringTests(RunStoreTestCase):
         with patch("modules.codex_worker.CodexWorker") as cls:
             cls.return_value.run.return_value = MagicMock(success=True, final_message="bericht")
             runners = weekly_review.default_runners(self.db_path)
-            self.assertEqual(set(runners), {"codex", "claude", "azure"})
+            self.assertEqual(set(runners), {"codex", "claude", "mistral", "azure"})
             self.assertEqual(runners["codex"]("prompt", self.tmp.name), "bericht")
             cls.assert_called_once_with(db_path=self.db_path)
             kwargs = cls.return_value.run.call_args.kwargs
