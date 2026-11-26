@@ -108,3 +108,37 @@ class ResumeWithoutChangesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ProductionSnapshotTests(unittest.TestCase):
+    def test_agents_get_a_copy_of_the_production_db_never_the_live_file(self):
+        """Owner 2026-11-26: measurements may read real data; writes must not reach it."""
+        import os
+        import sqlite3
+
+        from modules import coding_worker, verification_env
+
+        with tempfile.TemporaryDirectory() as tmp:
+            live = Path(tmp) / "agent.db"
+            with sqlite3.connect(live) as conn:
+                conn.execute("CREATE TABLE experiments (id TEXT)")
+                conn.execute("INSERT INTO experiments VALUES ('e1')")
+            with mock.patch.dict(os.environ, {"AGENT_DB_PATH": str(live)}), \
+                    mock.patch.object(verification_env.tempfile, "gettempdir", return_value=tmp):
+                env = coding_worker.filtered_env()
+            snapshot = env[coding_worker.PROD_DB_SNAPSHOT_ENV]
+            self.assertNotEqual(Path(snapshot), live)
+            self.assertTrue(snapshot.startswith(env["TMPDIR"]))
+            with sqlite3.connect(snapshot) as conn:
+                self.assertEqual(conn.execute("SELECT id FROM experiments").fetchall(), [("e1",)])
+                conn.execute("DELETE FROM experiments")
+            with sqlite3.connect(live) as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM experiments").fetchone()[0], 1)
+
+    def test_no_snapshot_without_a_database(self):
+        import os
+
+        from modules import coding_worker
+
+        with mock.patch.dict(os.environ, {"AGENT_DB_PATH": "/nonexistent/agent.db"}):
+            self.assertNotIn(coding_worker.PROD_DB_SNAPSHOT_ENV, coding_worker.filtered_env())

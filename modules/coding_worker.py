@@ -147,8 +147,42 @@ def filtered_env(extra_keys: frozenset[str] | set[str] | tuple[str, ...] = ()) -
         for name in ("TMPDIR", "TEMP", "TMP"):
             env[name] = run_tmp
     except OSError:
-        pass
+        return env
+    snapshot = production_db_snapshot(run_tmp)
+    if snapshot:
+        env[PROD_DB_SNAPSHOT_ENV] = snapshot
     return env
+
+
+# Owner 2026-11-26: a measurement may read the real Nexus data. Agents get a
+# fresh copy of the production database in their own TMPDIR (pruned after 6 h),
+# so reading is real and no write can ever reach the live database.
+PROD_DB_SNAPSHOT_ENV = "NEXUS_PROD_DB_SNAPSHOT"
+
+
+def production_db_snapshot(target_dir: str) -> str | None:
+    """Copy ``AGENT_DB_PATH`` into *target_dir* (sqlite backup); its path or None."""
+    import sqlite3
+
+    source = (os.environ.get("AGENT_DB_PATH") or "").strip()
+    if not source or not os.path.isfile(source):
+        return None
+    if os.environ.get(PROD_DB_SNAPSHOT_ENV, "").strip() == "0":
+        return None
+    target = os.path.join(target_dir, "prod-db-snapshot.db")
+    try:
+        src = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=10)
+        try:
+            dst = sqlite3.connect(target)
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+        finally:
+            src.close()
+    except sqlite3.Error:
+        return None
+    return target
 
 
 # Progress-aware agent runs (#327): every output line counts as progress, so the

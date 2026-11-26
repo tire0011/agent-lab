@@ -59,7 +59,9 @@ def hint(working_dir: str, repo_root: str) -> str:
     return (
         f"Work only inside your working directory {working_dir}. The deployed "
         f"checkout {repo_root} is off-limits: never read from or write to it, even "
-        "where documentation names paths below it."
+        "where documentation names paths below it. For a measurement on real Nexus "
+        "data, read the copy of the production database named by the environment "
+        "variable NEXUS_PROD_DB_SNAPSHOT (when set); never open the live database."
     )
 
 

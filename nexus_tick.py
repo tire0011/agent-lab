@@ -470,6 +470,19 @@ def _update_clis(db_path: str) -> None:
         _events.append(summary)
 
 
+def _prune_old_logs(repo_root: str, db_path: str) -> None:
+    """Experiment logs after 14 days, Vibe sessions after 7 (owner rule). Never fails the tick."""
+    try:
+        from modules.log_retention import prune_all
+
+        line = prune_all(repo_root, db_path)
+    except Exception as exc:  # noqa: BLE001 - cleanup must not break a tick
+        logger.warning("log retention failed: %s", exc)
+        return
+    if line:
+        logger.info("%s", line)
+
+
 def _prune_test_tmp() -> None:
     """Remove old per-run TMPDIRs of verification test runs. Never fails the tick."""
     try:
@@ -826,6 +839,7 @@ def main(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             _cleanup_expired_worktrees(service)
             _prune_test_tmp()
+            _prune_old_logs(args.repo_root, args.db_path)
             _update_clis(args.db_path)
             if not args.integration_only:
                 _weekly_review(args.db_path, args.repo_root)
