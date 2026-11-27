@@ -119,8 +119,14 @@ def _is_generated_path(path: str) -> bool:
 # Pytest loads conftest.py files and these root config files; a repair that
 # changes them (e.g. ``--noconftest`` in addopts) could silence the drift
 # fixture, so they are protected even when they do not name the marker.
-_TIMING_REPAIR_CONFIG_NAMES = {"conftest.py"}
-_TIMING_REPAIR_ROOT_CONFIGS = {"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
+_TIMING_REPAIR_ROOT_CONFIGS = {
+    "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml",
+    "pyproject.toml", "setup.cfg", "setup.py", "tox.ini",
+}
+
+
+def _is_timing_repair_config(path: str) -> bool:
+    return PurePosixPath(path).name == "conftest.py" or path in _TIMING_REPAIR_ROOT_CONFIGS
 
 
 def _timing_repair_protected_paths(
@@ -151,8 +157,7 @@ def _timing_repair_protected_paths(
     for path in dict.fromkeys(paths):
         if _is_generated_path(path):
             continue
-        pure = PurePosixPath(path)
-        if pure.name in _TIMING_REPAIR_CONFIG_NAMES or path in _TIMING_REPAIR_ROOT_CONFIGS:
+        if _is_timing_repair_config(path):
             protected.add(path)
         try:
             file = root / path
@@ -654,7 +659,9 @@ class VerificationMixin:
                         "the injected drift"
                     )
                 else:
-                    touched = sorted(set(paths) & protected)
+                    touched = sorted(
+                        path for path in paths if path in protected or _is_timing_repair_config(path)
+                    )
                     broken = _drift_fixture_broken(worktree_path, marker_files)
                     if touched or broken:
                         failure = "the patch touches the timing-drift fixture or pytest config" + (
@@ -791,7 +798,7 @@ class VerificationMixin:
         tails: dict[str, str] = {}
         drift = timing_check_module.run_timing_check(
             worktree_path, flagged, on_process=track, python=self.test_python_executable,
-            tails=tails, env=drift_env, **options,
+            tails=tails, env=drift_env, require_active_drift=True, **options,
         )
         if drift != "ok":
             return f"timing check under the same drift: {drift}\n" + "\n".join(tails.values())

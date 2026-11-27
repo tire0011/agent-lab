@@ -371,6 +371,7 @@ def run_timing_check(
     watchdog: WatchdogConfig | None = None,
     run_id: str = "timing-check",
     env: dict[str, str] | None = None,
+    require_active_drift: bool = False,
 ) -> str:
     """Run every selected test under clock drift and summarize the outcome.
 
@@ -381,22 +382,31 @@ def run_timing_check(
     string stays the same either way. *env* replaces ``drift_env(drift_ms)``
     (then *drift_ms* is ignored), so a rerun elsewhere - the base commit
     (#725) - sees exactly the same drift setup.
+    *require_active_drift* checks the injected clocks around each test call.
     """
 
     env = drift_env(drift_ms) if env is None else env
     return _run_timing_check_env(
         repo, tests, env, on_process=on_process, python=python, tails=tails,
-        watchdog=watchdog, run_id=run_id,
+        watchdog=watchdog, run_id=run_id, require_active_drift=require_active_drift,
     )
 
+
+_PYTEST_MAIN = r"""
+import os
+import sys
+import time
+
+real_clocks = {name: getattr(time, name) for name in ('monotonic', 'perf_counter', 'time')}
+
+import pytest
+
+plugins = []
+"""
 
 # Pytest captures stderr during tests. Duplicate it before capture and emit
 # start/end events in the format understood by the shared progress watchdog.
 _PYTEST_PROGRESS = r"""
-import os
-import sys
-import pytest
-
 progress = os.dup(2)
 
 class Progress:
@@ -413,7 +423,37 @@ class Progress:
     def pytest_runtest_logfinish(self, nodeid):
         os.write(progress, self.result + b"\n")
 
-sys.exit(pytest.main(sys.argv[1:], plugins=[Progress()]))
+plugins.append(Progress())
+"""
+
+# Run inside the flagged test's fixture lifetime. A separate test would get
+# freshly patched clocks and could miss a restoration in the candidate test.
+_PYTEST_DRIFT_CANARY = r"""
+class DriftCanary:
+    def __init__(self, drift_seconds):
+        if not 0 < drift_seconds < float('inf'):
+            raise ValueError('the clock drift canary requires positive finite drift')
+        self.minimum_offset = drift_seconds / 2
+
+    def check_clocks(self):
+        for name, original in real_clocks.items():
+            clock = getattr(time, name)
+            if clock is original or not clock_offset_ok(clock, original, self.minimum_offset):
+                pytest.fail(f'clock drift canary: time.{name} has no injected drift', pytrace=False)
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_call(self, item):
+        self.check_clocks()
+        try:
+            return (yield)
+        finally:
+            self.check_clocks()
+
+def clock_offset_ok(clock, original, minimum_offset):
+    before = original()
+    return clock() - before >= minimum_offset
+
+plugins.append(DriftCanary(float(sys.argv.pop(1))))
 """
 
 
@@ -427,6 +467,7 @@ def _run_timing_check_env(
     tails: dict[str, str] | None = None,
     watchdog: WatchdogConfig | None = None,
     run_id: str = "timing-check",
+    require_active_drift: bool = False,
 ) -> str:
     """Implementation shared with the old-vs-new environment probe (#738)."""
 
@@ -440,9 +481,20 @@ def _run_timing_check_env(
     try:
         arguments = ["-q", "-p", "no:cacheprovider", "--tb=short", f"--junitxml={report}", *test_list]
         executable = python or sys.executable
+        if watchdog is not None or require_active_drift:
+            script = _PYTEST_MAIN
+            if watchdog is not None:
+                script += _PYTEST_PROGRESS
+            if require_active_drift:
+                script += _PYTEST_DRIFT_CANARY
+                arguments.insert(0, str(float(env[CLOCK_DRIFT_ENV]) / 1000))
+            script += "\nsys.exit(pytest.main(sys.argv[1:], plugins=plugins))\n"
+            command = [executable, "-c", script, *arguments]
+        else:
+            command = [executable, "-m", "pytest", *arguments]
         if watchdog is None:
             proc = subprocess.Popen(
-                [executable, "-m", "pytest", *arguments],
+                command,
                 cwd=Path(repo), env=env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, start_new_session=True,
             )
@@ -452,7 +504,7 @@ def _run_timing_check_env(
             returncode = proc.returncode
         else:
             monitored = run_verification_test_monitored(
-                [executable, "-c", _PYTEST_PROGRESS, *arguments],
+                command,
                 cwd=str(repo), config=watchdog, run_id=run_id,
                 on_process=on_process, tests_only_progress=True, test_env=env,
             )

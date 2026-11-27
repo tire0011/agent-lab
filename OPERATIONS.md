@@ -210,10 +210,12 @@ run continues for as long as tests keep starting and finishing.
   verification continues; otherwise the worktree is put back exactly and the
   old `failed` verdict stands. A candidate that touches the drift fixture or
   pytest's loading of it (any file containing `NEXUS_TEST_CLOCK_DRIFT_MS`,
-  any `conftest.py`, the root `pytest.ini`/`pyproject.toml`/`setup.cfg`/
-  `tox.ini`) or that references the drift marker to detect or disable the
-  drift is rejected before it is judged, so the drift rerun can never pass
-  vacuously; a patch that does not apply to the branch HEAD (it overlaps
+  any `conftest.py`, or a root pytest or packaging config such as `pytest.ini`,
+  `pyproject.toml`, `setup.cfg`, `setup.py`, or `tox.ini`) is rejected before
+  it is judged, including when the patch creates a protected file. Patches
+  that reference the drift marker are also rejected. The drift rerun checks
+  the injected clocks before and after each flagged test runs. A patch that
+  does not apply to the branch HEAD (it overlaps
   uncommitted work) is discarded, never committed file-whole. The commit is
   atomic: every fallible step runs before the branch ref moves, and a failure
   after `update-ref` rolls the ref back, so a crash or interruption can never

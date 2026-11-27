@@ -79,7 +79,9 @@ class FakeLocalWorker:
         content = self.contents[min(len(self.tasks), len(self.contents)) - 1]
         (self.repo / "tests" / "test_new.py").write_text(content, encoding="utf-8")
         for rel, text in self.also.items():
-            (self.repo / rel).write_text(text, encoding="utf-8")
+            path = self.repo / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
         # A stray file the patch created must go too when the repair is discarded.
         if self.stray:
             (self.repo / "tests" / f"scratch_{len(self.tasks)}.txt").write_text("x", encoding="utf-8")
@@ -333,6 +335,42 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertIn("timing-drift marker", failed[0]["reason"])
         self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
         self.assertEqual(self._tree_state()[2], before[2])
+
+    def test_candidate_that_adds_configs_is_rejected_before_the_judge(self) -> None:
+        paths = (
+            "conftest.py", "tests/new/conftest.py", "tox.ini", "setup.cfg",
+            "pytest.ini", "pyproject.toml", "setup.py", ".pytest.ini",
+            "pytest.toml", ".pytest.toml",
+        )
+        self.fake = FakeLocalWorker(
+            self.repo, [CLOCK_INDEPENDENT], also=dict.fromkeys(paths, ""),
+        )
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        with patch.object(self.service, "_judge_timing_repair") as judge:
+            result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        judge.assert_not_called()
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertTrue(failed["reason"].endswith(", ".join(sorted(paths))))
+        self.assertEqual(self._tree_state(), before)
+
+    def test_candidate_that_restores_the_real_clock_fails_the_canary(self) -> None:
+        restored_clock = DRIFT_SENSITIVE.replace(
+            "class T", "real_monotonic = time.monotonic\nclass T",
+        ).replace(
+            "        started =", "        time.monotonic = real_monotonic\n        started =",
+        )
+        self.fake = FakeLocalWorker(self.repo, [restored_clock])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("clock drift canary: time.monotonic has no injected drift", failed["reason"])
+        self.assertEqual(self._tree_state(), before)
 
     # A patch that overlaps uncommitted work cannot be committed as only its
     # delta, so the candidate is discarded - never committed file-whole.
