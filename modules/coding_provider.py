@@ -260,8 +260,13 @@ def choose_provider(
 # other agent takes over and the attempt does not count. So does an expired or
 # missing login (2026-11-12: "Failed to authenticate: this login reached its
 # time limit") - the provider could not run, the work was never tried.
+# 502/503/504 and Vibe's infrastructure_failure: the provider's server failed,
+# not the work (2026-11-27: a Mistral run for #842 died on a 502 and was
+# counted as a failed attempt with no fallback).
 _OVERLOAD_RE = re.compile(
-    r"\b(?:529|429)\b|overloaded|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)"
+    r"\b(?:529|429)\b|overloaded|bad gateway|service unavailable|gateway timeout"
+    r"|infrastructure_failure|raw_status_code\W{0,4}50[234]\b"
+    r"|rate[ _-]?limit|usage[ _-]?limit|limit (?:reached|exceeded)"
     r"|failed to authenticate|authentication (?:failed|error)|not logged in|invalid api key"
     r"|\b401\b[^\n]{0,40}unauthorized|claude auth login|claude setup-token",
     re.IGNORECASE,
