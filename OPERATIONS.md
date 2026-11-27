@@ -208,8 +208,18 @@ run continues for as long as tests keep starting and finishing.
   repair is committed onto the experiment branch as `timing-check local
   repair` (only its delta; other uncommitted work stays uncommitted) and
   verification continues; otherwise the worktree is put back exactly and the
-  old `failed` verdict stands. Events: `timing_check_local_repair_started`,
-  `_passed`, `_failed` with `rounds`, `tokens`, `seconds`.
+  old `failed` verdict stands. A candidate that touches the drift fixture or
+  pytest's loading of it (any file containing `NEXUS_TEST_CLOCK_DRIFT_MS`,
+  any `conftest.py`, the root `pytest.ini`/`pyproject.toml`/`setup.cfg`/
+  `tox.ini`) or that references the drift marker to detect or disable the
+  drift is rejected before it is judged, so the drift rerun can never pass
+  vacuously; a patch that does not apply to the branch HEAD (it overlaps
+  uncommitted work) is discarded, never committed file-whole. The commit is
+  atomic: every fallible step runs before the branch ref moves, and a failure
+  after `update-ref` rolls the ref back, so a crash or interruption can never
+  leave HEAD on a repair commit whose worktree was restored. Events:
+  `timing_check_local_repair_started`, `_passed`, `_failed` with `rounds`,
+  `tokens`, `seconds`.
   The test suite itself runs with `NEXUS_TIMING_CHECK=0` and
   `NEXUS_TIMING_LOCAL_REPAIR=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,

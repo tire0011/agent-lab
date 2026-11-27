@@ -13,7 +13,7 @@ import tempfile
 import time
 
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 logger = logging.getLogger("modules.experiment_service")
@@ -80,6 +80,13 @@ _TIMING_REPAIR_MAX_LIKELY_FILES = 8
 _TIMING_REPAIR_FEEDBACK_CHARS = 4000
 # A repair that skips or xfails a flagged test only hides the problem.
 _TIMING_REPAIR_SKIP = re.compile(r"^\+.*\b(?:skip|skipIf|skipUnless|xfail)\b", re.MULTILINE)
+# A candidate that detects or disables the injected drift would make the drift
+# rerun pass vacuously, so it is rejected like a skip.
+_TIMING_REPAIR_DRIFT_TAMPER = re.compile(r"^\+.*NEXUS_TEST_CLOCK_DRIFT_MS", re.MULTILINE)
+
+
+class _TimingRepairRejected(Exception):
+    """A candidate that cannot be committed as only its own delta."""
 
 
 def timing_local_repair_enabled() -> bool:
@@ -107,6 +114,68 @@ def _default_timing_repair_worker(likely_files: tuple[str, ...]) -> Any:
 def _is_generated_path(path: str) -> bool:
     """Bytecode a test run writes is never part of a repair."""
     return "__pycache__/" in f"/{path}" or path.endswith((".pyc", ".pyo"))
+
+
+# Pytest loads conftest.py files and these root config files; a repair that
+# changes them (e.g. ``--noconftest`` in addopts) could silence the drift
+# fixture, so they are protected even when they do not name the marker.
+_TIMING_REPAIR_CONFIG_NAMES = {"conftest.py"}
+_TIMING_REPAIR_ROOT_CONFIGS = {"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
+
+
+def _timing_repair_protected_paths(
+    worktree_path: str, elog: ExperimentLogger,
+) -> tuple[set[str], set[str]] | None:
+    """``(protected, marker_files)`` a repair must never change, or None on scan failure.
+
+    ``protected`` is every file carrying the CLOCK_DRIFT marker (the drift
+    fixture in ``tests/conftest.py`` and everything else naming
+    ``NEXUS_TEST_CLOCK_DRIFT_MS``) plus every ``conftest.py`` and root pytest
+    config file. ``marker_files`` is the subset whose marker must stay present.
+    A candidate that deletes or neuters any of them would make the drift rerun
+    pass vacuously, so it is rejected instead of judged.
+    """
+    marker = timing_check_module.CLOCK_DRIFT_ENV
+    paths: list[str] = []
+    for args in (
+        ["ls-files", "-z", "--cached"],
+        ["ls-files", "-z", "--others", "--exclude-standard"],
+    ):
+        proc = _run_git(args, cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE)
+        if proc.returncode != 0:
+            return None
+        paths.extend(path for path in proc.stdout.split("\0") if path)
+    root = Path(worktree_path)
+    protected: set[str] = set()
+    marker_files: set[str] = set()
+    for path in dict.fromkeys(paths):
+        if _is_generated_path(path):
+            continue
+        pure = PurePosixPath(path)
+        if pure.name in _TIMING_REPAIR_CONFIG_NAMES or path in _TIMING_REPAIR_ROOT_CONFIGS:
+            protected.add(path)
+        try:
+            file = root / path
+            if file.is_file() and marker in file.read_text(encoding="utf-8", errors="ignore"):
+                marker_files.add(path)
+        except OSError:
+            continue
+    return protected | marker_files, marker_files
+
+
+def _drift_fixture_broken(worktree_path: str, marker_files: set[str]) -> list[str]:
+    """Marker files that are gone or no longer carry the CLOCK_DRIFT marker."""
+    marker = timing_check_module.CLOCK_DRIFT_ENV
+    broken: list[str] = []
+    for path in sorted(marker_files):
+        try:
+            content = (Path(worktree_path) / path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            broken.append(path)
+            continue
+        if marker not in content:
+            broken.append(path)
+    return broken
 
 
 @dataclass(slots=True)
@@ -505,6 +574,18 @@ class VerificationMixin:
                 rounds=0, tokens=0, seconds=round(time.monotonic() - started, 3),
             )
             return None
+        # The drift fixture and pytest's loading of it must survive every
+        # candidate untouched; a repair that neutered them would make the
+        # drift rerun pass vacuously.
+        scanned = _timing_repair_protected_paths(worktree_path, elog)
+        if scanned is None:
+            elog.error(
+                TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_failed",
+                "Could not scan the worktree for the timing-drift fixture; no repair",
+                rounds=0, tokens=0, seconds=round(time.monotonic() - started, 3),
+            )
+            return None
+        protected, marker_files = scanned
         try:
             base_commit = self.get_experiment(experiment_id).base_commit_sha
             changed = sorted(
@@ -528,6 +609,7 @@ class VerificationMixin:
         factory = getattr(self, "timing_repair_worker_factory", None)
         failure = ""
         previous_patch = ""
+        repair: TimingLocalRepair | None = None
         try:
             worker = (
                 factory(worktree_path) if factory is not None
@@ -565,31 +647,57 @@ class VerificationMixin:
                     failure = "the local worker made no change"
                 elif _TIMING_REPAIR_SKIP.search(patch):
                     failure = "the patch skips or xfails a test instead of fixing it"
-                else:
-                    failure = self._judge_timing_repair(
-                        experiment_id, worktree_path, flagged, drift_env, affected, paths,
-                        elog, watchdog=watchdog, host_failures=host_failures,
+                elif _TIMING_REPAIR_DRIFT_TAMPER.search(patch):
+                    failure = (
+                        "the patch references the timing-drift marker "
+                        f"({timing_check_module.CLOCK_DRIFT_ENV}) to detect or disable "
+                        "the injected drift"
                     )
-                    if not failure:
-                        repair = self._commit_timing_repair(
-                            worktree_path, before, paths, patch, elog,
+                else:
+                    touched = sorted(set(paths) & protected)
+                    broken = _drift_fixture_broken(worktree_path, marker_files)
+                    if touched or broken:
+                        failure = "the patch touches the timing-drift fixture or pytest config" + (
+                            f": {', '.join(touched)}" if touched else ""
+                        ) + (
+                            f"; the marker is gone from: {', '.join(broken)}" if broken else ""
                         )
-                        elog.info(
-                            TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_passed",
-                            f"Local repair fixed the drift-only tests in {round_no} round(s); "
-                            f"committed {repair.commit_sha[:12]}",
-                            rounds=rounds, tokens=tokens,
-                            seconds=round(time.monotonic() - started, 3),
-                            commit_sha=repair.commit_sha, paths=repair.paths, tests=flagged,
-                            paid_retry_avoided=True,
+                    else:
+                        failure = self._judge_timing_repair(
+                            experiment_id, worktree_path, flagged, drift_env, affected, paths,
+                            elog, watchdog=watchdog, host_failures=host_failures,
+                            protected=protected, marker_files=marker_files,
                         )
-                        return repair
+                        if not failure:
+                            repair = self._commit_timing_repair(
+                                worktree_path, before, paths, patch, elog,
+                            )
+                            break
                 previous_patch = patch
                 self._restore_worktree_tree(worktree_path, before, elog)
+        except _TimingRepairRejected as exc:
+            failure = str(exc)
         except HungTest as exc:
             failure = f"a repaired test hung: {exc}"
+        except (KeyboardInterrupt, SystemExit) as exc:
+            # Like an interruption of the check itself: the worktree and the
+            # branch are put back and the verdict falls back to today's.
+            failure = f"interrupted ({type(exc).__name__})"
         except Exception as exc:  # noqa: BLE001 - a broken repair keeps today's verdict
             failure = f"{type(exc).__name__}: {str(exc)[:500]}"
+        if repair is not None:
+            # The commit is on the branch and the worktree matches it; nothing
+            # is restored, so verification continues with the repair applied.
+            elog.info(
+                TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_passed",
+                f"Local repair fixed the drift-only tests in {rounds} round(s); "
+                f"committed {repair.commit_sha[:12]}",
+                rounds=rounds, tokens=tokens,
+                seconds=round(time.monotonic() - started, 3),
+                commit_sha=repair.commit_sha, paths=repair.paths, tests=flagged,
+                paid_retry_avoided=True,
+            )
+            return repair
         try:
             self._restore_worktree_tree(worktree_path, before, elog)
         except Exception as exc:  # noqa: BLE001 - reported; the verdict stays a failure
@@ -630,7 +738,10 @@ class VerificationMixin:
             "Make the smallest change in the code or in the test that removes the "
             "dependence on wall-clock time, for example an injected clock, a larger "
             "deadline, or time.monotonic() instead of time.time(). Do not delete, skip "
-            "or xfail a test and do not weaken what it checks.",
+            "or xfail a test and do not weaken what it checks. Never modify or delete any "
+            "conftest.py, pytest.ini, pyproject.toml, setup.cfg, tox.ini, or any file "
+            f"containing {timing_check_module.CLOCK_DRIFT_ENV} (the timing fixture and how "
+            "pytest loads it): a repair that touches them is rejected.",
             hint_line(list(likely)),
         ]).rstrip()
 
@@ -651,12 +762,26 @@ class VerificationMixin:
         drift_env: dict[str, str], affected: list[str], paths: list[str],
         elog: ExperimentLogger, *, watchdog: WatchdogConfig | None = None,
         host_failures: list[str] | tuple[str, ...] = (),
+        protected: set[str] | None = None,
+        marker_files: set[str] | None = None,
     ) -> str:
         """"" when the candidate passes both runs, else why it does not.
 
         Tests that already failed on this host without drift (the control run)
         may fail in the run without drift again; any other failure rejects.
+        The drift fixture and pytest config must still be intact when the drift
+        rerun starts, otherwise that rerun could pass vacuously.
         """
+        if protected is not None:
+            missing = [
+                path for path in sorted(protected)
+                if not (Path(worktree_path) / path).is_file()
+            ]
+            broken = _drift_fixture_broken(worktree_path, marker_files or set())
+            if missing or broken:
+                gone = missing + [f"{path} (marker gone)" for path in broken if path not in missing]
+                return f"the timing-drift fixture or pytest config changed: {', '.join(gone)}"
+
         def track(process: subprocess.Popen[str] | None) -> None:
             self._track_process(experiment_id, process)
 
@@ -765,7 +890,14 @@ class VerificationMixin:
         self, worktree_path: str, before: str, paths: list[str], patch: str,
         elog: ExperimentLogger,
     ) -> TimingLocalRepair:
-        """Commit only the repair's delta onto the branch HEAD; other work stays as it was."""
+        """Commit only the repair's delta onto the branch HEAD; other work stays as it was.
+
+        Every fallible step happens before the branch ref moves, and the one
+        step after ``update-ref`` (refreshing the real index) rolls the ref back
+        when it fails, so a crash can never leave HEAD on a repair commit whose
+        worktree was undone. A patch that does not apply to HEAD - it overlaps
+        uncommitted work - is rejected, never committed file-whole.
+        """
         def git(args: list[str], env: dict[str, str] | None = None) -> str:
             proc = _run_git(args, cwd=worktree_path, env=env, elog=elog,
                             phase=TIMING_LOCAL_REPAIR_PHASE)
@@ -784,31 +916,40 @@ class VerificationMixin:
                 ["apply", "--cached", "--binary", str(patch_file)], cwd=worktree_path, env=env,
             )
             if applied.returncode != 0:
-                # The repair touched lines of uncommitted work: take those files whole.
-                elog.info(
-                    TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_whole_files",
-                    "The repair overlaps uncommitted work; committing the touched files whole",
-                    paths=paths,
+                raise _TimingRepairRejected(
+                    "the candidate patch does not apply to the branch HEAD (it overlaps "
+                    f"uncommitted work in: {', '.join(paths)}); the candidate is discarded"
                 )
-                git(["read-tree", "HEAD"], env)
-                git(["--literal-pathspecs", "add", "-A", "--", *paths], env)
             tree = git(["write-tree"], env).strip()
+        # commit-tree moves no ref: a failure below leaves branch and worktree as they were.
         commit = git([
             "commit-tree", tree, "-p", head, "-m", TIMING_LOCAL_REPAIR_COMMIT_MESSAGE,
         ]).strip()
+        # Measured tree-to-tree, before any ref moves.
+        stat = self._tree_diff(before, tree, paths, worktree_path, elog, stat=True)
         git(["update-ref", "-m", TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, "HEAD", commit, head])
-        # The real index still describes the old HEAD for these paths.
-        reset = _run_git(
-            ["--literal-pathspecs", "reset", "-q", commit, "--", *paths],
-            cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE,
-        )
-        if reset.returncode != 0:
-            elog.warning(
-                TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_index_stale",
-                "Could not refresh the index for the repaired paths", stderr=reset.stderr,
-            )
-        stat = self._tree_diff(before, self._worktree_tree(worktree_path, elog), paths,
-                               worktree_path, elog, stat=True)
+        try:
+            # The real index still describes the old HEAD for these paths.
+            _run_git(
+                ["--literal-pathspecs", "reset", "-q", commit, "--", *paths],
+                cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE,
+            ).check_returncode()
+        except Exception:
+            # Roll the branch back before the caller restores the worktree, so
+            # HEAD can never stay on a repair commit whose files were undone.
+            try:
+                _run_git(
+                    ["update-ref", "-m", f"{TIMING_LOCAL_REPAIR_COMMIT_MESSAGE} (rollback)",
+                     "HEAD", head, commit],
+                    cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE,
+                ).check_returncode()
+            except Exception as rollback_exc:  # noqa: BLE001 - reported, then re-raise
+                elog.error(
+                    TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_rollback_failed",
+                    "Could not roll the branch back after a failed repair commit",
+                    exc=rollback_exc, commit_sha=commit, head=head,
+                )
+            raise
         return TimingLocalRepair(commit_sha=commit, paths=paths, diff=patch, stat=stat)
 
 

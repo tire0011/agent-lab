@@ -50,19 +50,23 @@ HOST_FAILING = (
     "    def test_host(self):\n"
     "        self.assertNotIn('NEXUS_TEST_CLOCK_DRIFT_MS', os.environ)\n"
 )
-# Other uncommitted work of the experiment, which the repair commit must not take.
+# Other work of the experiment, which the repair commit must not take along.
 APP = "VALUE = 1\n"
+APP_UNCOMMITTED = APP + "# uncommitted tweak\n"
 
 
 class FakeLocalWorker:
     """Writes *contents* (one per round) into tests/test_new.py, like a local SR patch."""
 
     def __init__(self, repo: Path, contents: list[str], *, success: bool = True,
-                 stray: bool = False) -> None:
+                 stray: bool = False, also: dict[str, str] | None = None,
+                 raises: BaseException | None = None) -> None:
         self.repo = repo
         self.contents = list(contents)
         self.success = success
         self.stray = stray
+        self.also = dict(also or {})
+        self.raises = raises
         self.tasks: list[str] = []
         self.kwargs: list[dict] = []
         self.last_run_metrics: dict | None = None
@@ -70,8 +74,12 @@ class FakeLocalWorker:
     def run(self, *, task: str, **kwargs):
         self.tasks.append(task)
         self.kwargs.append(kwargs)
+        if self.raises is not None:
+            raise self.raises
         content = self.contents[min(len(self.tasks), len(self.contents)) - 1]
         (self.repo / "tests" / "test_new.py").write_text(content, encoding="utf-8")
+        for rel, text in self.also.items():
+            (self.repo / rel).write_text(text, encoding="utf-8")
         # A stray file the patch created must go too when the repair is discarded.
         if self.stray:
             (self.repo / "tests" / f"scratch_{len(self.tasks)}.txt").write_text("x", encoding="utf-8")
@@ -142,16 +150,32 @@ class TimingLocalRepairTests(unittest.TestCase):
         self._git("add", "tests/conftest.py")
         self._git("commit", "-q", "-m", "drift fixture")
 
-    def _verify(self, test_source: str | None, *, repair: str = "1"):
+    def _prepare(self, test_source: str | None = None, *,
+                 extra_files: dict[str, str] | None = None) -> str:
+        """Commit the experiment's work (a checkpoint, like a real branch) and
+        leave one uncommitted tweak the repair commit must not take along."""
+        base = self._git("rev-parse", "HEAD").strip()
         if test_source is not None:
             (self.repo / "tests" / "test_new.py").write_text(test_source, encoding="utf-8")
+        for name, content in (extra_files or {}).items():
+            (self.repo / name).write_text(content, encoding="utf-8")
         (self.repo / "app.py").write_text(APP, encoding="utf-8")
+        self._git("add", ".")
+        self._git("commit", "-q", "-m", "experiment checkpoint")
+        (self.repo / "app.py").write_text(APP_UNCOMMITTED, encoding="utf-8")
         experiment = self.service.create_experiment("Add a test")
-        base = self._git("rev-parse", "HEAD").strip()
         self.service._force_status(experiment.id, STATUS_VERIFYING, base_commit_sha=base)
+        return experiment.id
+
+    def _run_verify(self, experiment_id: str, *, repair: str = "1"):
         env = {"NEXUS_TIMING_CHECK": "1", "NEXUS_TIMING_LOCAL_REPAIR": repair}
         with patch.dict("os.environ", env):
-            return experiment.id, self.service._verify(experiment.id, str(self.repo))
+            return self.service._verify(experiment_id, str(self.repo))
+
+    def _verify(self, test_source: str | None = None, *, repair: str = "1",
+                extra_files: dict[str, str] | None = None):
+        experiment_id = self._prepare(test_source, extra_files=extra_files)
+        return experiment_id, self._run_verify(experiment_id, repair=repair)
 
     def _events(self, experiment_id: str, event: str) -> list[dict]:
         path = Path(self.service.get_experiment_logger(experiment_id).path)
@@ -162,15 +186,21 @@ class TimingLocalRepairTests(unittest.TestCase):
         files = {
             str(path.relative_to(self.repo)): path.read_text(encoding="utf-8")
             for path in sorted(self.repo.rglob("*"))
-            if path.is_file() and ".git" not in path.parts and "__pycache__" not in path.parts
+            if path.is_file() and ".git" not in path.parts
+            and "__pycache__" not in path.parts and ".pytest_cache" not in path.parts
         }
-        return self._git("rev-parse", "HEAD"), self._git("status", "--porcelain"), files
+        status = "\n".join(
+            line for line in self._git("status", "--porcelain").splitlines()
+            if "__pycache__" not in line and ".pytest_cache" not in line
+        )
+        return self._git("rev-parse", "HEAD").strip(), status, files
 
     # (1) a passing local fix is committed and verification continues
     def test_passing_fix_is_committed_and_verification_continues(self) -> None:
         self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
         head_before = self._git("rev-parse", "HEAD").strip()
-        experiment_id, result = self._verify(DRIFT_SENSITIVE)
+        result = self._run_verify(experiment_id)
 
         self.assertEqual(result.status, "succeeded", result.error)
         self.assertEqual(len(self.fake.tasks), 1)
@@ -181,16 +211,19 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertIn("NEXUS_TEST_CLOCK_DRIFT_MS=50", task)
         self.assertIn("app.py", task)
         self.assertIn("injected clock", task)
+        # The worker is told the drift fixture itself is off limits.
+        self.assertIn("conftest.py", task)
         # A new commit on the branch, on top of the old HEAD, with only the repair.
         self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), head_before)
         self.assertEqual(self._git("log", "-1", "--format=%s").strip(), TIMING_LOCAL_REPAIR_COMMIT_MESSAGE)
         committed = self._git("show", "--name-only", "--format=", "HEAD").split()
         self.assertEqual(committed, ["tests/test_new.py"])
         self.assertEqual(self._git("show", "HEAD:tests/test_new.py"), CLOCK_INDEPENDENT)
-        # The experiment's other work is still uncommitted, the index is clean for the repair.
-        status = self._git("status", "--porcelain")
-        self.assertIn("?? app.py", status)
-        self.assertNotIn("test_new.py", status)
+        # The experiment's other uncommitted work stays uncommitted; the
+        # repaired file itself is clean against the new HEAD.
+        status_lines = self._git("status", "--porcelain").splitlines()
+        self.assertIn(" M app.py", status_lines)
+        self.assertFalse(any(line.endswith("tests/test_new.py") for line in status_lines))
         # Verification went on to the quality gate and records the repaired file.
         self.quality_mock.assert_called_once()
         self.assertIn("tests/test_new.py", result.git_status)
@@ -208,11 +241,10 @@ class TimingLocalRepairTests(unittest.TestCase):
 
     # (2) a fix that still fails under drift is discarded; today's verdict stays
     def test_fix_still_failing_under_drift_is_discarded(self) -> None:
-        (self.repo / "tests" / "test_new.py").write_text(DRIFT_SENSITIVE, encoding="utf-8")
-        before = self._tree_state()
-        before_files = {**before[2], "app.py": APP}
         self.fake = FakeLocalWorker(self.repo, [STILL_DRIFTING, STILL_DRIFTING], stray=True)
-        experiment_id, result = self._verify(None)
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
 
         self.assertEqual(result.status, "failed")
         self.assertIn(f"timing_sensitive: {FLAGGED}", result.error)
@@ -220,10 +252,11 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertEqual(len(self.fake.tasks), TIMING_LOCAL_REPAIR_MAX_ROUNDS)
         self.assertIn("Previous local round failed", self.fake.tasks[1])
         self.assertIn("timing check under the same drift", self.fake.tasks[1])
-        # Nothing of the attempt is left: same HEAD, same files, no stray file.
+        # Nothing of the attempt is left: same HEAD, same status, same files.
         head, status, files = self._tree_state()
         self.assertEqual(head, before[0])
-        self.assertEqual(files, before_files)
+        self.assertEqual(status, before[1])
+        self.assertEqual(files, before[2])
         self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
         failed = self._events(experiment_id, "timing_check_local_repair_failed")
         self.assertEqual(len(failed), 1)
@@ -234,8 +267,9 @@ class TimingLocalRepairTests(unittest.TestCase):
 
     def test_failed_worker_run_is_discarded(self) -> None:
         self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT], success=False, stray=True)
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
         head_before = self._git("rev-parse", "HEAD")
-        experiment_id, result = self._verify(DRIFT_SENSITIVE)
+        result = self._run_verify(experiment_id)
         self.assertEqual(result.status, "failed")
         self.assertEqual(self._git("rev-parse", "HEAD"), head_before)
         self.assertEqual(
@@ -249,10 +283,166 @@ class TimingLocalRepairTests(unittest.TestCase):
             "    def test_budget", "    @unittest.skip('slow host')\n    def test_budget",
         )
         self.fake = FakeLocalWorker(self.repo, [skipped, skipped])
-        experiment_id, result = self._verify(DRIFT_SENSITIVE)
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        result = self._run_verify(experiment_id)
         self.assertEqual(result.status, "failed")
         failed = self._events(experiment_id, "timing_check_local_repair_failed")
         self.assertIn("skips or xfails", failed[0]["reason"])
+
+    # A candidate that neuters the drift fixture must not make the drift rerun
+    # pass vacuously: it is rejected before the judge runs.
+    def test_candidate_that_neuters_the_drift_fixture_is_rejected(self) -> None:
+        conftest = (self.repo / "tests" / "conftest.py").read_text(encoding="utf-8")
+        neutered = conftest.replace("NEXUS_TEST_CLOCK_DRIFT_MS", "NEXUS_TEST_CLOCK_DISABLED_MS")
+        self.assertNotEqual(neutered, conftest)
+        self.fake = FakeLocalWorker(
+            self.repo, [CLOCK_INDEPENDENT, CLOCK_INDEPENDENT],
+            also={"tests/conftest.py": neutered},
+        )
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("timing-drift fixture", failed[0]["reason"])
+        self.assertEqual(self._events(experiment_id, "timing_check_local_repair_passed"), [])
+        # No commit, and the fixture is back exactly as it was.
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+        head, status, files = self._tree_state()
+        self.assertEqual(files, before[2])
+        self.assertEqual(
+            (self.repo / "tests" / "conftest.py").read_text(encoding="utf-8"), conftest,
+        )
+        # The worker was told the fixture is off limits.
+        self.assertIn("conftest.py", self.fake.tasks[0])
+
+    # A candidate that detects the injected drift in the test itself is rejected too.
+    def test_candidate_that_reads_the_drift_marker_is_rejected(self) -> None:
+        sneaky = CLOCK_INDEPENDENT + "\n# opt out when NEXUS_TEST_CLOCK_DRIFT_MS is set\n"
+        self.fake = FakeLocalWorker(self.repo, [sneaky, sneaky])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("timing-drift marker", failed[0]["reason"])
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertEqual(self._tree_state()[2], before[2])
+
+    # A patch that overlaps uncommitted work cannot be committed as only its
+    # delta, so the candidate is discarded - never committed file-whole.
+    def test_candidate_overlapping_uncommitted_work_is_discarded(self) -> None:
+        self.fake = FakeLocalWorker(
+            self.repo, [CLOCK_INDEPENDENT, CLOCK_INDEPENDENT],
+            also={"app.py": APP + "# worker edit\n"},
+        )
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("does not apply to the branch HEAD", failed[0]["reason"])
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+        head, status, files = self._tree_state()
+        self.assertEqual(files, before[2])
+        # The uncommitted tweak is still there, still uncommitted.
+        self.assertIn(" M app.py", status.splitlines())
+        self.assertEqual((self.repo / "app.py").read_text(encoding="utf-8"), APP_UNCOMMITTED)
+
+    # A crash after the branch ref moved must roll the branch back, so no
+    # repair commit stays on a worktree that was restored.
+    def test_crash_after_the_branch_moves_rolls_the_branch_back(self) -> None:
+        self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        original_run_git = verification_module._run_git
+
+        def flaky(args, **kwargs):
+            if args[:3] == ["--literal-pathspecs", "reset", "-q"]:
+                raise subprocess.CalledProcessError(
+                    128, ["git", *args], output="", stderr="injected failure",
+                )
+            return original_run_git(args, **kwargs)
+
+        with patch.object(verification_module, "_run_git", flaky):
+            result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+        head, status, files = self._tree_state()
+        self.assertEqual(files, before[2])
+        self.assertEqual(status, before[1])
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(self._events(experiment_id, "timing_check_local_repair_passed"), [])
+
+    # An interruption mid-repair still leaves worktree and branch as they were
+    # and falls back to today's verdict, like an interruption of the check.
+    def _assert_interruption_restores_everything(self, raised: BaseException) -> None:
+        self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT], raises=raised)
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+        self.assertEqual(result.status, "failed")
+        self.assertIn(f"timing_sensitive: {FLAGGED}", result.error)
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+        head, status, files = self._tree_state()
+        self.assertEqual(files, before[2])
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("interrupted", failed[0]["reason"])
+        self.assertEqual(self._events(experiment_id, "timing_check_local_repair_passed"), [])
+
+    def test_keyboard_interrupt_mid_repair_restores_everything(self) -> None:
+        self._assert_interruption_restores_everything(KeyboardInterrupt())
+
+    def test_system_exit_mid_repair_restores_everything(self) -> None:
+        self._assert_interruption_restores_everything(SystemExit(1))
+
+    # Fails halfway: round 1 is judged and discarded, round 2 passes and commits.
+    def test_second_round_can_still_pass_and_commit(self) -> None:
+        self.fake = FakeLocalWorker(self.repo, [STILL_DRIFTING, CLOCK_INDEPENDENT])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        head_before = self._git("rev-parse", "HEAD").strip()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "succeeded", result.error)
+        self.assertEqual(len(self.fake.tasks), 2)
+        self.assertIn("Previous local round failed", self.fake.tasks[1])
+        self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), head_before)
+        self.assertEqual(self._git("log", "-1", "--format=%s").strip(), TIMING_LOCAL_REPAIR_COMMIT_MESSAGE)
+        committed = self._git("show", "--name-only", "--format=", "HEAD").split()
+        self.assertEqual(committed, ["tests/test_new.py"])
+        passed = self._events(experiment_id, "timing_check_local_repair_passed")
+        self.assertEqual(len(passed), 1)
+        self.assertEqual(passed[0]["rounds"], 2)
+        self.assertEqual(passed[0]["tokens"], 240)
+
+    # Runs twice: after a successful repair the next verification does not
+    # attempt (or commit) a second repair.
+    def test_successful_repair_is_not_attempted_again_on_the_next_verification(self) -> None:
+        self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT])
+        experiment_id, result = self._verify(DRIFT_SENSITIVE)
+        self.assertEqual(result.status, "succeeded", result.error)
+        self.assertEqual(self.repair_factory.call_count, 1)
+
+        self.service._force_status(experiment_id, STATUS_VERIFYING)
+        with patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1", "NEXUS_TIMING_LOCAL_REPAIR": "1"}):
+            again = self.service._verify(experiment_id, str(self.repo))
+        self.assertEqual(again.status, "succeeded", again.error)
+        self.assertEqual(self.repair_factory.call_count, 1)
+        subjects = self._git("log", "--format=%s").splitlines()
+        self.assertEqual(subjects.count(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE), 1)
 
     # (3) host regressions and known (pre-existing) drift never trigger a repair
     def test_host_failure_never_triggers_a_repair(self) -> None:
@@ -274,9 +464,10 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertEqual(self._events(experiment_id, "timing_check_local_repair_started"), [])
 
     def test_mixed_host_failure_and_drift_still_repairs_only_drift(self) -> None:
-        (self.repo / "tests" / "test_host.py").write_text(HOST_FAILING, encoding="utf-8")
         self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT])
-        experiment_id, result = self._verify(DRIFT_SENSITIVE)
+        experiment_id, result = self._verify(
+            DRIFT_SENSITIVE, extra_files={"tests/test_host.py": HOST_FAILING},
+        )
         task = self.fake.tasks[0]
         self.assertIn(FLAGGED, task)
         self.assertNotIn("test_host", task.split("Files of this change")[0])
@@ -294,7 +485,7 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertIn(f"timing_sensitive: {FLAGGED}; hint:", result.error)
         self.repair_factory.assert_not_called()
         self.assertEqual(self._events(experiment_id, "timing_check_local_repair_started"), [])
-        self.assertIn("?? tests/test_new.py", self._git("status", "--porcelain"))
+        self.assertIn(" M app.py", self._git("status", "--porcelain").splitlines())
 
     def test_unset_switch_means_on(self) -> None:
         with patch.dict("os.environ"):
