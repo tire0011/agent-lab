@@ -1,18 +1,38 @@
-"""Create a disposable environment for verification subprocesses."""
+"""Builds the verification environment without a static allowlist for verification test
+subprocesses started by ``ExperimentService._verify``.
+
+Root cause this fixes: the verification test subprocess (``python -m
+unittest discover -s tests -q`` inside the experiment worktree) previously ran
+via ``subprocess.run(..., env=None)``, which means it silently inherited the
+*entire* environment of the running ``agent-api`` process - including the
+real, production ``AGENT_API_KEY``. Since ``api.py`` reads
+``AGENT_API_KEY`` once at import time and the test suite expects
+``AGENT_API_KEY=test-key`` (see the ``os.environ.setdefault(...)`` calls at
+the top of ``tests/test_api.py`` and friends), a freshly-imported ``api``
+module inside that inherited environment picked up the production key
+instead, and every API-auth test that asserted a 200/401 based on the
+*expected* test key failed unpredictably with unexpected 401s.
+
+This module is deliberately separate from the coding agents' own
+environment minimisation (``modules.coding_worker.filtered_env``, used by
+``CodexWorker._safe_env`` and ``ClaudeWorker._safe_env``), which builds the
+environment for the *implementation* phase and must keep passing through the
+LLM provider credentials that phase actually needs (``OPENAI_API_KEY``,
+``AZURE_OPENAI_API_KEY``, ``ANTHROPIC_API_KEY``, ...). Verification test runs
+need none of those, and must never see them.
+"""
 
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Mapping
 
-# Keep executable discovery and locale support while dropping service settings,
-# proxies, Python startup overrides and credential-store configuration.
-_RUNTIME_ENV = {"PATH", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "WINDIR"}
+_SENSITIVE_ENV_RE = re.compile(r"(?i)(key|secret|token|password|credential|authorization|openai|azure|codex|ssh|agent_mailbox)")
 
 # The fixed, test-only value the whole test suite already expects (see
 # ``os.environ.setdefault("AGENT_API_KEY", "test-key")`` throughout
@@ -73,63 +93,53 @@ def prune_test_tmp(max_age_seconds: float = TEST_TMP_MAX_AGE_SECONDS,
     return removed
 
 
-def build_verification_test_env(
-    base_env: Mapping[str, str] | None = None,
-    *,
-    run_tmp: Path | None = None,
-) -> dict[str, str]:
-    """Build a child environment rooted in a disposable run directory."""
-    source = os.environ if base_env is None else base_env
-    env = {name: source[name] for name in _RUNTIME_ENV if name in source}
-    run_tmp = new_test_tmp_dir() if run_tmp is None else run_tmp.resolve()
-    home = run_tmp / "home"
-    home.mkdir(exist_ok=True)
-    env.update({
-        "AGENT_API_KEY": VERIFICATION_TEST_API_KEY,
-        "AGENT_DB_PATH": str(run_tmp / "agent.db"),
-        "AGENT_LOG_DIR": str(run_tmp / "logs"),
-        "AGENT_MAILBOX_REPO_PATH": str(run_tmp / "mailbox-repo"),
-        "AGENT_CODE_REPO_PATH": str(run_tmp / "code-repo"),
-        "AGENT_CODEX_BIN": str(run_tmp / "no-codex"),
-        "AGENT_CLAUDE_BIN": str(run_tmp / "no-claude"),
-        "AGENT_VIBE_BIN": str(run_tmp / "no-vibe"),
-        "LOCAL_MODEL_RATES_PATH": str(run_tmp / "local-model-rates.json"),
-        "LOCAL_MODEL_STREAM": "0",
-        "NEXUS_DB_MIGRATE_LEGACY": "0",
-        # Disposable databases can skip fsync on every commit.
-        "NEXUS_DB_DURABILITY": "relaxed",
-        "NEXUS_LOG_DIR": str(run_tmp / "structured-logs"),
-        "NEXUS_TEST_LOG_DIR": str(run_tmp / "test-runs"),
-        "NEXUS_TIMING_CHECK": "0",
-        "NEXUS_LLAMA_SERVER_DIAGNOSTICS": "0",
-        "NEXUS_HEALTH_CHECK": "0",
-        "NEXUS_CLI_UPDATE": "0",
-        "NEXUS_WEEKLY_REVIEW": "0",
-        "NEXUS_LOG_RETENTION": "0",
-        "PYTHONUNBUFFERED": "1",
-        "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONNOUSERSITE": "1",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "HOME": str(home),
-        "USERPROFILE": str(home),
-        **dict.fromkeys(("TMPDIR", "TEMP", "TMP"), str(run_tmp)),
-        **dict.fromkeys(LOCAL_MODEL_URL_ENVS, UNREACHABLE_LOCAL_MODEL_URL),
-    })
-    return env
+def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Build the isolated environment for one verification test subprocess.
 
-
-@contextmanager
-def verification_test_env(
-    base_env: Mapping[str, str] | None = None,
-    *,
-    clock_drift: str | None = None,
-) -> Iterator[dict[str, str]]:
-    """Own the run directory until the subprocess and its readers finish."""
+    Starts from the parent environment, removes sensitive variables,
+    and then explicitly sets ``AGENT_API_KEY`` to the fixed test value. No static
+    environment allowlist is used. As a result, no production
+    API key, LLM provider credential, GitHub/Copilot token, authorization
+    header, or other secret-shaped variable can ever reach the verification
+    test process - regardless of what the parent process happens to have
+    set. Values are never logged by this function or its caller.
+    """
+    source: Mapping[str, str] = base_env if base_env is not None else os.environ
+    env = {key: value for key, value in source.items() if not _SENSITIVE_ENV_RE.search(key)}
+    env.pop(CLOCK_DRIFT_ENV, None)
+    env["AGENT_API_KEY"] = VERIFICATION_TEST_API_KEY
+    # A tick started by a test must not check or clean the host (host_health).
+    env["NEXUS_HEALTH_CHECK"] = "0"
+    # Nor update the machine's coding-agent CLIs (cli_updates).
+    env["NEXUS_CLI_UPDATE"] = "0"
+    # Nor start the weekly review (weekly_review).
+    env["NEXUS_WEEKLY_REVIEW"] = "0"
+    # Nor prune the machine's real logs (log_retention).
+    env["NEXUS_LOG_RETENTION"] = "0"
     run_tmp = new_test_tmp_dir()
-    try:
-        env = build_verification_test_env(base_env, run_tmp=run_tmp)
-        if clock_drift is not None:
-            env[CLOCK_DRIFT_ENV] = clock_drift
-        yield env
-    finally:
-        shutil.rmtree(run_tmp, ignore_errors=True)
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        env[name] = str(run_tmp)
+    # The service environment exports ``AGENT_DB_PATH`` pointing at the
+    # production database (nexus-tick.service sets it), and the verification
+    # suite also runs via ``python -m unittest discover`` - where
+    # ``tests/conftest.py`` does not execute. Without this, ``DEFAULT_DB_PATH``
+    # binds to the production database at import time and any test using a
+    # default path opens and locks it while the API service is writing; a
+    # suite run inside the tick hung for hours on exactly this (#766).
+    # Under pytest, conftest.py assigns its own temporary path anyway.
+    if "AGENT_DB_PATH" in source:
+        env["AGENT_DB_PATH"] = str(
+            Path(tempfile.mkdtemp(prefix="nexus-verification-db-", dir=run_tmp)) / "agent.db"
+        )
+    # Same reason, and the actual cause of the 2026-11-19 tick hang (#766):
+    # under unittest discovery conftest.py does not redirect the local model,
+    # so a default-constructed LlamaCppClient talks to the real llama-server
+    # (it falls back to 127.0.0.1:8080 even when no variable is set). A
+    # mailbox test's background failure analysis queued a real inference
+    # there, and LocalLlmJobService.close() finishes an in-flight job before
+    # returning - minutes at ~3 tok/s, behind Nexus's own controller jobs.
+    # Assigned unconditionally, like conftest.py: connection refused is
+    # immediate, and a test that needs a model server sets its own URL.
+    for name in LOCAL_MODEL_URL_ENVS:
+        env[name] = UNREACHABLE_LOCAL_MODEL_URL
+    return env

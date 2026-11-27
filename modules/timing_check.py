@@ -15,7 +15,7 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable
 
 from modules.verification_runner import HungTest, WatchdogConfig, run_verification_test_monitored
-from modules.verification_env import CLOCK_DRIFT_ENV, verification_test_env
+from modules.verification_env import CLOCK_DRIFT_ENV, build_verification_test_env
 
 
 _DIFF_PATH = re.compile(r"^(?:diff --git a/(\S+) b/(\S+)|\+\+\+ b/(\S+))$", re.MULTILINE)
@@ -241,8 +241,18 @@ def _failed_ids(output: str) -> list[str]:
 
 
 def drift_env(drift_ms: int | float = 50) -> dict[str, str]:
-    """Capture the drift setting shared by the branch and base runs."""
-    return {CLOCK_DRIFT_ENV: str(drift_ms)}
+    """The environment of a drift run.
+
+    The same isolated environment as the normal verification run (#736): no
+    production API key or provider credentials, AGENT_API_KEY = test key, and
+    no inherited drift - *drift_ms* is the only drift the child sees. The
+    drift fixture is deterministic (no random seed), so passing one dict to
+    two runs gives both the identical setup.
+    """
+    env = build_verification_test_env()
+    env[CLOCK_DRIFT_ENV] = str(drift_ms)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
 
 
 def _collected_ids(
@@ -253,12 +263,11 @@ def _collected_ids(
     if not file_list:
         return set()
     try:
-        with verification_test_env(clock_drift=env.get(CLOCK_DRIFT_ENV)) as child_env:
-            proc = subprocess.run(
-                [python or sys.executable, "-m", "pytest", "--collect-only", "-q",
-                 "-p", "no:cacheprovider", f"--rootdir={Path(repo).resolve()}", *file_list],
-                cwd=repo, env=child_env, capture_output=True, text=True, timeout=300,
-            )
+        proc = subprocess.run(
+            [python or sys.executable, "-m", "pytest", "--collect-only", "-q",
+             "-p", "no:cacheprovider", *file_list],
+            cwd=repo, env=env, capture_output=True, text=True, timeout=300,
+        )
     except (OSError, subprocess.SubprocessError):
         return None
     # 0 = collected, 5 = nothing collected; anything else is a collection error.
@@ -284,7 +293,7 @@ def base_drift_check(
     Returns ``(regressed, base_drift)``: ``regressed`` passes on the base under
     drift (or does not exist there - a new test), ``base_drift`` fails on the
     base under drift too, so the change did not make it timing-sensitive.
-    *env* carries the drift setting from the branch run. The base is
+    *env* must be the environment of the branch's drift run. The base is
     checked out in a temporary detached worktree of *repo*, removed afterwards.
     None when the base run gives no verdict - the caller then keeps failing.
     """
@@ -314,7 +323,7 @@ def base_drift_check(
         kwargs: dict[str, object] = {"tails": tails} if tails is not None else {}
         if watchdog is not None:
             kwargs.update(watchdog=watchdog, run_id=run_id)
-        result = _run_isolated_timing_check(
+        result = _run_timing_check_env(
             base_path, on_base, env, on_process=on_process, python=python, **kwargs,
         )
         if result == "ok":
@@ -369,14 +378,14 @@ def run_timing_check(
     verification can use the same interpreter as its normal test run. When
     *tails* is a dict, it receives ``{node_id: failure text}`` (at most
     TAIL_MAX_LINES lines each) from pytest's junitxml report; the result
-    string stays the same either way. *env* supplies the drift setting
+    string stays the same either way. *env* replaces ``drift_env(drift_ms)``
     (then *drift_ms* is ignored), so a rerun elsewhere - the base commit
     (#725) - sees exactly the same drift setup.
     """
 
-    settings = drift_env(drift_ms) if env is None else env
-    return _run_isolated_timing_check(
-        repo, tests, settings, on_process=on_process, python=python, tails=tails,
+    env = drift_env(drift_ms) if env is None else env
+    return _run_timing_check_env(
+        repo, tests, env, on_process=on_process, python=python, tails=tails,
         watchdog=watchdog, run_id=run_id,
     )
 
@@ -408,13 +417,6 @@ sys.exit(pytest.main(sys.argv[1:], plugins=[Progress()]))
 """
 
 
-def _run_isolated_timing_check(repo, tests, settings, **kwargs) -> str:
-    if kwargs.get("watchdog") is not None:
-        return _run_timing_check_env(repo, tests, settings, **kwargs)
-    with verification_test_env(clock_drift=settings.get(CLOCK_DRIFT_ENV)) as env:
-        return _run_timing_check_env(repo, tests, env, **kwargs)
-
-
 def _run_timing_check_env(
     repo: str | os.PathLike[str],
     tests: Iterable[str],
@@ -436,10 +438,7 @@ def _run_timing_check_env(
     report_dir = tempfile.TemporaryDirectory(prefix="nexus-timing-check-")
     report = Path(report_dir.name) / "junit.xml"
     try:
-        arguments = [
-            "-q", "-p", "no:cacheprovider", "--tb=short",
-            f"--rootdir={Path(repo).resolve()}", f"--junitxml={report}", *test_list,
-        ]
+        arguments = ["-q", "-p", "no:cacheprovider", "--tb=short", f"--junitxml={report}", *test_list]
         executable = python or sys.executable
         if watchdog is None:
             proc = subprocess.Popen(
@@ -455,7 +454,7 @@ def _run_timing_check_env(
             monitored = run_verification_test_monitored(
                 [executable, "-c", _PYTEST_PROGRESS, *arguments],
                 cwd=str(repo), config=watchdog, run_id=run_id,
-                on_process=on_process, tests_only_progress=True, clock_drift=env.get(CLOCK_DRIFT_ENV),
+                on_process=on_process, tests_only_progress=True, test_env=env,
             )
             if monitored.stalled:
                 raise HungTest(monitored.aborted_test_id or "no active pytest test reported")
@@ -538,12 +537,14 @@ def timing_check_env_probe(ids: Iterable[str], drift_ms: int | float = 0) -> str
 
     node_ids = list(ids)
     old_env = os.environ.copy()
-    old_env.update(drift_env(drift_ms))
-    old_env["PYTHONUNBUFFERED"] = "1"
+    new_env = build_verification_test_env()
+    for env in (old_env, new_env):
+        env[CLOCK_DRIFT_ENV] = str(drift_ms)
+        env["PYTHONUNBUFFERED"] = "1"
     old_tails: dict[str, str] = {}
     new_tails: dict[str, str] = {}
     old_result = _run_timing_check_env(Path.cwd(), node_ids, old_env, tails=old_tails)
-    new_result = run_timing_check(Path.cwd(), node_ids, drift_ms, tails=new_tails)
+    new_result = _run_timing_check_env(Path.cwd(), node_ids, new_env, tails=new_tails)
     return build_timing_check_env_probe_report(
         node_ids, old_result, new_result, old_tails, new_tails,
     )
