@@ -388,6 +388,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
     _migrate_known_drift_tests(conn)
+    _migrate_experiment_lessons(conn)
     conn.commit()
     with conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -406,6 +407,13 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
 def _migrate_known_drift_tests(conn: sqlite3.Connection) -> None:
     """#725: tests main already has that fail under the timing check's drift."""
     from modules.known_drift_tests import ensure_schema
+
+    ensure_schema(conn)
+
+
+def _migrate_experiment_lessons(conn: sqlite3.Connection) -> None:
+    """#715: lessons learned from failed-then-fixed experiment pairs."""
+    from modules.experiment_lessons import ensure_schema
 
     ensure_schema(conn)
 

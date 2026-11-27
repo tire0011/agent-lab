@@ -3,14 +3,16 @@ from models import (
     ExperimentAdoptionStatus,
     ExperimentDetail,
     ExperimentDrift,
+    ExperimentLesson,
     ExperimentReflection,
     ExperimentsResponse,
+    LessonsResponse,
     LocalReplay,
     LocalReplaysResponse,
     PublicExperimentSummary,
     ReflectionsResponse,
 )
-from modules import experiment_reflection, local_shadow_replay, planner_shadow, review_size_stats
+from modules import experiment_lessons, experiment_reflection, local_shadow_replay, planner_shadow, review_size_stats
 from modules.experiment_adoption_service import ExperimentAdoptionService
 from modules.experiment_service import ExperimentService
 
@@ -32,6 +34,8 @@ EXPERIMENTS_DEFAULT_LIMIT = 20
 EXPERIMENTS_MAX_LIMIT = 100
 REFLECTIONS_DEFAULT_LIMIT = 20
 REFLECTIONS_MAX_LIMIT = 100
+LESSONS_DEFAULT_LIMIT = 20
+LESSONS_MAX_LIMIT = 100
 LOCAL_REPLAYS_DEFAULT_LIMIT = 20
 LOCAL_REPLAYS_MAX_LIMIT = 200
 PLANNER_SHADOW_DEFAULT_LIMIT = 20
@@ -143,6 +147,27 @@ def list_reflections(
     stored = experiment_reflection.list_reflections(limit, db_path=_reflection_db_path(service))
     reflections = [_reflection_payload(item) for item in stored]
     return ReflectionsResponse(count=len(reflections), reflections=reflections)
+
+
+def _lesson_payload(lesson: dict) -> ExperimentLesson:
+    payload = dict(lesson)
+    for field in ("cause", "rule"):
+        if payload.get(field):
+            payload[field] = redaction.redact(str(payload[field]))
+    return ExperimentLesson(**payload)
+
+
+@router.get("/lessons", response_model=LessonsResponse)
+def list_experiment_lessons(
+    x_api_key: str | None = Header(default=None),
+    limit: int = Query(default=LESSONS_DEFAULT_LIMIT, ge=LIMIT_MIN, le=LESSONS_MAX_LIMIT),
+    service: ExperimentService = Depends(get_experiment_service),
+) -> LessonsResponse:
+    """Stored lessons from failed-then-fixed experiment pairs, newest first (#715)."""
+    api.authorize(x_api_key)
+    stored = experiment_lessons.list_lessons(limit, db_path=_reflection_db_path(service))
+    lessons = [_lesson_payload(item) for item in stored]
+    return LessonsResponse(count=len(lessons), lessons=lessons)
 
 
 @router.get("/local-replays", response_model=LocalReplaysResponse)

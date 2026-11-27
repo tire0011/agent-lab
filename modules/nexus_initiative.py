@@ -273,6 +273,7 @@ class NexusInitiativeService:
         proposal_releaser: Callable[[int, str], None] | None = None,
         reflection_sweep: Callable[..., Any] | None = None,
         reflection_timeout_seconds: float | None = None,
+        lessons_sweep: Callable[..., Any] | None = None,
         reverification_launcher: Callable[[], None] | None = None,
     ) -> None:
         self.db_path = str(db_path)
@@ -303,6 +304,12 @@ class NexusInitiativeService:
 
             reflection_sweep = reflect_pending
         self._reflection_sweep = reflection_sweep
+        # #715: phrase stored lesson rules with the local model, best effort.
+        if lessons_sweep is None:
+            from modules.experiment_lessons import phrase_pending_lessons
+
+            lessons_sweep = phrase_pending_lessons
+        self._lessons_sweep = lessons_sweep
         if reflection_timeout_seconds is None:
             try:
                 reflection_timeout_seconds = float(
@@ -1928,6 +1935,26 @@ class NexusInitiativeService:
                 self._reflection_timeout_seconds,
             )
 
+    def _phrase_pending_lessons(self) -> None:
+        """Best-effort bounded lesson phrasing with the local model (#715)."""
+        if (self._text_setting("nexus.lessons_enabled") or "1").strip() == "0":
+            return
+
+        def run() -> None:
+            try:
+                self._lessons_sweep(limit=2, db_path=self.db_path)
+            except Exception as exc:  # noqa: BLE001 - phrasing never owns lifecycle
+                logger.warning("initiative: pending-lesson sweep failed: %s", exc)
+
+        worker = threading.Thread(target=run, name="experiment-lessons-sweep", daemon=True)
+        worker.start()
+        worker.join(timeout=self._reflection_timeout_seconds)
+        if worker.is_alive():
+            logger.warning(
+                "initiative: pending-lesson sweep exceeded %.3fs; tick continues",
+                self._reflection_timeout_seconds,
+            )
+
     def _sweep_stalled_experiments(self) -> None:
         """Best-effort stall recovery before the initiative gates.
 
@@ -1953,6 +1980,7 @@ class NexusInitiativeService:
         self._current_tick_id = tick_id
         self._planner_called = False
         self._reflect_pending()
+        self._phrase_pending_lessons()
         if self._paused():
             return self._record(InitiativeDecision(DECISION_PAUSED, detail="paused by the owner", tick_id=tick_id))
         self._sweep_stalled_experiments()
