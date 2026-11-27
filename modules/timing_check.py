@@ -436,12 +436,19 @@ plugins.append(Progress())
 # freshly patched clocks and could miss a restoration in the candidate test.
 # The plugin gets one JSON argument (popped from argv): the drift in seconds
 # and the required node ids. It writes a JSON report (path from
-# _CANARY_REPORT_ENV) at session finish: every node id whose call ran with
+# CANARY_REPORT_ENV) at session finish: every node id whose call ran with
 # both boundary checks clean, plus the call outcome pytest reported.
-_CANARY_REPORT_ENV = "NEXUS_TEST_TIMING_CANARY_REPORT"
+# Public because the repair tamper check (verification.py) rejects patches
+# naming this variable too: a candidate could otherwise forge a report while
+# skipping the flagged test (#845).
+CANARY_REPORT_ENV = "NEXUS_TEST_TIMING_CANARY_REPORT"
 _PYTEST_DRIFT_CANARY = r"""
 import json
 import threading
+
+# Captured before any test runs, like real_clocks above: the in-call sampler
+# paces itself with this sleep (#845), so a patched time.sleep cannot blind it.
+real_sleep = time.sleep
 
 class DriftCanary:
     def __init__(self, config):
@@ -471,23 +478,30 @@ class DriftCanary:
         # Sampled while the test call runs, so a candidate that temporarily
         # puts a real clock back is caught inside the window, not only at the
         # boundaries. Identity only: calling the drifted clock here would
-        # inflate the very drift the test is judged under.
+        # inflate the very drift the test is judged under. The clock names are
+        # a literal and each clock is read through the time module on every
+        # sample, paced by real_sleep (#845): a test cannot blind this sampler
+        # by patching time.sleep, by mutating this script's globals
+        # (real_clocks), or by binding a clock in its own scope - the module
+        # attribute is what gets checked, on every sample.
         while not stop.is_set():
-            for name in real_clocks:
-                if getattr(time, name) is not installed[name]:
+            for name in ('monotonic', 'perf_counter', 'time'):
+                if getattr(time, name, None) is not installed.get(name):
                     self._violation(
                         nodeid,
                         f'clock drift canary: time.{name} has no injected drift '
                         '(a real clock was put back during the test)',
                     )
                     return
-            time.sleep(0.0005)
+            real_sleep(0.0005)
 
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_call(self, item):
         nodeid = item.nodeid
         self.check_clocks(nodeid)
-        installed = {name: getattr(time, name) for name in real_clocks}
+        # Literal names, not the real_clocks global: a candidate must not be
+        # able to blind the in-call sampler by mutating that global (#845).
+        installed = {name: getattr(time, name) for name in ('monotonic', 'perf_counter', 'time')}
         stop = threading.Event()
         monitor = threading.Thread(
             target=self._monitor_clocks, args=(nodeid, installed, stop), daemon=True,
@@ -598,7 +612,7 @@ def _run_timing_check_env(
             if require_active_drift:
                 script += _PYTEST_DRIFT_CANARY
                 child_env = dict(env)
-                child_env[_CANARY_REPORT_ENV] = str(canary_report)
+                child_env[CANARY_REPORT_ENV] = str(canary_report)
                 arguments.insert(0, json.dumps({
                     "drift_seconds": float(env[CLOCK_DRIFT_ENV]) / 1000,
                     "required": list(dict.fromkeys(test_list)),

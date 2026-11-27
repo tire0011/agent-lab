@@ -336,6 +336,24 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
         self.assertEqual(self._tree_state()[2], before[2])
 
+    # #845: a candidate that names the canary report variable could forge a
+    # canary report while skipping the flagged test; rejected like the drift
+    # marker itself.
+    def test_candidate_that_names_the_canary_report_env_is_rejected(self) -> None:
+        sneaky = CLOCK_INDEPENDENT + "\n# report via NEXUS_TEST_TIMING_CANARY_REPORT\n"
+        self.fake = FakeLocalWorker(self.repo, [sneaky, sneaky])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertEqual(len(failed), 1)
+        self.assertIn("timing-drift marker", failed[0]["reason"])
+        self.assertIn("NEXUS_TEST_TIMING_CANARY_REPORT", failed[0]["reason"])
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertEqual(self._tree_state()[2], before[2])
+
     def test_candidate_that_adds_configs_is_rejected_before_the_judge(self) -> None:
         paths = (
             "conftest.py", "tests/new/conftest.py", "tox.ini", "setup.cfg",

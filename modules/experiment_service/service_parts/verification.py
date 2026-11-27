@@ -81,8 +81,17 @@ _TIMING_REPAIR_FEEDBACK_CHARS = 4000
 # A repair that skips or xfails a flagged test only hides the problem.
 _TIMING_REPAIR_SKIP = re.compile(r"^\+.*\b(?:skip|skipIf|skipUnless|xfail)\b", re.MULTILINE)
 # A candidate that detects or disables the injected drift would make the drift
-# rerun pass vacuously, so it is rejected like a skip.
-_TIMING_REPAIR_DRIFT_TAMPER = re.compile(r"^\+.*NEXUS_TEST_CLOCK_DRIFT_MS", re.MULTILINE)
+# rerun pass vacuously, so it is rejected like a skip. #845: naming the canary
+# report variable is equally a tamper - the patch could forge a canary report
+# while skipping the flagged test.
+_TIMING_REPAIR_TAMPER_MARKERS = (
+    timing_check_module.CLOCK_DRIFT_ENV,
+    timing_check_module.CANARY_REPORT_ENV,
+)
+_TIMING_REPAIR_DRIFT_TAMPER = re.compile(
+    r"^\+.*(?:" + "|".join(re.escape(marker) for marker in _TIMING_REPAIR_TAMPER_MARKERS) + r")",
+    re.MULTILINE,
+)
 
 
 class _TimingRepairRejected(Exception):
@@ -717,8 +726,8 @@ class VerificationMixin:
                     elif _TIMING_REPAIR_DRIFT_TAMPER.search(patch):
                         failure = (
                             "the patch references the timing-drift marker "
-                            f"({timing_check_module.CLOCK_DRIFT_ENV}) to detect or disable "
-                            "the injected drift"
+                            f"({' or '.join(_TIMING_REPAIR_TAMPER_MARKERS)}) to detect or "
+                            "disable the injected drift or forge its canary report"
                         )
                     else:
                         failure = self._judge_timing_repair(

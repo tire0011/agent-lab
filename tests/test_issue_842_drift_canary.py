@@ -76,6 +76,49 @@ PERMANENT_RESTORE = (
     "        time.monotonic = real_monotonic\n"
     "        self.assertLess(1, 2)\n"
 )
+# #845: patches time.sleep to raise (blinding a sampler that paces itself
+# through the module attribute), then puts a real clock back during the call.
+# The monitor uses the sleep captured before any test ran, so the in-call
+# sampler stays alive and still catches the restore.
+SLEEP_BLINDING_RESTORE = (
+    "import time\n"
+    "import unittest\n"
+    "real_monotonic = time.monotonic\n"
+    "real_sleep = time.sleep\n"
+    "def _boom(seconds):\n"
+    "    raise RuntimeError('time.sleep is patched')\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_budget(self):\n"
+    "        time.sleep = _boom\n"
+    "        real_sleep(0.02)\n"
+    "        saved = time.monotonic\n"
+    "        time.monotonic = real_monotonic\n"
+    "        real_sleep(0.05)\n"
+    "        time.monotonic = saved\n"
+    "        time.sleep = real_sleep\n"
+    "        self.assertLess(1, 2)\n"
+)
+# #845: mutates the plugin script's real_clocks global (a local alias of the
+# clocks) while putting a real clock back during the call. The monitor
+# iterates a literal name list and reads the clocks through the time module on
+# every sample, so it does not rely on that global and still catches the
+# restore.
+REAL_CLOCKS_TWEAK_RESTORE = (
+    "import __main__\n"
+    "import time\n"
+    "import unittest\n"
+    "real_monotonic = time.monotonic\n"
+    "class T(unittest.TestCase):\n"
+    "    def test_budget(self):\n"
+    "        saved_clocks = dict(__main__.real_clocks)\n"
+    "        __main__.real_clocks.clear()\n"
+    "        saved = time.monotonic\n"
+    "        time.monotonic = real_monotonic\n"
+    "        time.sleep(0.05)\n"
+    "        time.monotonic = saved\n"
+    "        __main__.real_clocks.update(saved_clocks)\n"
+    "        self.assertLess(1, 2)\n"
+)
 
 
 def _install_drift_conftest(repo: Path) -> None:
@@ -140,6 +183,26 @@ class GuardedDriftRunTests(unittest.TestCase):
         result = self._guarded(tails=tails)
         self.assertEqual(flagged_tests(result), [NODE])
         self.assertIn("clock drift canary: time.monotonic has no injected drift", tails.get(NODE, ""))
+
+    # #845: a patched time.sleep must not blind the in-call sampler; the
+    # temporary restore is still caught inside the call window.
+    def test_patched_sleep_does_not_hide_a_temporary_restore(self) -> None:
+        self._write(SLEEP_BLINDING_RESTORE)
+        tails: dict[str, str] = {}
+        result = self._guarded(tails=tails)
+        self.assertEqual(flagged_tests(result), [NODE])
+        self.assertIn("clock drift canary", tails.get(NODE, ""))
+        self.assertIn("put back during the test", tails.get(NODE, ""))
+
+    # #845: the sampler must not rely on the plugin script's real_clocks
+    # global; clearing it does not hide a temporary restore either.
+    def test_tweaking_real_clocks_does_not_hide_a_temporary_restore(self) -> None:
+        self._write(REAL_CLOCKS_TWEAK_RESTORE)
+        tails: dict[str, str] = {}
+        result = self._guarded(tails=tails)
+        self.assertEqual(flagged_tests(result), [NODE])
+        self.assertIn("clock drift canary", tails.get(NODE, ""))
+        self.assertIn("put back during the test", tails.get(NODE, ""))
 
     def test_missing_canary_report_fails_closed(self) -> None:
         # A child that exits 0 without ever writing the canary report (crash
