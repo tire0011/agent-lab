@@ -19,7 +19,7 @@ from modules.central_logging import ExperimentLogger, sanitize_command
 from modules.experiment_evaluation import parse_git_status_short
 from modules.github_work_tracking import failing_test_names
 from modules.review_size_stats import DiffSize, parse_numstat
-from modules.run_store import get_setting, set_setting
+from modules.run_store import DEFAULT_DB_PATH, get_setting, set_setting
 from modules.test_run_log import global_heartbeat_bridge
 from modules import timing_check as timing_check_module
 from modules.verification_runner import (
@@ -63,8 +63,21 @@ TIMING_CHECK_HINT = (
 TIMING_VERDICT_KNOWN_DRIFT = "passed_with_known_drift"
 
 
-def timing_check_enabled() -> bool:
-    return os.environ.get(TIMING_CHECK_ENV_VAR, "1").strip() != "0"
+def timing_check_enabled(db_path: str | None = None) -> bool:
+    """Slow-machine check (#681/#689): on unless explicitly disabled.
+
+    Two switches, both fail-closed for the check itself: ``NEXUS_TIMING_CHECK=0``
+    (environment override) and a persisted host-blocker switch-off (#730) read
+    from the settings DB, so it survives restarts. The environment can only
+    turn the check off, never back on over a persisted switch-off.
+    """
+    if os.environ.get(TIMING_CHECK_ENV_VAR, "1").strip() == "0":
+        return False
+    from modules import gate_self_repair
+
+    return gate_self_repair.gate_disabled_at(
+        db_path or DEFAULT_DB_PATH, gate_self_repair.GATE_TIMING_CHECK,
+    ) is None
 
 
 class VerificationMixin:
@@ -307,10 +320,16 @@ class VerificationMixin:
         are, the verdict is ``passed_with_known_drift`` and the change proceeds.
         """
         drift_env: dict[str, str] | None = None
-        if not timing_check_enabled():
+        disabled_by_env = os.environ.get(TIMING_CHECK_ENV_VAR, "1").strip() == "0"
+        if disabled_by_env or not timing_check_enabled(self.db_path):
+            source = (
+                f"{TIMING_CHECK_ENV_VAR}=0"
+                if disabled_by_env else
+                "the persisted host-blocker switch-off (#730)"
+            )
             elog.info(
                 "verifying", "timing_check_skipped",
-                f"Slow-machine check disabled by {TIMING_CHECK_ENV_VAR}=0",
+                f"Slow-machine check disabled by {source}",
             )
             return None
         # Per-test failure text by exact node id (#737), for the events below.

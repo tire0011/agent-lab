@@ -538,6 +538,52 @@ def _sweep_stalled_experiments(service) -> None:
         logger.warning("experiment %s stalled and was marked failed", experiment_id)
 
 
+def _gate_self_repair_tick(db_path: str, repo_root: str, service=None) -> None:
+    """#730: detect a repeated host blocker and switch the allowlisted gate off.
+
+    The switch-off is persisted in the settings DB and reported through durable
+    pending rows that the next tick retries, so a failed GitHub/mailbox call
+    never loses the report. The rerun on main uses the verification
+    interpreter and watchdog and runs at most once per experiment triple.
+    Never fails the tick.
+    """
+    try:
+        from modules import gate_self_repair
+        from modules.verification_runner import WatchdogConfig
+
+        experiments = getattr(service, "experiment_service", None)
+        python = getattr(experiments, "test_python_executable", None)
+        if not isinstance(python, str):
+            python = None
+        watchdog = None
+        if hasattr(experiments, "_get_test_watchdog_config"):
+            watchdog = experiments._get_test_watchdog_config()
+        if not isinstance(watchdog, WatchdogConfig):
+            watchdog = WatchdogConfig.resolve()
+        outcome = gate_self_repair.check_and_repair(
+            db_path=db_path, repo_root=repo_root, python=python, watchdog=watchdog,
+        )
+    except Exception as exc:  # noqa: BLE001 - self-repair must not break a tick
+        logger.warning("gate self-repair check failed: %s", exc)
+        return
+    if outcome.get("switched_off"):
+        logger.warning(
+            "gate self-repair: %s switched off as %s (repair issue %s)",
+            gate_self_repair.GATE_TIMING_CHECK, outcome.get("blocker"),
+            outcome.get("repair_issue_number"),
+        )
+        _events.append(
+            f"Gate self-repair: the timing check is switched off as {outcome.get('blocker')} "
+            f"(repair issue #{outcome.get('repair_issue_number')})"
+        )
+    elif outcome.get("detected"):
+        logger.info(
+            "gate self-repair: repeated gate reason seen (%s), rerun on main: %s",
+            outcome["detected"]["reason"],
+            (outcome.get("rerun") or outcome.get("rerun_record") or {}).get("result"),
+        )
+
+
 def _wait_for_experiments(service=None) -> None:
     """Keep the process alive until the work it started has ended (#358).
 
@@ -789,6 +835,7 @@ def main(argv: list[str] | None = None) -> int:
         from modules import nexus_status_issue
 
         nexus_status_issue.update_for(service, args.repo_root)
+        _gate_self_repair_tick(args.db_path, args.repo_root, service)
     try:
         if not args.dry_run and service.controller is not None:
             resume = service.resume_blocked_capability()
