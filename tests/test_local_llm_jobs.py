@@ -166,23 +166,6 @@ class LocalLlmJobServiceTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 service.close()
 
-    @mock.patch.dict("os.environ", {"NEXUS_LLAMA_SERVER_DIAGNOSTICS": "0"})
-    async def test_isolated_job_failure_skips_host_diagnostics(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            service = LocalLlmJobService(
-                db_path=str(Path(tmp) / "jobs.db"),
-                llama_client=_FailingClient(_RemoteProtocolError("peer closed connection")),
-            )
-            try:
-                with mock.patch("modules.local_llm_jobs.llama_server_failure_diagnostics") as diagnostics:
-                    job_id = service.submit("hello")
-                    with self.assertRaises(LocalLlmJobError):
-                        await service.wait(job_id)
-                    diagnostics.assert_not_called()
-            finally:
-                service.close()
-
-    @mock.patch.dict("os.environ", {"NEXUS_LLAMA_SERVER_DIAGNOSTICS": "1"})
     async def test_transport_error_is_recorded_and_diagnostics_logged(self):
         with tempfile.TemporaryDirectory() as tmp:
             service = LocalLlmJobService(

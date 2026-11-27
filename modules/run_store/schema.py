@@ -10,8 +10,6 @@ LEGACY_DB_PATH = "/agent/state/agent.db"
 
 
 def _migrate_legacy_db_if_needed(target_path: Path) -> None:
-    if os.environ.get("NEXUS_DB_MIGRATE_LEGACY") == "0":
-        return
     legacy_path = Path(LEGACY_DB_PATH)
     default_target = Path(DEFAULT_DB_PATH)
     if target_path != default_target:
