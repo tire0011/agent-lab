@@ -119,8 +119,36 @@ def _is_generated_path(path: str) -> bool:
 # Pytest loads conftest.py files and these root config files; a repair that
 # changes them (e.g. ``--noconftest`` in addopts) could silence the drift
 # fixture, so they are protected even when they do not name the marker.
-_TIMING_REPAIR_CONFIG_NAMES = {"conftest.py"}
-_TIMING_REPAIR_ROOT_CONFIGS = {"pytest.ini", "pyproject.toml", "setup.cfg", "tox.ini"}
+_TIMING_REPAIR_ROOT_CONFIGS = {
+    "pytest.ini", ".pytest.ini", "pytest.toml", ".pytest.toml",
+    "pyproject.toml", "setup.cfg", "setup.py", "tox.ini",
+}
+
+
+def _is_timing_repair_config(path: str) -> bool:
+    """A path pytest loads its configuration from, wherever it sits.
+
+    Any ``conftest.py`` (root, test dir, or newly created) and the root
+    pytest/packaging configs - checked by name, so it applies to new and
+    ignored files exactly as to tracked ones.
+    """
+    return PurePosixPath(path).name == "conftest.py" or path in _TIMING_REPAIR_ROOT_CONFIGS
+
+
+# Files larger than this are not scanned for the drift marker: a pytest
+# plugin or config is text and small, a database or venv file is not.
+_TIMING_REPAIR_MARKER_MAX_BYTES = 1024 * 1024
+
+
+def _carries_marker(file: Path) -> bool:
+    """Whether *file* names the CLOCK_DRIFT marker (bounded read)."""
+    marker = timing_check_module.CLOCK_DRIFT_ENV
+    try:
+        if file.stat().st_size > _TIMING_REPAIR_MARKER_MAX_BYTES:
+            return False
+        return marker in file.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
 
 
 def _timing_repair_protected_paths(
@@ -134,12 +162,16 @@ def _timing_repair_protected_paths(
     config file. ``marker_files`` is the subset whose marker must stay present.
     A candidate that deletes or neuters any of them would make the drift rerun
     pass vacuously, so it is rejected instead of judged.
+
+    The listing is independent of Git ignore rules: ``--others`` without
+    ``--exclude-standard`` also yields ignored files, which still steer
+    pytest while staying invisible to a plain tree snapshot. The name
+    predicate is applied to every path, before the generated-path filter.
     """
-    marker = timing_check_module.CLOCK_DRIFT_ENV
     paths: list[str] = []
     for args in (
         ["ls-files", "-z", "--cached"],
-        ["ls-files", "-z", "--others", "--exclude-standard"],
+        ["ls-files", "-z", "--others"],
     ):
         proc = _run_git(args, cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE)
         if proc.returncode != 0:
@@ -149,18 +181,40 @@ def _timing_repair_protected_paths(
     protected: set[str] = set()
     marker_files: set[str] = set()
     for path in dict.fromkeys(paths):
+        if _is_timing_repair_config(path):
+            protected.add(path)
         if _is_generated_path(path):
             continue
-        pure = PurePosixPath(path)
-        if pure.name in _TIMING_REPAIR_CONFIG_NAMES or path in _TIMING_REPAIR_ROOT_CONFIGS:
-            protected.add(path)
-        try:
-            file = root / path
-            if file.is_file() and marker in file.read_text(encoding="utf-8", errors="ignore"):
-                marker_files.add(path)
-        except OSError:
-            continue
+        file = root / path
+        if file.is_file() and _carries_marker(file):
+            marker_files.add(path)
     return protected | marker_files, marker_files
+
+
+def _ignored_protected_paths(worktree_path: str, elog: ExperimentLogger) -> list[str]:
+    """Ignored untracked files the protection scan cares about.
+
+    ``git add -A`` skips ignored files, so an ignored ``conftest.py`` or root
+    config would be invisible to the snapshot, the diff and the rollback while
+    still steering pytest. They are force-added into the snapshot instead.
+    """
+    proc = _run_git(
+        ["ls-files", "-z", "--others", "--ignored", "--exclude-standard"],
+        cwd=worktree_path, elog=elog, phase=TIMING_LOCAL_REPAIR_PHASE,
+    )
+    proc.check_returncode()
+    root = Path(worktree_path)
+    selected: list[str] = []
+    for path in proc.stdout.split("\0"):
+        if not path:
+            continue
+        if _is_timing_repair_config(path):
+            selected.append(path)
+        elif not _is_generated_path(path):
+            file = root / path
+            if file.is_file() and _carries_marker(file):
+                selected.append(path)
+    return selected
 
 
 def _drift_fixture_broken(worktree_path: str, marker_files: set[str]) -> list[str]:
@@ -636,31 +690,35 @@ class VerificationMixin:
                 )
                 tokens += self._timing_repair_tokens(worker, result)
                 after = self._worktree_tree(worktree_path, elog)
-                paths = [
-                    path for path in self._tree_diff_names(before, after, worktree_path, elog)
-                    if not _is_generated_path(path)
-                ]
+                # The touched check looks at every changed path, generated
+                # ones included: the protection must not depend on the
+                # generated-file filter that keeps bytecode out of the patch.
+                all_paths = self._tree_diff_names(before, after, worktree_path, elog)
+                paths = [path for path in all_paths if not _is_generated_path(path)]
                 patch = self._tree_diff(before, after, paths, worktree_path, elog) if paths else ""
                 if not getattr(result, "success", False):
                     failure = getattr(result, "error", None) or "the local worker gave no patch"
-                elif not paths:
-                    failure = "the local worker made no change"
-                elif _TIMING_REPAIR_SKIP.search(patch):
-                    failure = "the patch skips or xfails a test instead of fixing it"
-                elif _TIMING_REPAIR_DRIFT_TAMPER.search(patch):
-                    failure = (
-                        "the patch references the timing-drift marker "
-                        f"({timing_check_module.CLOCK_DRIFT_ENV}) to detect or disable "
-                        "the injected drift"
-                    )
                 else:
-                    touched = sorted(set(paths) & protected)
+                    touched = sorted(
+                        path for path in all_paths
+                        if path in protected or _is_timing_repair_config(path)
+                    )
                     broken = _drift_fixture_broken(worktree_path, marker_files)
                     if touched or broken:
                         failure = "the patch touches the timing-drift fixture or pytest config" + (
                             f": {', '.join(touched)}" if touched else ""
                         ) + (
                             f"; the marker is gone from: {', '.join(broken)}" if broken else ""
+                        )
+                    elif not paths:
+                        failure = "the local worker made no change"
+                    elif _TIMING_REPAIR_SKIP.search(patch):
+                        failure = "the patch skips or xfails a test instead of fixing it"
+                    elif _TIMING_REPAIR_DRIFT_TAMPER.search(patch):
+                        failure = (
+                            "the patch references the timing-drift marker "
+                            f"({timing_check_module.CLOCK_DRIFT_ENV}) to detect or disable "
+                            "the injected drift"
                         )
                     else:
                         failure = self._judge_timing_repair(
@@ -791,7 +849,7 @@ class VerificationMixin:
         tails: dict[str, str] = {}
         drift = timing_check_module.run_timing_check(
             worktree_path, flagged, on_process=track, python=self.test_python_executable,
-            tails=tails, env=drift_env, **options,
+            tails=tails, env=drift_env, require_active_drift=True, **options,
         )
         if drift != "ok":
             return f"timing check under the same drift: {drift}\n" + "\n".join(tails.values())
@@ -816,12 +874,22 @@ class VerificationMixin:
 
     @staticmethod
     def _worktree_tree(worktree_path: str, elog: ExperimentLogger) -> str:
-        """Tree object of the whole working state (tracked + untracked), index untouched."""
+        """Tree object of the whole working state (tracked + untracked), index untouched.
+
+        ``git add -A`` skips ignored files, but an ignored ``conftest.py`` or
+        root config still steers pytest, so the ignored files the protection
+        scan cares about are force-added too: the snapshot, the diff and the
+        rollback then all see them.
+        """
         with tempfile.TemporaryDirectory(prefix="nexus-timing-repair-index-") as index_dir:
             env = dict(os.environ)
             env["GIT_INDEX_FILE"] = str(Path(index_dir) / "index")
             for args in (["read-tree", "HEAD"], ["add", "-A"]):
                 _run_git(args, cwd=worktree_path, env=env, elog=elog,
+                         phase=TIMING_LOCAL_REPAIR_PHASE).check_returncode()
+            extra = _ignored_protected_paths(worktree_path, elog)
+            if extra:
+                _run_git(["add", "-f", "--", *extra], cwd=worktree_path, env=env, elog=elog,
                          phase=TIMING_LOCAL_REPAIR_PHASE).check_returncode()
             proc = _run_git(["write-tree"], cwd=worktree_path, env=env, elog=elog,
                             phase=TIMING_LOCAL_REPAIR_PHASE)

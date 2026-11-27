@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 import re
 import shutil
@@ -371,6 +372,7 @@ def run_timing_check(
     watchdog: WatchdogConfig | None = None,
     run_id: str = "timing-check",
     env: dict[str, str] | None = None,
+    require_active_drift: bool = False,
 ) -> str:
     """Run every selected test under clock drift and summarize the outcome.
 
@@ -381,22 +383,36 @@ def run_timing_check(
     string stays the same either way. *env* replaces ``drift_env(drift_ms)``
     (then *drift_ms* is ignored), so a rerun elsewhere - the base commit
     (#725) - sees exactly the same drift setup.
+    *require_active_drift* guards the run with the drift canary: the injected
+    clocks are checked before and after each test call *and* sampled while the
+    call runs (a test may not temporarily put a real clock back), and every
+    selected test must actually execute its call and pass both canary checks -
+    a run whose exit status is 0 only because a flagged test was skipped gives
+    no verdict.
     """
 
     env = drift_env(drift_ms) if env is None else env
     return _run_timing_check_env(
         repo, tests, env, on_process=on_process, python=python, tails=tails,
-        watchdog=watchdog, run_id=run_id,
+        watchdog=watchdog, run_id=run_id, require_active_drift=require_active_drift,
     )
 
+
+_PYTEST_MAIN = r"""
+import os
+import sys
+import time
+
+real_clocks = {name: getattr(time, name) for name in ('monotonic', 'perf_counter', 'time')}
+
+import pytest
+
+plugins = []
+"""
 
 # Pytest captures stderr during tests. Duplicate it before capture and emit
 # start/end events in the format understood by the shared progress watchdog.
 _PYTEST_PROGRESS = r"""
-import os
-import sys
-import pytest
-
 progress = os.dup(2)
 
 class Progress:
@@ -413,8 +429,140 @@ class Progress:
     def pytest_runtest_logfinish(self, nodeid):
         os.write(progress, self.result + b"\n")
 
-sys.exit(pytest.main(sys.argv[1:], plugins=[Progress()]))
+plugins.append(Progress())
 """
+
+# Run inside the flagged test's fixture lifetime. A separate test would get
+# freshly patched clocks and could miss a restoration in the candidate test.
+# The plugin gets one JSON argument (popped from argv): the drift in seconds
+# and the required node ids. It writes a JSON report (path from
+# _CANARY_REPORT_ENV) at session finish: every node id whose call ran with
+# both boundary checks clean, plus the call outcome pytest reported.
+_CANARY_REPORT_ENV = "NEXUS_TEST_TIMING_CANARY_REPORT"
+_PYTEST_DRIFT_CANARY = r"""
+import json
+import threading
+
+class DriftCanary:
+    def __init__(self, config):
+        drift_seconds = float(config['drift_seconds'])
+        if not 0 < drift_seconds < float('inf'):
+            raise ValueError('the clock drift canary requires positive finite drift')
+        self.minimum_offset = drift_seconds / 2
+        self.report_path = config.get('report_path')
+        self.canary_ok = {}
+        self.outcomes = {}
+        self.violations = {}
+        self._lock = threading.Lock()
+
+    def check_clocks(self, nodeid):
+        for name, original in real_clocks.items():
+            clock = getattr(time, name)
+            if clock is original or not clock_offset_ok(clock, original, self.minimum_offset):
+                message = f'clock drift canary: time.{name} has no injected drift'
+                self._violation(nodeid, message)
+                pytest.fail(message, pytrace=False)
+
+    def _violation(self, nodeid, message):
+        with self._lock:
+            return self.violations.setdefault(nodeid, message)
+
+    def _monitor_clocks(self, nodeid, installed, stop):
+        # Sampled while the test call runs, so a candidate that temporarily
+        # puts a real clock back is caught inside the window, not only at the
+        # boundaries. Identity only: calling the drifted clock here would
+        # inflate the very drift the test is judged under.
+        while not stop.is_set():
+            for name in real_clocks:
+                if getattr(time, name) is not installed[name]:
+                    self._violation(
+                        nodeid,
+                        f'clock drift canary: time.{name} has no injected drift '
+                        '(a real clock was put back during the test)',
+                    )
+                    return
+            time.sleep(0.0005)
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_call(self, item):
+        nodeid = item.nodeid
+        self.check_clocks(nodeid)
+        installed = {name: getattr(time, name) for name in real_clocks}
+        stop = threading.Event()
+        monitor = threading.Thread(
+            target=self._monitor_clocks, args=(nodeid, installed, stop), daemon=True,
+        )
+        monitor.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            monitor.join(timeout=10)
+            self.check_clocks(nodeid)
+            with self._lock:
+                violation = self.violations.get(nodeid)
+            if violation is not None:
+                pytest.fail(violation, pytrace=False)
+        with self._lock:
+            if nodeid not in self.violations:
+                self.canary_ok[nodeid] = True
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_makereport(self, item, call):
+        report = yield
+        if report.when == 'call':
+            with self._lock:
+                self.outcomes[item.nodeid] = report.outcome
+        return report
+
+    def pytest_sessionfinish(self, session):
+        sys.setswitchinterval(_old_switch_interval)
+        if not self.report_path:
+            return
+        with self._lock:
+            data = {
+                nodeid: {'canary': True, 'outcome': self.outcomes.get(nodeid)}
+                for nodeid in self.canary_ok
+            }
+        try:
+            with open(self.report_path, 'w', encoding='utf-8') as handle:
+                json.dump(data, handle)
+        except OSError:
+            pass
+
+def clock_offset_ok(clock, original, minimum_offset):
+    before = original()
+    return clock() - before >= minimum_offset
+
+_old_switch_interval = sys.getswitchinterval()
+sys.setswitchinterval(min(_old_switch_interval, 0.0005))
+_canary_config = json.loads(sys.argv.pop(1))
+_canary_config['report_path'] = os.environ.get('NEXUS_TEST_TIMING_CANARY_REPORT') or None
+plugins.append(DriftCanary(_canary_config))
+"""
+
+
+def _canary_unverified(report_path: str | os.PathLike[str], required: Iterable[str]) -> list[str] | None:
+    """Required node ids the canary report does not show as run and passed.
+
+    None when the report is missing or unreadable: a guarded rerun without a
+    readable canary report has no verdict (fail closed). A flagged test that
+    was skipped during setup never enters ``pytest_runtest_call``, so pytest
+    can exit 0 without the canary ever running; such an id lands here, as does
+    one whose call did not succeed.
+    """
+    try:
+        data = json.loads(Path(report_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    missing: list[str] = []
+    for node_id in dict.fromkeys(required):
+        entry = data.get(node_id)
+        if not (isinstance(entry, dict) and entry.get("canary") and entry.get("outcome") == "passed"):
+            missing.append(node_id)
+    return missing
 
 
 def _run_timing_check_env(
@@ -427,6 +575,7 @@ def _run_timing_check_env(
     tails: dict[str, str] | None = None,
     watchdog: WatchdogConfig | None = None,
     run_id: str = "timing-check",
+    require_active_drift: bool = False,
 ) -> str:
     """Implementation shared with the old-vs-new environment probe (#738)."""
 
@@ -437,13 +586,31 @@ def _run_timing_check_env(
     result = "error"
     report_dir = tempfile.TemporaryDirectory(prefix="nexus-timing-check-")
     report = Path(report_dir.name) / "junit.xml"
+    canary_report = Path(report_dir.name) / "canary.json"
+    child_env = env
     try:
         arguments = ["-q", "-p", "no:cacheprovider", "--tb=short", f"--junitxml={report}", *test_list]
         executable = python or sys.executable
+        if watchdog is not None or require_active_drift:
+            script = _PYTEST_MAIN
+            if watchdog is not None:
+                script += _PYTEST_PROGRESS
+            if require_active_drift:
+                script += _PYTEST_DRIFT_CANARY
+                child_env = dict(env)
+                child_env[_CANARY_REPORT_ENV] = str(canary_report)
+                arguments.insert(0, json.dumps({
+                    "drift_seconds": float(env[CLOCK_DRIFT_ENV]) / 1000,
+                    "required": list(dict.fromkeys(test_list)),
+                }))
+            script += "\nsys.exit(pytest.main(sys.argv[1:], plugins=plugins))\n"
+            command = [executable, "-c", script, *arguments]
+        else:
+            command = [executable, "-m", "pytest", *arguments]
         if watchdog is None:
             proc = subprocess.Popen(
-                [executable, "-m", "pytest", *arguments],
-                cwd=Path(repo), env=env, stdout=subprocess.PIPE,
+                command,
+                cwd=Path(repo), env=child_env, stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT, text=True, start_new_session=True,
             )
             if on_process is not None:
@@ -452,9 +619,9 @@ def _run_timing_check_env(
             returncode = proc.returncode
         else:
             monitored = run_verification_test_monitored(
-                [executable, "-c", _PYTEST_PROGRESS, *arguments],
+                command,
                 cwd=str(repo), config=watchdog, run_id=run_id,
-                on_process=on_process, tests_only_progress=True, test_env=env,
+                on_process=on_process, tests_only_progress=True, test_env=child_env,
             )
             if monitored.stalled:
                 raise HungTest(monitored.aborted_test_id or "no active pytest test reported")
@@ -464,6 +631,15 @@ def _run_timing_check_env(
         elif returncode == 1:
             failed = _failed_ids(output or "")
             result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(failed)}" if failed else "error"
+        if require_active_drift and result == "ok":
+            # A zero exit status alone proves nothing: a flagged test skipped
+            # during setup never runs the canary. Every selected id must show
+            # a successful call with completed canary checks in the report.
+            unverified = _canary_unverified(canary_report, test_list)
+            if unverified is None:
+                result = "error"
+            elif unverified:
+                result = f"{TIMING_SENSITIVE_PREFIX}{', '.join(unverified)}"
         if tails is not None and returncode != 0 and report.is_file():
             try:
                 tails.update(failure_tails(report, _failed_ids(output or ""), repo))
