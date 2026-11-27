@@ -82,3 +82,17 @@ class ProviderOverloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ServerFailureIsOverloadTests(unittest.TestCase):
+    def test_a_provider_server_error_is_an_overload_not_a_failed_attempt(self):
+        """2026-11-27: a Mistral run for #842 died on a 502 and counted as an attempt."""
+        from modules.coding_provider import is_provider_overload
+
+        vibe_502 = ("Vibe infrastructure_failure: Response validation failed: 3 validation errors "
+                    "for Unmarshaller body.data.id Field required [... 'raw_status_code': 502}}]")
+        for error in (vibe_502, "HTTP 503 Service Unavailable", "504 Gateway Timeout", "Bad Gateway"):
+            self.assertTrue(is_provider_overload(error), error)
+        # A bare number in test output is not a server failure.
+        for error in ("tests failed: 3 of 10", "AssertionError: 502 != 200", "expected 503 rows"):
+            self.assertFalse(is_provider_overload(error), error)
