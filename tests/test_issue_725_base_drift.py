@@ -105,7 +105,8 @@ class BaseDriftVerificationTests(unittest.TestCase):
         )
         quality.start()
         self.addCleanup(quality.stop)
-        env = patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1"})
+        # The local repair (#711) is tested in its own file.
+        env = patch.dict("os.environ", {"NEXUS_TIMING_CHECK": "1", "NEXUS_TIMING_LOCAL_REPAIR": "0"})
         env.start()
         self.addCleanup(env.stop)
 

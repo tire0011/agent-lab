@@ -191,6 +191,8 @@ os.environ["LOCAL_MODEL_STREAM"] = "0"
 # fail closed to needs_review. Tests of the check itself opt in explicitly.
 # Assigned, not setdefault: a shell that exports it must not change results.
 os.environ["NEXUS_TIMING_CHECK"] = "0"
+# Its local repair (#711) would call the real llama-server; its tests opt in.
+os.environ["NEXUS_TIMING_LOCAL_REPAIR"] = "0"
 
 # The tick's host check (modules/host_health) would look at - and on low disk
 # clean - this machine's own temp dir. Tests of the check call it directly.
