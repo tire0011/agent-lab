@@ -21,9 +21,14 @@ API_VERSION = VERSION
 COMPONENTS = ["health", "status", "problems", "ideas", "chat"]
 
 
-def build_status() -> dict:
+def build_status(db_path: str | None = None) -> dict:
+    from modules import gate_self_repair
+
     return {
         "agent_status": "idle",
         "api_version": API_VERSION,
         "components": COMPONENTS,
+        # #730: the gate self-repair state (switched-off gates, host blocker,
+        # repair issue, pending reports).
+        "gate_self_repair": gate_self_repair.status(db_path),
     }

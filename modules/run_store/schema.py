@@ -390,6 +390,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
     _migrate_known_drift_tests(conn)
+    _migrate_gate_self_repair(conn)
     conn.commit()
     with conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -410,6 +411,13 @@ def _migrate_known_drift_tests(conn: sqlite3.Connection) -> None:
     from modules.known_drift_tests import ensure_schema
 
     ensure_schema(conn)
+
+
+def _migrate_gate_self_repair(conn: sqlite3.Connection) -> None:
+    """#730: durable pending gate-repair reports, retried on the next tick."""
+    from modules.gate_self_repair import REPORT_SCHEMA_SQL
+
+    conn.executescript(REPORT_SCHEMA_SQL)
 
 
 def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:

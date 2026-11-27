@@ -22,6 +22,7 @@ class StatusResponse(BaseModel):
     agent_status: str
     api_version: str
     components: list[str]
+    gate_self_repair: dict[str, Any] | None = None
 
 
 class Problem(BaseModel):

@@ -374,6 +374,15 @@ class McpApiTests(unittest.TestCase):
                 "agent_status": "idle",
                 "api_version": "0.2.0",
                 "components": ["health", "status", "problems", "ideas", "chat"],
+                # #730: the gate self-repair state is part of /status.
+                "gate_self_repair": {
+                    "disabled_gates": [],
+                    "host_blocker": None,
+                    "pending_reports": 0,
+                    "repair_issue_number": None,
+                    "state": None,
+                    "timing_check": "on",
+                },
             },
         )
 
