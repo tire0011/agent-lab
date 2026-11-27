@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -23,6 +24,7 @@ import unittest
 from unittest.mock import patch
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from modules.central_logging import ExperimentLogger, read_log_entries
 from modules.nexus_diagnostics import (
@@ -325,7 +327,7 @@ class GlobalHeartbeatBridgeTests(unittest.TestCase):
 
 
 class MonitoredRunTests(unittest.TestCase):
-    """End-to-end runs of the real watchdog against real test processes."""
+    """Exercise the watchdog loop and its subprocess integration."""
 
     def setUp(self):
         self.log_dir = Path(tempfile.mkdtemp(prefix="nexus-monitored-"))
@@ -340,32 +342,49 @@ class MonitoredRunTests(unittest.TestCase):
         return result, beats
 
     def test_progressing_suite_runs_far_past_the_stall_timeout(self):
-        """Six tests, each shorter than the stall timeout, total longer than
-        it: progress - not total runtime - must decide."""
-        root = _write_suite(
-            """
-            import time, unittest
+        elapsed = 0.0
+        completed = 0
+        test_count = 6
+        step = FAST.stall_timeout_seconds / 2
+        parser = UnittestStreamParser()
 
-            class Slow(unittest.TestCase):
-                pass
+        def wait_for_suite(timeout):
+            nonlocal elapsed, completed
+            if completed == test_count:
+                process.returncode = 0
+                return 0
+            _record_all(tracker, parser.feed(
+                f"test_{completed} (test_subject.Slow.test_{completed}) ... ok\n"
+            ))
+            completed += 1
+            elapsed += step
+            raise subprocess.TimeoutExpired(DISCOVER, timeout)
 
-            for index in range(6):
-                def _make(i):
-                    def test(self):
-                        time.sleep(0.4)
-                    test.__name__ = f"test_{i}"
-                    return test
-                setattr(Slow, f"test_{index}", _make(index))
-            """
-        )
-        result, beats = self._run(root)
+        # Replace the tracker module's clock without patching the clock used
+        # by subprocess or the rest of the test suite.
+        with patch("modules.test_progress.time", SimpleNamespace(monotonic=lambda: elapsed)):
+            tracker = ProgressTracker(expected_total=test_count)
+            with (
+                patch("modules.verification_runner.ProgressTracker", return_value=tracker),
+                patch("modules.verification_runner.subprocess.Popen") as spawn,
+                patch("modules.verification_runner._terminate") as terminate,
+            ):
+                process = spawn.return_value
+                process.stdout = process.stderr = None
+                process.pid = -1
+                process.poll.side_effect = lambda: process.returncode
+                process.returncode = None
+                process.wait.side_effect = wait_for_suite
+                result, beats = self._run(self.log_dir)
+
+        terminate.assert_not_called()
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.timed_out)
         self.assertFalse(result.stalled)
-        self.assertEqual(result.tests_total, 6)
-        self.assertEqual(result.progress["tests_completed"], 6)
-        self.assertGreaterEqual(result.duration_ms, 2400)
-        self.assertTrue(beats, "the watchdog must publish a heartbeat while running")
+        self.assertEqual(result.progress["tests_completed"], test_count)
+        self.assertEqual(len(beats), test_count)
+        self.assertGreater(beats[-1]["elapsed_seconds"], FAST.stall_timeout_seconds)
+        self.assertTrue(all(beat["last_progress_age_seconds"] == step for beat in beats))
 
     def test_a_stuck_test_is_detected_and_diagnosed(self):
         root = _write_suite(
