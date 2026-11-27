@@ -372,6 +372,160 @@ class TimingLocalRepairTests(unittest.TestCase):
         self.assertIn("clock drift canary: time.monotonic has no injected drift", failed["reason"])
         self.assertEqual(self._tree_state(), before)
 
+    # #842: a candidate that puts a real clock back during the test and
+    # reinstates the drifted one before returning passes both boundary checks;
+    # the canary samples the clocks while the call runs, so the guarded rerun
+    # still fails and the candidate is rejected.
+    def test_candidate_that_temporarily_restores_the_clock_is_rejected(self) -> None:
+        temporary = (
+            "import time\n"
+            "import unittest\n"
+            "real_monotonic = time.monotonic\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_budget(self):\n"
+            "        saved = time.monotonic\n"
+            "        time.monotonic = real_monotonic\n"
+            "        time.sleep(0.1)\n"
+            "        time.monotonic = saved\n"
+            "        self.assertLess(1, 2)\n"
+        )
+        self.fake = FakeLocalWorker(self.repo, [temporary, temporary])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("clock drift canary", failed["reason"])
+        self.assertIn("put back during the test", failed["reason"])
+        self.assertEqual(self._tree_state(), before)
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+
+    # #842: a skip that avoids the literal skip keywords (SkipTest) reaches the
+    # judge; there the guarded rerun must refuse it: the flagged test never
+    # ran its call, so pytest's zero exit status proves nothing.
+    SKIP_AT_SETUP = (
+        "import unittest\n"
+        "class T(unittest.TestCase):\n"
+        "    def setUp(self):\n"
+        "        raise unittest.SkipTest('not on this host')\n"
+        "    def test_budget(self):\n"
+        "        self.assertLess(1, 2)\n"
+    )
+
+    def test_candidate_that_skips_at_setup_without_the_skip_keyword_is_rejected(self) -> None:
+        self.fake = FakeLocalWorker(self.repo, [self.SKIP_AT_SETUP, self.SKIP_AT_SETUP])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("timing check under the same drift", failed["reason"])
+        self.assertIn(FLAGGED, failed["reason"])
+        self.assertEqual(self._tree_state(), before)
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+
+    # #842: an ignored conftest.py or root config is invisible to `git add -A`,
+    # but it still steers pytest: creating one is rejected before the judge,
+    # and the rollback removes it again.
+    def test_candidate_creating_ignored_protected_files_is_rejected_and_removed(self) -> None:
+        (self.repo / ".gitignore").write_text("ignored/\n/tox.ini\n", encoding="utf-8")
+        self._git("add", ".gitignore")
+        self._git("commit", "-q", "-m", "gitignore")
+        self.fake = FakeLocalWorker(
+            self.repo, [CLOCK_INDEPENDENT],
+            also={"ignored/conftest.py": "HOOK = 1\n", "tox.ini": "[pytest]\n"},
+        )
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        with patch.object(self.service, "_judge_timing_repair") as judge:
+            result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        judge.assert_not_called()
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("ignored/conftest.py", failed["reason"])
+        self.assertIn("tox.ini", failed["reason"])
+        self.assertFalse((self.repo / "ignored" / "conftest.py").exists())
+        self.assertFalse((self.repo / "tox.ini").exists())
+        self.assertEqual(self._tree_state(), before)
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+
+    # #842: an ignored conftest.py that already existed is protected too, and
+    # a rejected attempt restores its content, not just its existence.
+    def test_candidate_modifying_an_existing_ignored_conftest_is_rejected_and_restored(self) -> None:
+        (self.repo / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+        self._git("add", ".gitignore")
+        self._git("commit", "-q", "-m", "gitignore")
+        ignored = self.repo / "ignored"
+        ignored.mkdir()
+        (ignored / "conftest.py").write_text("ORIGINAL = 1\n", encoding="utf-8")
+        self.fake = FakeLocalWorker(
+            self.repo, [CLOCK_INDEPENDENT],
+            also={"ignored/conftest.py": "ORIGINAL = 2\n"},
+        )
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        with patch.object(self.service, "_judge_timing_repair") as judge:
+            result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        judge.assert_not_called()
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("ignored/conftest.py", failed["reason"])
+        self.assertEqual((ignored / "conftest.py").read_text(encoding="utf-8"), "ORIGINAL = 1\n")
+        self.assertEqual(self._tree_state(), before)
+
+    # #842: a hang inside the guarded rerun aborts the whole repair; worktree
+    # and branch are put back exactly and the old verdict stands.
+    def test_judge_hang_mid_repair_restores_everything(self) -> None:
+        from modules.verification_runner import HungTest
+
+        self.fake = FakeLocalWorker(self.repo, [CLOCK_INDEPENDENT])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        before = self._tree_state()
+        original = verification_module.timing_check_module.run_timing_check
+
+        def hanging(*args, **kwargs):
+            if kwargs.get("require_active_drift"):
+                raise HungTest(FLAGGED)
+            return original(*args, **kwargs)
+
+        with patch.object(verification_module.timing_check_module, "run_timing_check", hanging):
+            result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn(f"timing_sensitive: {FLAGGED}", result.error)
+        failed, = self._events(experiment_id, "timing_check_local_repair_failed")
+        self.assertIn("hung", failed["reason"])
+        self.assertEqual(self._git("rev-parse", "HEAD").strip(), before[0])
+        self.assertNotIn(TIMING_LOCAL_REPAIR_COMMIT_MESSAGE, self._git("log", "--format=%s"))
+        self.assertEqual(self._tree_state(), before)
+        self.assertEqual(self._events(experiment_id, "timing_check_local_repair_passed"), [])
+
+    # #842: halfway failure then success - round 1 is rejected by the canary
+    # (skip at setup), round 2 passes and commits. Each guarded rerun reads
+    # its own canary report, so round 1's exit-0-skipped run is never
+    # mistaken for a pass.
+    def test_canary_rejected_round_one_then_passing_round_two_commits(self) -> None:
+        self.fake = FakeLocalWorker(self.repo, [self.SKIP_AT_SETUP, CLOCK_INDEPENDENT])
+        experiment_id = self._prepare(DRIFT_SENSITIVE)
+        head_before = self._git("rev-parse", "HEAD").strip()
+        result = self._run_verify(experiment_id)
+
+        self.assertEqual(result.status, "succeeded", result.error)
+        self.assertEqual(len(self.fake.tasks), 2)
+        self.assertIn("Previous local round failed", self.fake.tasks[1])
+        self.assertEqual(self._git("rev-parse", "HEAD~1").strip(), head_before)
+        self.assertEqual(self._git("log", "-1", "--format=%s").strip(), TIMING_LOCAL_REPAIR_COMMIT_MESSAGE)
+        committed = self._git("show", "--name-only", "--format=", "HEAD").split()
+        self.assertEqual(committed, ["tests/test_new.py"])
+        passed = self._events(experiment_id, "timing_check_local_repair_passed")
+        self.assertEqual(len(passed), 1)
+        self.assertEqual(passed[0]["rounds"], 2)
+
     # A patch that overlaps uncommitted work cannot be committed as only its
     # delta, so the candidate is discarded - never committed file-whole.
     def test_candidate_overlapping_uncommitted_work_is_discarded(self) -> None:
