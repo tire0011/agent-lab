@@ -105,6 +105,19 @@ class _RepairProgress:
     patch: str = ""
 
 
+def _review_fix_task(service, experiment, goal, summary, paths, branch_diff):
+    """The local review-fix coding task plus the matching lessons section (#715).
+
+    The review summary and the touched paths are the match context; the
+    returned lesson ids are marked sent by the caller right before the worker
+    runs. Returns ``(task, lesson_ids)``.
+    """
+    task = f"{goal}\n{hint_line(paths)}\n\n{HANDOVER_HEADING}\nBranch diff:\n{branch_diff}"
+    return service._with_lessons_section(
+        task, experiment, extra_files=paths, extra_text=summary
+    )
+
+
 def _repair(adoption, tree, head, base, summary, experiment_id, elog, remaining, progress):
     tracked_paths = set(_git(tree, "ls-files", "-z").rstrip("\0").split("\0"))
     findings = _findings(summary, tracked_paths)
@@ -117,6 +130,20 @@ def _repair(adoption, tree, head, base, summary, experiment_id, elog, remaining,
     )
     task = f"{goal}\n{hint_line(paths)}\n\n{HANDOVER_HEADING}\nBranch diff:\n{branch_diff}"
     service = adoption.experiment_service
+    # #715: the local review-fix coding call gets the same matching lessons
+    # section as every other coding run; the ids are marked sent right before
+    # worker.run. Best-effort: a service without the lessons hooks (or a store
+    # error) just runs without the section.
+    review_fix_lesson_ids: list[str] = []
+    with_lessons = getattr(service, "_with_lessons_section", None)
+    if callable(with_lessons):
+        try:
+            experiment = service.get_experiment(experiment_id)
+            task, review_fix_lesson_ids = _review_fix_task(
+                service, experiment, goal, summary, paths, branch_diff
+            )
+        except Exception:  # noqa: BLE001 - lessons never block the repair
+            logger.warning("local review fix: lessons section failed", exc_info=True)
     template = service.test_command or _TEST_COMMANDS[_DEFAULT_TEST_COMMAND_KEY]
     python = service.test_python_executable
     command = [part.format(python=python) for part in template]
@@ -133,6 +160,12 @@ def _repair(adoption, tree, head, base, summary, experiment_id, elog, remaining,
             f"Local patch so far:\n{progress.patch[:8000]}" if failure else ""
         )
         progress.rounds = round_no
+        mark_sent = getattr(service, "_mark_lessons_sent", None)
+        if callable(mark_sent):
+            try:
+                mark_sent(experiment_id, review_fix_lesson_ids)
+            except Exception:  # noqa: BLE001 - bookkeeping only
+                logger.warning("local review fix: could not track lesson injection", exc_info=True)
         result = worker.run(
             task=task + feedback, working_dir=str(tree), sandbox="workspace-write",
             timeout_seconds=budget, experiment_logger=elog, phase="local_review_fix",

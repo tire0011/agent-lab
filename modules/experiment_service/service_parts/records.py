@@ -894,6 +894,18 @@ class RecordsMixin:
             policy_rule=fields.get("policy_rule"),
             reason=sanitized_reason(str(fields["error"])) if fields.get("error") else None,
         )
+        if status in _TERMINAL_STATUSES:
+            # #715: a terminal status (also set by re-verification outside
+            # run_experiment) reconciles the lessons store; idempotent and
+            # best-effort, so a failure here never breaks the pipeline.
+            try:
+                from modules.experiment_lessons import note_experiment_finished
+
+                note_experiment_finished(self.db_path, experiment_id)
+            except Exception:  # noqa: BLE001 - lessons are bookkeeping only
+                logger.warning(
+                    "experiment %s: lesson reconcile failed", experiment_id, exc_info=True
+                )
 
 
     def mark_interrupted_experiments_failed(self) -> list[str]:

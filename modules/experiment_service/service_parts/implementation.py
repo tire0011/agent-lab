@@ -8,9 +8,13 @@ import subprocess
 import uuid
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from modules.experiment_lessons import lessons_for_prompt, note_experiment_finished
+from modules.experiment_lessons import (
+    lessons_for_prompt,
+    mark_injected_for,
+    note_experiment_finished,
+)
 from modules.central_logging import ExperimentLogger
 from modules.codex_worker import CodexResult
 from modules.coding_provider import (
@@ -215,29 +219,64 @@ class ImplementationMixin:
             )
 
 
-    def _with_lessons_section(self, prompt: str, experiment: Experiment) -> str:
+    def _with_lessons_section(
+        self, prompt: str, experiment: Experiment, *,
+        extra_files: Iterable[str] = (), extra_text: str = "",
+    ) -> tuple[str, list[str]]:
         """Append the matching "Lessons from earlier runs" section (#715).
 
-        Selects the best-matching active lessons for the goal and the files the
-        plan will touch, bounded to ``LESSONS_SECTION_MAX_CHARS``, and tracks the
-        injection on the experiment. Returns *prompt* unchanged when nothing
-        matches or the store is unavailable.
+        Selects the best-matching active lessons for the goal and the target
+        files - the plan's ``affected_files`` when a plan exists, plus paths
+        named in the issue/goal text and files earlier experiments on the same
+        source touched (the initial implementation call has no plan yet).
+        Returns ``(prompt, sent_lesson_ids)``; the prompt is unchanged when
+        nothing matches or the store is unavailable. The rendered section is
+        untrusted advisory context, so it is also run through the goal policy
+        and dropped when that check rejects it. Only the returned ids were
+        actually rendered; the caller marks them sent right before dispatch.
         """
         try:
             plan = experiment.plan or {}
             files = [
                 str(f) for f in (plan.get("affected_files") or []) if str(f).strip()
             ]
-            section, _lesson_ids = lessons_for_prompt(
-                self.db_path, goal=experiment.goal, files=files, experiment_id=experiment.id
+            files.extend(str(f) for f in extra_files if str(f).strip())
+            text = (
+                f"{experiment.goal}\n{extra_text}" if extra_text else experiment.goal
+            )
+            section, lesson_ids = lessons_for_prompt(
+                self.db_path, goal=experiment.goal, files=files,
+                experiment_id=experiment.id, text=text,
             )
             if section:
-                return f"{prompt}\n\n{section}"
+                if _check_goal_policy(section) is not None:
+                    logger.warning(
+                        "experiment %s: lessons section rejected by goal policy; dropped",
+                        experiment.id,
+                    )
+                    return prompt, []
+                return f"{prompt}\n\n{section}", lesson_ids
         except Exception as exc:  # noqa: BLE001 - a coding run never waits on lessons
             logger.warning(
                 "experiment %s: lessons section failed: %s", experiment.id, exc
             )
-        return prompt
+        return prompt, []
+
+    def _mark_lessons_sent(self, experiment_id: str, lesson_ids: Iterable[str]) -> None:
+        """Track only the lessons that were actually sent to a worker (#715).
+
+        Called right before ``worker.run``, after provider setup, so a failed
+        pre-dispatch step never counts as an injection. Best-effort.
+        """
+        ids = [str(i) for i in (lesson_ids or ()) if str(i).strip()]
+        if not ids:
+            return
+        try:
+            mark_injected_for(self.db_path, ids, experiment_id)
+        except Exception as exc:  # noqa: BLE001 - lessons are bookkeeping only
+            logger.warning(
+                "experiment %s: could not track lesson injection: %s", experiment_id, exc
+            )
 
 
     def _run_pipeline(self, experiment_id: str, *, github_work_tracking: Any | None = None) -> Experiment:
@@ -340,7 +379,9 @@ class ImplementationMixin:
         )
         implementation_prompt = _build_direct_implementation_prompt(experiment.goal)
         # #715: matching lessons from earlier failed-then-fixed runs ride along.
-        implementation_prompt = self._with_lessons_section(implementation_prompt, experiment)
+        implementation_prompt, implementation_lesson_ids = self._with_lessons_section(
+            implementation_prompt, experiment
+        )
         if github_work_tracking is not None:
             implementation_prompt = self._merge_current_main(worktree_path, elog) + implementation_prompt
         implementation_task_id = uuid.uuid4().hex
@@ -370,6 +411,9 @@ class ImplementationMixin:
         stall_seconds, max_seconds = agent_watchdog_limits()
 
         live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
+        # #715: the lessons in the prompt are only tracked once they are actually
+        # sent to the worker (provider setup above can still fail).
+        self._mark_lessons_sent(experiment_id, implementation_lesson_ids)
         implementation_result: CodexResult = worker.run(
             task=implementation_prompt,
             working_dir=worktree_path,
@@ -708,13 +752,15 @@ class ImplementationMixin:
                 provider=provider_of(worker) or "",
             )
             live_usage, live_state = self._live_worker_usage_callback(experiment_id, elog)
+            # A repair coder is a paid coder too: it sees the same suggestion (#636)
+            # and the same lessons section (#715) as the first attempt.
+            repair_prompt, repair_lesson_ids = self._with_lessons_section(
+                _build_repair_implementation_prompt(result.goal, feedback), result
+            )
+            self._mark_lessons_sent(experiment_id, repair_lesson_ids)
             repair_result = worker.run(
-                # A repair coder is a paid coder too: it sees the same suggestion (#636)
-                # and the same lessons section (#715) as the first attempt.
                 task=with_model_written_tests(
-                    self._with_lessons_section(
-                        _build_repair_implementation_prompt(result.goal, feedback), result
-                    ),
+                    repair_prompt,
                     getattr(result, "model_written_tests", None),
                 ),
                 working_dir=worktree_path,

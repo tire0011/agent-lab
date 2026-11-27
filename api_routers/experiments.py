@@ -154,6 +154,10 @@ def _lesson_payload(lesson: dict) -> ExperimentLesson:
     for field in ("cause", "rule"):
         if payload.get(field):
             payload[field] = redaction.redact(str(payload[field]))
+    # #715: keywords and files are derived from raw evidence; redact them too
+    # on the read side, even though they are sanitized at write time.
+    payload["keywords"] = [redaction.redact(str(k)) for k in payload.get("keywords") or []]
+    payload["files"] = [redaction.redact(str(f)) for f in payload.get("files") or []]
     return ExperimentLesson(**payload)
 
 

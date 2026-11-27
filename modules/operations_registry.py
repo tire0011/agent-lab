@@ -721,7 +721,7 @@ class OperationsRegistry:
         return OperationResult("reflections_list", True, lines or ["(no reflections stored)"], 0)
 
     def _op_lessons_list(self, args: dict[str, Any]) -> OperationResult:
-        from modules.experiment_lessons import list_lessons
+        from modules.experiment_lessons import failure_recurrence_stats, list_lessons
 
         limit = self._limit(args, default=10, maximum=100)
         lines: list[str] = []
@@ -735,10 +735,21 @@ class OperationsRegistry:
             lines.append(redact(f"  rule: {lesson['rule']}")[:500])
             if lesson.get("files"):
                 lines.append(redact(f"  files: {', '.join(lesson['files'][:8])}")[:300])
+            if lesson.get("keywords"):
+                lines.append(redact(f"  keywords: {', '.join(lesson['keywords'][:12])}")[:300])
             lines.append(
                 f"  evidence: {lesson['failure_experiment_id'][:12]} -> "
                 f"{lesson['success_experiment_id'][:12]}"
             )
+        try:
+            stats = failure_recurrence_stats(self.db_path, window=20)
+            lines.append(
+                f"recurrence (last {stats['window']} experiments): "
+                f"{stats['repeated']}/{stats['failure_events']} failure events repeated "
+                "an earlier reason on the same source"
+            )
+        except Exception:  # noqa: BLE001 - the measure is informational
+            pass
         return OperationResult("lessons_list", True, lines or ["(no lessons stored)"], 0)
 
     def _op_known_drift_tests_list(self, args: dict[str, Any]) -> OperationResult:
