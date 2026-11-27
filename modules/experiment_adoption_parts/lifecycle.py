@@ -42,6 +42,7 @@ from modules.experiment_adoption_parts.core import (
     _MAX_RECOVERY_ATTEMPTS,
     _MAX_STALE_RETRIES,
     _NullExperimentLogger,
+    _TERMINAL_STATUSES,
     _row_to_adoption,
     _safe_list,
 )
@@ -451,6 +452,18 @@ class LifecycleMixin:
         query = f"UPDATE experiment_adoptions SET {', '.join(set_clauses)} WHERE experiment_id = ?"
         with self._lock, self._conn:
             self._conn.execute(query, values)
+        if status in _TERMINAL_STATUSES:
+            # #715: a terminal adoption outcome (e.g. a review-blocked merge
+            # while the experiment row still says 'succeeded') reconciles the
+            # lessons store; idempotent and best-effort.
+            try:
+                from modules.experiment_lessons import note_adoption_outcome
+
+                note_adoption_outcome(self.db_path, experiment_id)
+            except Exception:  # noqa: BLE001 - lessons are bookkeeping only
+                logger.warning(
+                    "adoption %s: lesson reconcile failed", experiment_id, exc_info=True
+                )
 
 
     def _transition_status(self, experiment_id: str, from_status: str, to_status: str, **fields: Any) -> bool:

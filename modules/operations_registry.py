@@ -258,6 +258,7 @@ class OperationsRegistry:
             "branch_drift": OperationSpec("branch_drift", "Branch-Abstand und überlappende Dateien eines Experiments zu aktuellem main.", [experiment_id], ["experiment", "branch", "drift", "conflict", "overlap"], mutates_state=False),
             "experiment_reflection": OperationSpec("experiment_reflection", "Gespeicherte Reflexion (Verbesserungsvorschläge) zu einem Experiment.", [experiment_id], ["experiment", "reflection", "suggestions", "lessons", "ideas"], mutates_state=False),
             "reflections_list": OperationSpec("reflections_list", "Neueste gespeicherte Experiment-Reflexionen mit ihren Vorschlägen.", [limit10], ["reflection", "suggestions", "lessons", "ideas", "history"], mutates_state=False),
+            "lessons_list": OperationSpec("lessons_list", "Gespeicherte Lessons aus fehlgeschlagen-then-fix Experimenten (#715): Regel, Ursache, Dateien, Evidence-IDs und Nutzung.", [limit10], ["lessons", "experiment", "history", "rules", "failures"], mutates_state=False),
             "local_replays_list": OperationSpec("local_replays_list", "Lokale Shadow-Replays gemergter Experimente mit lokaler Test-Passrate je Prompt-Variante.", [limit10], ["local", "replay", "benchmark", "pass rate", "variant", "local model"], mutates_state=False),
             "known_drift_tests_list": OperationSpec("known_drift_tests_list", "Tests auf main, die unter der Uhr-Drift des Timing-Checks auch auf dem Basis-Commit fehlschlagen (#725), mit Zähler und Issue.", [limit10], ["timing", "drift", "clock", "known drift", "flaky", "test"], mutates_state=False),
             "reverifications_list": OperationSpec("reverifications_list", "Neueste kostenlose Re-Verifikationen geparkter Experimente.", [limit10], ["experiment", "reverification", "parked", "timing", "ready"], mutates_state=False),
@@ -718,6 +719,38 @@ class OperationsRegistry:
         for stored in list_reflections(limit, db_path=self.db_path):
             lines.extend(self._reflection_lines(stored))
         return OperationResult("reflections_list", True, lines or ["(no reflections stored)"], 0)
+
+    def _op_lessons_list(self, args: dict[str, Any]) -> OperationResult:
+        from modules.experiment_lessons import failure_recurrence_stats, list_lessons
+
+        limit = self._limit(args, default=10, maximum=100)
+        lines: list[str] = []
+        for lesson in list_lessons(limit, db_path=self.db_path):
+            lines.append(redact(
+                f"lesson {lesson['id'][:12]} ({lesson['created_at']}, status={lesson['status']}, "
+                f"kind={lesson.get('failure_kind') or '?'}, injected={lesson['injected_count']}, "
+                f"ineffective={lesson['ineffective_count']})"
+            )[:500])
+            lines.append(redact(f"  cause: {lesson['cause']}")[:500])
+            lines.append(redact(f"  rule: {lesson['rule']}")[:500])
+            if lesson.get("files"):
+                lines.append(redact(f"  files: {', '.join(lesson['files'][:8])}")[:300])
+            if lesson.get("keywords"):
+                lines.append(redact(f"  keywords: {', '.join(lesson['keywords'][:12])}")[:300])
+            lines.append(
+                f"  evidence: {lesson['failure_experiment_id'][:12]} -> "
+                f"{lesson['success_experiment_id'][:12]}"
+            )
+        try:
+            stats = failure_recurrence_stats(self.db_path, window=20)
+            lines.append(
+                f"recurrence (last {stats['window']} experiments): "
+                f"{stats['repeated']}/{stats['failure_events']} failure events repeated "
+                "an earlier reason on the same source"
+            )
+        except Exception:  # noqa: BLE001 - the measure is informational
+            pass
+        return OperationResult("lessons_list", True, lines or ["(no lessons stored)"], 0)
 
     def _op_known_drift_tests_list(self, args: dict[str, Any]) -> OperationResult:
         from modules.known_drift_tests import list_known_drift

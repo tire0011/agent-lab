@@ -369,6 +369,34 @@ class ReflectionsResponse(BaseModel):
     reflections: list[ExperimentReflection]
 
 
+class ExperimentLesson(BaseModel):
+    """One lesson learned from a failed-then-fixed experiment pair (#715)."""
+
+    id: str
+    created_at: str
+    status: str
+    failure_kind: str | None = None
+    cause: str
+    rule: str
+    phrased: bool = False
+    model: str | None = None
+    files: list[str] = Field(default_factory=list)
+    keywords: list[str] = Field(default_factory=list)
+    failure_experiment_id: str
+    success_experiment_id: str
+    source_type: str | None = None
+    source_id: str | None = None
+    injected_count: int = 0
+    ineffective_count: int = 0
+    last_injected_at: str | None = None
+    demoted_at: str | None = None
+
+
+class LessonsResponse(BaseModel):
+    count: int
+    lessons: list[ExperimentLesson]
+
+
 class LocalReplay(BaseModel):
     """One local shadow replay of a merged paid experiment (#637)."""
 

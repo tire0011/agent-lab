@@ -662,7 +662,12 @@ class VerificationMixin:
             path for path in dict.fromkeys([*test_files, *changed])
             if not _is_generated_path(path) and (Path(worktree_path) / path).is_file()
         )[:_TIMING_REPAIR_MAX_LIKELY_FILES]
-        task = self._timing_repair_task(flagged, drift_tails, drift_ms, changed, likely)
+        # #715: the timing-repair coding call gets the same matching lessons
+        # section as the implementation call (the flagged tests and the changed
+        # files are its target files).
+        task, timing_lesson_ids = self._timing_repair_prompt(
+            self.get_experiment(experiment_id), flagged, drift_tails, drift_ms, changed, likely
+        )
         elog.info(
             TIMING_LOCAL_REPAIR_PHASE, "timing_check_local_repair_started",
             "Asking the local coding worker to make drift-only tests clock-independent",
@@ -692,6 +697,8 @@ class VerificationMixin:
                     f"Previous patch (discarded):\n{previous_patch[:_TIMING_REPAIR_FEEDBACK_CHARS]}"
                     if failure else ""
                 )
+                # #715: tracked only when the prompt is actually sent to the worker.
+                self._mark_lessons_sent(experiment_id, timing_lesson_ids)
                 result = worker.run(
                     task=task + feedback, working_dir=worktree_path, sandbox="workspace-write",
                     timeout_seconds=remaining, experiment_logger=elog,
@@ -811,6 +818,21 @@ class VerificationMixin:
             "pytest loads it): a repair that touches them is rejected.",
             hint_line(list(likely)),
         ]).rstrip()
+
+
+    def _timing_repair_prompt(
+        self, experiment: Any, flagged: list[str], tails: dict[str, str], drift_ms: str,
+        changed: list[str], likely: tuple[str, ...],
+    ) -> tuple[str, list[str]]:
+        """The timing-repair task plus the matching lessons section (#715).
+
+        Returns ``(task, sent_lesson_ids)``; the ids are tracked by the caller
+        right before the worker is dispatched.
+        """
+        task = self._timing_repair_task(flagged, tails, drift_ms, changed, likely)
+        return self._with_lessons_section(
+            task, experiment, extra_files=likely, extra_text=" ".join(flagged)
+        )
 
 
     @staticmethod
