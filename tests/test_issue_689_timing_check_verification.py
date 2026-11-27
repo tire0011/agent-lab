@@ -72,6 +72,10 @@ class TimingCheckVerificationTests(unittest.TestCase):
         )
         quality.start()
         self.addCleanup(quality.stop)
+        # The local repair (#711) is tested in its own file.
+        repair = patch.dict("os.environ", {"NEXUS_TIMING_LOCAL_REPAIR": "0"})
+        repair.start()
+        self.addCleanup(repair.stop)
 
     def tearDown(self) -> None:
         self.service.close()

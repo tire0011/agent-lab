@@ -93,6 +93,7 @@ class RecordsMixin:
         rng: Any | None = None,
         base_ref: str = "HEAD",
         test_command: list[str] | None = None,
+        timing_repair_worker_factory: Callable[[str], Any] | None = None,
     ) -> None:
         """
         Parameters
@@ -125,6 +126,10 @@ class RecordsMixin:
             Verification argv template replacing the built-in suite; ``{python}`` becomes
             ``test_python_executable``. Trusted callers only - never build it from plan or
             model output.
+        timing_repair_worker_factory:
+            ``(worktree_path) -> worker`` for the local timing-check repair (#711); defaults
+            to a local-only :class:`LocalCodingWorker` that never calls a paid or free-tier
+            model.
         """
         self.selection_worker = (
             selection_worker
@@ -137,6 +142,7 @@ class RecordsMixin:
         self.local_worker_factory = local_worker_factory or (
             lambda _working_dir: build_worker("local", db_path=db_path)
         )
+        self.timing_repair_worker_factory = timing_repair_worker_factory
         self.plan_worker_factory = plan_worker_factory or random_worker_factory(db_path=db_path, rng=rng)
         self.db_path = db_path
         self.repo_root = repo_root

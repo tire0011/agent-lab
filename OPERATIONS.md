@@ -197,7 +197,21 @@ run continues for as long as tests keep starting and finishing.
   `test_x`). `timing_check_flagged` has the drift run's text for the drift-only
   tests; `timing_check_failed_closed` has the control run's text for tests
   that fail without drift too, else the drift run's (#737).
-  The test suite itself runs with `NEXUS_TIMING_CHECK=0` (set in
+- `NEXUS_TIMING_LOCAL_REPAIR` (default on; `0`/`false`/`off`/`no` turn it
+  off) - local repair of drift-only timing failures (#711). When the check
+  flags only drift-only regressions (no host failures, no known base drift),
+  the local coding worker (no paid or free-tier model) gets the flagged ids,
+  their failure tails, the drift value and the change's files, for at most 2
+  rounds. A candidate passes when the flagged ids pass under the same drift
+  environment and the affected test files pass without drift (tests that
+  already failed on this host without drift may fail again). A passing
+  repair is committed onto the experiment branch as `timing-check local
+  repair` (only its delta; other uncommitted work stays uncommitted) and
+  verification continues; otherwise the worktree is put back exactly and the
+  old `failed` verdict stands. Events: `timing_check_local_repair_started`,
+  `_passed`, `_failed` with `rounds`, `tokens`, `seconds`.
+  The test suite itself runs with `NEXUS_TIMING_CHECK=0` and
+  `NEXUS_TIMING_LOCAL_REPAIR=0` (set in
   `tests/conftest.py`); tests of the check opt in. To replay merged commits,
   run `python scripts/timing_check_replay.py <sha> ... | --last N [--ref main]`
   (`--drift-ms`, `--timeout` per commit, default 900 s; `--last` walks HEAD
