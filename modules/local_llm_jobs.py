@@ -19,6 +19,7 @@ from modules import heartbeat
 from modules.llama_cpp_client import LlamaCppClient
 from modules.redaction import redact
 from modules.run_store import DEFAULT_DB_PATH
+from modules.run_store.schema import _apply_durability
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -287,6 +288,7 @@ class LocalLlmJobService:
         self._conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        _apply_durability(self._conn)
         self._conn.execute(
             """
             CREATE TABLE IF NOT EXISTS local_llm_jobs (
@@ -857,7 +859,9 @@ class LocalLlmJobService:
             lease.stop()
             duration = time.perf_counter() - started
             error_kind = classify_job_error(exc)
-            diagnostics = llama_server_failure_diagnostics()
+            diagnostics = {}
+            if os.environ.get("NEXUS_LLAMA_SERVER_DIAGNOSTICS") != "0":
+                diagnostics = llama_server_failure_diagnostics()
             _LOGGER.error(
                 "local_llm job failed job_id=%s role=%s session_id=%s provider=local model=%s "
                 "duration=%.3fs max_tokens=%s prompt_chars=%s error_kind=%s exc_type=%s "

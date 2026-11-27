@@ -33,7 +33,7 @@ from modules.test_progress import (
     parse_total_tests,
 )
 from modules.test_run_log import VerificationTestLog, prune_test_logs
-from modules.verification_env import build_verification_test_env
+from modules.verification_env import verification_test_env
 
 logger = logging.getLogger("nexus.verification_runner")
 
@@ -215,7 +215,7 @@ def run_verification_test_monitored(
     prune_logs: bool = True,
     on_process: Callable[[subprocess.Popen | None], None] | None = None,
     tests_only_progress: bool = False,
-    test_env: Mapping[str, str] | None = None,
+    clock_drift: str | None = None,
 ) -> VerificationRunResult:
     """Run the verification tests under a progress-aware watchdog.
 
@@ -223,6 +223,28 @@ def run_verification_test_monitored(
     so the caller can log a summary that keeps the global Nexus heartbeat
     alive. A failing callback is logged and never propagates.
     """
+    with verification_test_env(clock_drift=clock_drift) as env:
+        return _run_monitored(
+            command, cwd=cwd, run_id=run_id, config=config, expected_total=expected_total,
+            on_heartbeat=on_heartbeat, test_log_dir=test_log_dir, prune_logs=prune_logs,
+            on_process=on_process, tests_only_progress=tests_only_progress, env=env,
+        )
+
+
+def _run_monitored(
+    command: Sequence[str],
+    *,
+    cwd: str,
+    run_id: str,
+    config: WatchdogConfig | None,
+    expected_total: int | None,
+    on_heartbeat: Callable[[dict[str, Any]], None] | None,
+    test_log_dir: str | Path | None,
+    prune_logs: bool,
+    on_process: Callable[[subprocess.Popen | None], None] | None,
+    tests_only_progress: bool,
+    env: dict[str, str],
+) -> VerificationRunResult:
     config = config or WatchdogConfig.resolve()
     started = time.perf_counter()
     test_log = VerificationTestLog(run_id, log_dir=test_log_dir)
@@ -235,11 +257,6 @@ def run_verification_test_monitored(
     observed_test_ids: set[str] = set()
     stdout_chunks: list[str] = []
 
-    env = build_verification_test_env() if test_env is None else dict(test_env)
-    # Without this the child's stderr can sit in a block buffer when it is a
-    # pipe, and "no progress" would then mean "no flush" - the watchdog would
-    # abort healthy runs.
-    env["PYTHONUNBUFFERED"] = "1"
     _enable_slow_test_stacks(env, test_log.path)
 
     test_log.log_run_event(

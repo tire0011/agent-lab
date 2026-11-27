@@ -4,6 +4,7 @@ import unittest
 import importlib
 import os
 from pathlib import Path
+from unittest import mock
 
 import modules.run_store as run_store
 
@@ -207,6 +208,15 @@ class RunStoreTests(unittest.TestCase):
                 importlib.reload(run_store)
             self.assertTrue(custom_db.exists())
 
+    @mock.patch.dict(os.environ, {"NEXUS_DB_MIGRATE_LEGACY": "0"})
+    def test_isolated_db_does_not_probe_the_legacy_path(self):
+        from modules.run_store import schema
+
+        with mock.patch.object(schema, "LEGACY_DB_PATH", ""), \
+                mock.patch.object(schema.Path, "exists", side_effect=AssertionError):
+            schema._migrate_legacy_db_if_needed(Path(schema.DEFAULT_DB_PATH))
+
+    @mock.patch.dict(os.environ, {"NEXUS_DB_MIGRATE_LEGACY": "1"})
     def test_legacy_db_is_migrated_to_external_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             legacy_db = Path(tmp) / "legacy.db"
