@@ -597,7 +597,11 @@ class MergedTestRun:
 def _test_env(tmp: str) -> dict[str, str]:
     from modules.verification_env import build_verification_test_env
 
-    return build_verification_test_env(run_tmp=Path(tmp))
+    env = build_verification_test_env()
+    # The tests must never write the production database.
+    env["AGENT_DB_PATH"] = str(Path(tmp) / "agent.db")
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    return env
 
 
 def _run_bounded(cmd: list[str], cwd: str, env: dict[str, str], timeout: float) -> tuple[int | None, str]:

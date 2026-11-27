@@ -15,7 +15,7 @@ from modules.verification_env import (
     LOCAL_MODEL_URL_ENVS,
     UNREACHABLE_LOCAL_MODEL_URL,
     VERIFICATION_TEST_API_KEY,
-    verification_test_env,
+    build_verification_test_env,
 )
 
 # Representative secret-shaped environment variables that must never reach
@@ -36,37 +36,29 @@ _REPRESENTATIVE_SECRETS = {
 }
 
 
-class VerificationEnvTestCase(unittest.TestCase):
-    def build_env(self, source=None):
-        env_context = verification_test_env(source)
-        env = env_context.__enter__()
-        self.addCleanup(env_context.__exit__, None, None, None)
-        return env
-
-
-class VerificationTestApiKeyTests(VerificationEnvTestCase):
+class VerificationTestApiKeyTests(unittest.TestCase):
     def test_agent_api_key_forced_to_test_key_regardless_of_parent(self):
         """Regression test: even with a fake *production* AGENT_API_KEY set
         in the parent process environment, the built verification test
         environment must always contain the fixed test key."""
         parent_env = {"AGENT_API_KEY": "fake-production-secret-key-12345", "PATH": "/usr/bin"}
-        built = self.build_env(parent_env)
+        built = build_verification_test_env(parent_env)
         self.assertEqual(built["AGENT_API_KEY"], "test-key")
         self.assertEqual(built["AGENT_API_KEY"], VERIFICATION_TEST_API_KEY)
         self.assertNotIn("fake-production-secret-key-12345", built.values())
 
     def test_agent_api_key_set_even_when_parent_lacks_it(self):
-        built = self.build_env({"PATH": "/usr/bin"})
+        built = build_verification_test_env({"PATH": "/usr/bin"})
         self.assertEqual(built["AGENT_API_KEY"], "test-key")
 
     def test_default_base_env_is_real_os_environ(self):
         # Calling with no argument must not raise and must still force the
         # test key (uses the real process environment as the source).
-        built = self.build_env()
+        built = build_verification_test_env()
         self.assertEqual(built["AGENT_API_KEY"], "test-key")
 
 
-class VerificationEnvSecretExclusionTests(VerificationEnvTestCase):
+class VerificationEnvSecretExclusionTests(unittest.TestCase):
     def test_representative_secrets_are_absent(self):
         """None of these secret-shaped variables, even if present in the
         parent process, may appear in the built verification environment
@@ -75,7 +67,7 @@ class VerificationEnvSecretExclusionTests(VerificationEnvTestCase):
         parent_env = dict(_REPRESENTATIVE_SECRETS)
         parent_env["PATH"] = "/usr/bin"
         parent_env["HOME"] = "/home/nexus"
-        built = self.build_env(parent_env)
+        built = build_verification_test_env(parent_env)
 
         for key, secret_value in _REPRESENTATIVE_SECRETS.items():
             if key == "AGENT_API_KEY":
@@ -91,28 +83,30 @@ class VerificationEnvSecretExclusionTests(VerificationEnvTestCase):
                 )
             self.assertNotIn(secret_value, built.values())
 
-    def test_service_settings_and_startup_overrides_are_excluded(self):
-        overrides = {
-            "HTTPS_PROXY": "http://proxy.test",
-            "PYTHONPATH": "/service/modules",
-            "PYTEST_ADDOPTS": "--lf",
-            "NEXUS_REVERIFY_PARKED": "1",
-            "NEXUS_TEST_CLOCK_DRIFT_MS": "5000",
-            "GIT_CONFIG_GLOBAL": "/service/gitconfig",
-            "XDG_CONFIG_HOME": "/service/config",
-            "RANDOM_UNKNOWN_VAR": "whatever",
-        }
-        built = self.build_env({**overrides, "PATH": "/usr/bin", "HOME": "/service"})
-        self.assertFalse(overrides.keys() & built.keys())
+    def test_ordinary_parent_variables_pass_without_positive_allowlist(self):
+        parent_env = dict(_REPRESENTATIVE_SECRETS)
+        parent_env.update({"PATH": "/usr/bin", "HOME": "/home/nexus", "RANDOM_UNKNOWN_VAR": "whatever"})
+        built = build_verification_test_env(parent_env)
+        self.assertEqual(built["RANDOM_UNKNOWN_VAR"], "whatever")
         self.assertEqual(built["PATH"], "/usr/bin")
-        self.assertEqual(Path(built["HOME"]).parent, Path(built["TMPDIR"]))
-        for name in ("AGENT_LOG_DIR", "AGENT_MAILBOX_REPO_PATH", "AGENT_CODE_REPO_PATH",
-                     "AGENT_CODEX_BIN", "AGENT_CLAUDE_BIN", "AGENT_VIBE_BIN",
-                     "LOCAL_MODEL_RATES_PATH"):
-            self.assertEqual(Path(built[name]).parent, Path(built["TMPDIR"]))
+        self.assertEqual(built["HOME"], "/home/nexus")
+        self.assertEqual(built["AGENT_API_KEY"], "test-key")
+
+    def test_empty_parent_env_yields_only_test_isolation_values(self):
+        built = build_verification_test_env({})
+        self.assertEqual(built.pop("NEXUS_HEALTH_CHECK"), "0")
+        self.assertEqual(built.pop("NEXUS_CLI_UPDATE"), "0")
+        self.assertEqual(built.pop("NEXUS_WEEKLY_REVIEW"), "0")
+        self.assertEqual(built.pop("NEXUS_LOG_RETENTION"), "0")
+        run_tmp = {built.pop(name) for name in ("TMPDIR", "TEMP", "TMP")}
+        self.assertEqual(len(run_tmp), 1)  # one own temp dir per run
+        self.assertEqual(built, {
+            "AGENT_API_KEY": "test-key",
+            **{name: UNREACHABLE_LOCAL_MODEL_URL for name in LOCAL_MODEL_URL_ENVS},
+        })
 
 
-class VerificationEnvDatabaseIsolationTests(VerificationEnvTestCase):
+class VerificationEnvDatabaseIsolationTests(unittest.TestCase):
     def test_production_db_path_is_replaced_with_a_temporary_one(self):
         # #766: the tick exports AGENT_DB_PATH pointing at the production
         # database. The verification suite also runs via unittest discovery,
@@ -121,28 +115,24 @@ class VerificationEnvDatabaseIsolationTests(VerificationEnvTestCase):
         # a default-path service opens and locks the production DB while the
         # API service writes it, and the suite hangs inside the tick.
         parent_env = {"PATH": "/usr/bin", "AGENT_DB_PATH": "/var/lib/nexus/agent.db"}
-        built = self.build_env(parent_env)
+        built = build_verification_test_env(parent_env)
         self.assertIn("AGENT_DB_PATH", built)
         self.assertNotEqual(built["AGENT_DB_PATH"], "/var/lib/nexus/agent.db")
         self.assertNotIn("/var/lib/nexus/agent.db", built.values())
         self.assertTrue(built["AGENT_DB_PATH"].endswith("agent.db"))
 
-    def test_db_is_private_even_without_a_parent_setting(self):
-        first = self.build_env({})
-        second = self.build_env({})
-        self.assertEqual(Path(first["AGENT_DB_PATH"]).parent, Path(first["TMPDIR"]))
-        self.assertNotEqual(first["AGENT_DB_PATH"], second["AGENT_DB_PATH"])
-        self.assertEqual(first["NEXUS_DB_DURABILITY"], "relaxed")
-        self.assertEqual(first["NEXUS_DB_MIGRATE_LEGACY"], "0")
+    def test_db_path_absent_in_parent_stays_absent(self):
+        built = build_verification_test_env({"PATH": "/usr/bin"})
+        self.assertNotIn("AGENT_DB_PATH", built)
 
     def test_default_base_env_keeps_no_production_db_path(self):
         # Whatever the real process environment holds, the built environment
         # must never carry the production database path through.
-        built = self.build_env()
+        built = build_verification_test_env()
         self.assertNotEqual(built.get("AGENT_DB_PATH"), "/var/lib/nexus/agent.db")
 
 
-class VerificationEnvLocalModelIsolationTests(VerificationEnvTestCase):
+class VerificationEnvLocalModelIsolationTests(unittest.TestCase):
     def test_real_local_model_urls_are_replaced(self):
         # #766: under unittest discovery conftest.py does not redirect the
         # local model, so a test's background failure analysis reached the
@@ -152,14 +142,14 @@ class VerificationEnvLocalModelIsolationTests(VerificationEnvTestCase):
             "LLAMA_CPP_BASE_URL": "http://127.0.0.1:8080/v1",
             "LLAMA_API_URL": "http://127.0.0.1:8080",
         }
-        built = self.build_env(parent_env)
+        built = build_verification_test_env(parent_env)
         for name in LOCAL_MODEL_URL_ENVS:
             self.assertEqual(built[name], UNREACHABLE_LOCAL_MODEL_URL)
 
     def test_unset_urls_are_still_assigned(self):
         # The client falls back to 127.0.0.1:8080 when nothing is set, so an
         # absent variable is no isolation.
-        built = self.build_env({"PATH": "/usr/bin"})
+        built = build_verification_test_env({"PATH": "/usr/bin"})
         self.assertEqual(built["LOCAL_MODEL_URL"], UNREACHABLE_LOCAL_MODEL_URL)
 
     def test_unittest_child_with_this_env_never_reaches_a_model_server(self):
@@ -169,7 +159,7 @@ class VerificationEnvLocalModelIsolationTests(VerificationEnvTestCase):
         import sys
         import time
 
-        env = self.build_env()
+        env = build_verification_test_env()
         env["PYTHONPATH"] = str(Path(__file__).resolve().parent.parent)
         started = time.monotonic()
         result = subprocess.run(
@@ -190,14 +180,36 @@ class VerificationEnvLocalModelIsolationTests(VerificationEnvTestCase):
         self.assertLess(time.monotonic() - started, 30)
 
 
-class VerificationEnvSafeRuntimeTests(VerificationEnvTestCase):
+class VerificationEnvSafeRuntimeTests(unittest.TestCase):
     def test_safe_runtime_variables_pass_through_when_present(self):
-        runtime = {"PATH": "/usr/bin:/bin", "LANG": "en_US.UTF-8"}
-        built = self.build_env(runtime)
-        self.assertEqual({name: built[name] for name in runtime}, runtime)
+        parent_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/home/nexus",
+            "LANG": "en_US.UTF-8",
+            "USER": "nexus",
+        }
+        built = build_verification_test_env(parent_env)
+        self.assertEqual(built["PATH"], "/usr/bin:/bin")
+        self.assertEqual(built["HOME"], "/home/nexus")
+        self.assertEqual(built["LANG"], "en_US.UTF-8")
+        self.assertEqual(built["USER"], "nexus")
 
-    def test_missing_runtime_variables_are_omitted(self):
-        self.assertNotIn("PATH", self.build_env({}))
+    def test_missing_safe_runtime_variables_are_simply_omitted(self):
+        # Building must not raise or synthesize values for allowlisted
+        # variables that simply are not set in the parent environment.
+        built = build_verification_test_env({"HOME": "/home/nexus"})
+        self.assertIn("HOME", built)
+        self.assertNotIn("PATH", built)
+
+    def test_unrelated_parent_variables_pass_through(self):
+        parent_env = {f"UNRELATED_VAR_{i}": str(i) for i in range(50)}
+        parent_env["PATH"] = "/usr/bin"
+        built = build_verification_test_env(parent_env)
+        self.assertEqual(built["UNRELATED_VAR_49"], "49")
+        self.assertEqual(built["PATH"], "/usr/bin")
+        self.assertEqual(built["AGENT_API_KEY"], "test-key")
+
+
 
 
 if __name__ == "__main__":

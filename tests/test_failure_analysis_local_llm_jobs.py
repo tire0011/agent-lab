@@ -298,8 +298,8 @@ class UnhealthyJobDegradesOnceTests(_FailureAnalysisJobTestCase):
 
     def test_cancelled_job_yields_one_unavailable_record(self) -> None:
         client = _BlockingClient(_diagnosis_json())
-        jobs = self._jobs(client)
         self.addCleanup(client.release.set)
+        jobs = self._jobs(client)
         original_submit = jobs.submit
 
         def _submit_then_cancel(prompt, **kwargs):
@@ -328,8 +328,8 @@ class UnhealthyJobDegradesOnceTests(_FailureAnalysisJobTestCase):
 
     def test_stuck_job_yields_one_unavailable_record(self) -> None:
         client = _BlockingClient(_diagnosis_json())
-        jobs = self._jobs(client)
         self.addCleanup(client.release.set)
+        jobs = self._jobs(client)
         # Any job still running is past its liveness window: the worker, not
         # the model, is what the sweep is looking for.
         jobs._stuck_after_seconds = 0.0
