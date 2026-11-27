@@ -22,6 +22,7 @@ from modules.home_gpu.collect import (
     MAX_ANSWER_BYTES,
     SEEN_FILES_SETTING,
     _ensure_schema,
+    _reconcile_orphan,
     collect_replies,
 )
 from modules.mailbox.config import MailboxConfig
@@ -235,6 +236,262 @@ def test_failed_answer_write_leaves_row_queued_for_retry(mailbox, db, state_dir,
 
     assert collect_replies(mailbox, db, state_dir) == 1
     assert _job_row(db)[0] == "answered"
+
+
+# --- failure paths and transaction boundaries (review fixes for #813) --------
+
+
+def test_db_failure_after_answer_write_removes_orphan_and_retry_succeeds(
+    mailbox, db, state_dir, monkeypatch
+):
+    import modules.home_gpu.collect as collect_module
+
+    _queue_job(db)
+    answer = "The home GPU says hi."
+    (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID, answer), encoding="utf-8")
+    answer_path = state_dir / "home_gpu" / f"{JOB_ID}.txt"
+
+    real_save_seen = collect_module._save_seen
+
+    def boom(*args, **kwargs):
+        # The row UPDATE succeeded and the answer file is already on disk;
+        # only the commit-time write fails.
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(collect_module, "_save_seen", boom)
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        collect_replies(mailbox, db, state_dir)
+
+    # The transaction rolled back and the orphaned answer file was removed:
+    # no file is left on disk that no row represents.
+    row = _job_row(db)
+    assert row[0] == "queued"
+    assert row[7] is None
+    assert not answer_path.exists()
+    assert _seen(db) == []
+
+    monkeypatch.setattr(collect_module, "_save_seen", real_save_seen)
+    assert collect_replies(mailbox, db, state_dir) == 1
+    assert _job_row(db)[0] == "answered"
+    assert answer_path.read_text(encoding="utf-8") == answer
+
+
+def test_crash_between_write_and_commit_is_safely_replaced_on_retry(
+    mailbox, db, state_dir
+):
+    _queue_job(db)
+    answer = "Fresh answer after the crash."
+    (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID, answer), encoding="utf-8")
+    # Simulate a crash after the answer file landed but before the row update
+    # committed: an orphan sits at the target path while the row is queued.
+    orphan = state_dir / "home_gpu" / f"{JOB_ID}.txt"
+    orphan.parent.mkdir(parents=True)
+    orphan.write_text("stale bytes from the interrupted attempt", encoding="utf-8")
+
+    assert collect_replies(mailbox, db, state_dir) == 1
+    assert _job_row(db)[0] == "answered"
+    # The orphan was safely replaced by the atomic tmp-plus-rename write.
+    assert orphan.read_text(encoding="utf-8") == answer
+    assert not list(orphan.parent.glob("*.tmp-*"))
+
+
+def test_answer_write_leaves_no_tmp_files(mailbox, db, state_dir):
+    _queue_job(db)
+    (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+
+    assert collect_replies(mailbox, db, state_dir) == 1
+    assert sorted(p.name for p in (state_dir / "home_gpu").iterdir()) == [
+        f"{JOB_ID}.txt"
+    ]
+
+
+def test_reconcile_orphan_removes_only_unrepresented_own_file(db, state_dir):
+    _queue_job(db)
+    answer_path = state_dir / "home_gpu" / f"{JOB_ID}.txt"
+    answer_path.parent.mkdir(parents=True)
+    digest = hashlib.sha256(b"mine").hexdigest()
+
+    # Row still queued and the file is ours -> orphan, removed.
+    answer_path.write_bytes(b"mine")
+    _reconcile_orphan(db, answer_path, digest, JOB_ID)
+    assert not answer_path.exists()
+
+    # File content is not ours (a concurrent winner wrote something else) -> kept.
+    answer_path.write_bytes(b"theirs")
+    _reconcile_orphan(db, answer_path, digest, JOB_ID)
+    assert answer_path.read_bytes() == b"theirs"
+
+    # Row answered with this exact path -> the file is represented, kept.
+    db.execute(
+        "UPDATE home_gpu_jobs SET status = 'answered', answer_path = ? WHERE job_id = ?",
+        (str(answer_path), JOB_ID),
+    )
+    db.commit()
+    _reconcile_orphan(db, answer_path, digest, JOB_ID)
+    assert answer_path.read_bytes() == b"theirs"
+
+    # A missing file is a no-op.
+    answer_path.unlink()
+    _reconcile_orphan(db, answer_path, digest, JOB_ID)
+    assert not answer_path.exists()
+
+
+def test_row_answered_between_check_and_update_is_ignored_once(
+    mailbox, tmp_path, state_dir, monkeypatch, caplog
+):
+    import modules.mailbox.core as mailbox_core
+
+    db_path = tmp_path / "race.db"
+    db = init_db(str(db_path))
+    try:
+        _queue_job(db)
+        (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+        answer_path = state_dir / "home_gpu" / f"{JOB_ID}.txt"
+        real_write = mailbox_core._atomic_write
+
+        def write_then_lose_the_race(path, content):
+            real_write(path, content)
+            # A concurrent collector answers the row after our status check
+            # but before our guarded UPDATE claims it.
+            other = sqlite3.connect(str(db_path))
+            other.execute(
+                "UPDATE home_gpu_jobs SET status = 'answered', answer_sha256 = ?, "
+                "answer_path = ? WHERE job_id = ? AND status = 'queued'",
+                ("f" * 64, str(answer_path), JOB_ID),
+            )
+            other.commit()
+            other.close()
+
+        monkeypatch.setattr(mailbox_core, "_atomic_write", write_then_lose_the_race)
+        caplog.set_level(logging.WARNING)
+
+        assert collect_replies(mailbox, db, state_dir) == 0
+        assert caplog.text.count("job already answered") == 1
+        row = _job_row(db)
+        assert row[0] == "answered"
+        assert row[6] == "f" * 64  # the winner's values, not ours
+        assert answer_path.exists()  # the winner's file is kept, not deleted
+        assert _seen(db) == ["reply-1.md"]
+
+        caplog.clear()
+        assert collect_replies(mailbox, db, state_dir) == 0
+        assert "job already answered" not in caplog.text
+    finally:
+        db.close()
+
+
+def test_collect_replies_preserves_caller_open_transaction(tmp_path, mailbox, state_dir):
+    db_path = tmp_path / "tx.db"
+    db = init_db(str(db_path))
+    try:
+        _queue_job(db)  # commits schema + job row
+        (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+        # The caller has an open, uncommitted transaction on the same connection.
+        db.execute(
+            "INSERT INTO service_settings (key, value, updated_at) VALUES "
+            "('caller.marker', 'x', '2026-01-01T00:00:00Z')"
+        )
+        assert db.in_transaction
+
+        other = sqlite3.connect(str(db_path))
+        try:
+            assert collect_replies(mailbox, db, state_dir) == 1
+            # Our work is visible on this connection ...
+            assert _job_row(db)[0] == "answered"
+            assert _seen(db) == ["reply-1.md"]
+            # ... but nothing was committed: the caller's transaction is still
+            # open and a second connection sees neither our work nor the
+            # caller's pending insert.
+            assert db.in_transaction
+            assert (
+                other.execute(
+                    "SELECT status FROM home_gpu_jobs WHERE job_id = ?", (JOB_ID,)
+                ).fetchone()[0]
+                == "queued"
+            )
+            assert (
+                other.execute(
+                    "SELECT COUNT(*) FROM service_settings WHERE key = 'caller.marker'"
+                ).fetchone()[0]
+                == 0
+            )
+            assert (
+                other.execute(
+                    "SELECT COUNT(*) FROM service_settings WHERE key = ?",
+                    (SEEN_FILES_SETTING,),
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            other.close()
+        db.rollback()
+        # Our update rolled back together with the caller's transaction.
+        assert _job_row(db)[0] == "queued"
+    finally:
+        db.close()
+
+
+def test_ensure_schema_never_commits_a_pending_transaction(tmp_path):
+    db_path = tmp_path / "schema.db"
+    db = init_db(str(db_path))  # has service_settings, not home_gpu_jobs
+    try:
+        db.execute(
+            "INSERT INTO service_settings (key, value, updated_at) VALUES "
+            "('caller.marker', 'x', '2026-01-01T00:00:00Z')"
+        )
+        assert db.in_transaction
+        _ensure_schema(db)
+        # The schema was created (visible on this connection) ...
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'home_gpu_jobs'"
+            ).fetchone()[0]
+            == 1
+        )
+        # ... but the caller's transaction was NOT committed.
+        assert db.in_transaction
+        other = sqlite3.connect(str(db_path))
+        try:
+            assert (
+                other.execute(
+                    "SELECT COUNT(*) FROM service_settings WHERE key = 'caller.marker'"
+                ).fetchone()[0]
+                == 0
+            )
+            assert (
+                other.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'home_gpu_jobs'"
+                ).fetchone()[0]
+                == 0
+            )
+        finally:
+            other.close()
+        db.rollback()
+
+        # With no transaction open the DDL autocommits and persists on its own,
+        # and a repeated call is a read-only probe that starts no transaction.
+        assert not db.in_transaction
+        _ensure_schema(db)
+        _ensure_schema(db)
+        assert not db.in_transaction
+        assert (
+            db.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE name = 'home_gpu_jobs'"
+            ).fetchone()[0]
+            == 1
+        )
+        other2 = sqlite3.connect(str(db_path))
+        try:
+            assert (
+                other2.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = 'home_gpu_jobs'"
+                ).fetchone()[0]
+                == 1
+            )
+        finally:
+            other2.close()
+    finally:
+        db.close()
 
 
 # --- mailbox tick integration -------------------------------------------------

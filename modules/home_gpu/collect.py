@@ -22,8 +22,21 @@ answer hash, path and the reply's numbers in one transaction.
 Unknown job ids, a repeated reply for an already answered row and answers over
 256 KB are ignored; each such file is logged once, and the set of seen files is
 kept in the ``service_settings`` table so a later copy of the same file is
-skipped silently. Everything here is off unless the tick calls it, and the tick
-only calls it when ``NEXUS_HOME_GPU=1`` (``modules.home_gpu.jobs.home_gpu_enabled``).
+skipped silently.
+
+Failure handling across the file/transaction boundary: the answer file is
+written before the row update, so a crash or a failed transaction can leave a
+file on disk that no row represents. A retry safely *replaces* such an orphan
+(the write is an atomic tmp-file-plus-rename), and when a transaction fails
+after the file landed, ``_reconcile_orphan`` removes the orphan again - but
+only when the row does not reference the path and the file content is exactly
+the bytes this collector wrote, so a concurrent winner's answer is never
+deleted. All database work runs inside savepoints (``_tx``), and schema
+initialization never commits, so a caller's open transaction on the shared
+connection is preserved end to end.
+
+Everything here is off unless the tick calls it, and the tick only calls it
+when ``NEXUS_HOME_GPU=1`` (``modules.home_gpu.jobs.home_gpu_enabled``).
 """
 
 from __future__ import annotations
@@ -34,7 +47,9 @@ import logging
 import math
 import re
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from modules.mailbox import core as mailbox_core
 
@@ -56,36 +71,49 @@ _JOB_ID = re.compile(r"[A-Za-z0-9-]+\Z")
 
 # ``CREATE TABLE IF NOT EXISTS`` mirrors the #812 migration so this module also
 # works against a database whose schema predates it; the columns are identical.
-_ENSURE_SCHEMA = """
-CREATE TABLE IF NOT EXISTS service_settings (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+# The statements are kept as individual strings on purpose: ``executescript``
+# would COMMIT any pending transaction first, which would commit unrelated
+# caller work on the shared connection, so it is never used here.
+_SCHEMA_STATEMENTS = (
+    """
+    CREATE TABLE IF NOT EXISTS service_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS home_gpu_jobs (
+        job_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'queued',
+        submitted_at TEXT NOT NULL,
+        deadline TEXT NOT NULL,
+        answered_at TEXT NULL,
+        model TEXT NULL,
+        prompt_tokens INTEGER NULL,
+        completion_tokens INTEGER NULL,
+        seconds REAL NULL,
+        input_sha256 TEXT NOT NULL,
+        answer_sha256 TEXT NULL,
+        answer_path TEXT NULL,
+        host TEXT NULL
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_status ON home_gpu_jobs(status)",
+    """
+    CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_submitted_at
+        ON home_gpu_jobs(submitted_at DESC)
+    """,
+)
 
-CREATE TABLE IF NOT EXISTS home_gpu_jobs (
-    job_id TEXT PRIMARY KEY,
-    kind TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'queued',
-    submitted_at TEXT NOT NULL,
-    deadline TEXT NOT NULL,
-    answered_at TEXT NULL,
-    model TEXT NULL,
-    prompt_tokens INTEGER NULL,
-    completion_tokens INTEGER NULL,
-    seconds REAL NULL,
-    input_sha256 TEXT NOT NULL,
-    answer_sha256 TEXT NULL,
-    answer_path TEXT NULL,
-    host TEXT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_status
-    ON home_gpu_jobs(status);
-
-CREATE INDEX IF NOT EXISTS idx_home_gpu_jobs_submitted_at
-    ON home_gpu_jobs(submitted_at DESC);
-"""
+#: Every schema object this module needs; all four present means "skip DDL".
+_EXPECTED_SCHEMA_OBJECTS = (
+    "service_settings",
+    "home_gpu_jobs",
+    "idx_home_gpu_jobs_status",
+    "idx_home_gpu_jobs_submitted_at",
+)
 
 
 class _NotClaimed(Exception):
@@ -93,8 +121,44 @@ class _NotClaimed(Exception):
 
 
 def _ensure_schema(db: sqlite3.Connection) -> None:
-    db.executescript(_ENSURE_SCHEMA)
-    db.commit()
+    """Create the home-GPU tables only when they are missing.
+
+    The ``sqlite_master`` probe is a plain read: it neither starts nor commits
+    a transaction, so calling this on every collection is free and never
+    disturbs a pending transaction on the caller's connection. Only when an
+    object is missing are the ``CREATE IF NOT EXISTS`` statements executed, as
+    ordinary statements: with no transaction open they autocommit on their own,
+    with a caller's transaction open they join it and are left for the caller
+    to commit or roll back. This function never commits anything itself.
+    """
+    placeholders = ",".join("?" for _ in _EXPECTED_SCHEMA_OBJECTS)
+    found = db.execute(
+        f"SELECT COUNT(*) FROM sqlite_master WHERE name IN ({placeholders})",
+        _EXPECTED_SCHEMA_OBJECTS,
+    ).fetchone()[0]
+    if found == len(_EXPECTED_SCHEMA_OBJECTS):
+        return
+    for statement in _SCHEMA_STATEMENTS:
+        db.execute(statement)
+
+
+@contextmanager
+def _tx(db: sqlite3.Connection) -> Iterator[None]:
+    """One unit of database work that never commits a caller's transaction.
+
+    A SAVEPOINT is used instead of ``with db:``: with no transaction open the
+    RELEASE commits exactly this unit; with a caller's transaction already
+    open the savepoint nests inside it, so RELEASE / ROLLBACK TO touch only
+    this unit and the caller's transaction stays open and uncommitted.
+    """
+    db.execute("SAVEPOINT home_gpu_collect")
+    try:
+        yield
+    except BaseException:
+        db.execute("ROLLBACK TO home_gpu_collect")
+        db.execute("RELEASE home_gpu_collect")
+        raise
+    db.execute("RELEASE home_gpu_collect")
 
 
 def _load_seen(db: sqlite3.Connection) -> list[str]:
@@ -140,8 +204,47 @@ def _ignore(
     )
     seen.append(name)
     seen_set.add(name)
-    with db:
+    with _tx(db):
         _save_seen(db, seen)
+
+
+def _reconcile_orphan(
+    db: sqlite3.Connection, answer_path: Path, digest: str, job_id: str
+) -> None:
+    """Remove an answer file whose row update did not commit.
+
+    The answer file is written before the row is updated, so a failed or
+    interrupted transaction can leave a file on disk that no row represents.
+    The file is removed only when the row does *not* reference it (still
+    queued, missing, or answered with a different path) *and* the file's
+    content hashes to *digest* - i.e. it is exactly the bytes this collector
+    wrote. A concurrent winner's answer (row answered with this path, or a
+    file with different content) is never deleted. A retry after a plain
+    crash needs no cleanup here: the atomic tmp-plus-rename write safely
+    replaces the orphan on the next attempt.
+    """
+    try:
+        row = db.execute(
+            "SELECT status, answer_path FROM home_gpu_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None and row[0] == "answered" and row[1] == str(answer_path):
+        return
+    try:
+        data = answer_path.read_bytes()
+    except OSError:
+        return
+    if hashlib.sha256(data).hexdigest() != digest:
+        return
+    try:
+        answer_path.unlink()
+        logger.info("Removed orphaned answer file=%s job_id=%s", answer_path, job_id)
+    except OSError:
+        logger.warning(
+            "Could not remove orphaned answer file=%s job_id=%s", answer_path, job_id
+        )
 
 
 def _metrics(meta: dict[str, str]) -> tuple[int, int, float]:
@@ -172,6 +275,12 @@ def collect_replies(
     of newly answered jobs. Files already in the seen set (kept in the
     ``service_settings`` table) are skipped silently, which makes repeated runs
     over the same outbox idempotent.
+
+    ``db`` is never committed wholesale: each unit of work runs in a savepoint
+    and schema setup never commits, so a transaction the caller already has
+    open on the shared connection is preserved. If the row update fails after
+    the answer file was written, the orphaned file is removed again before the
+    error propagates; the next run retries the file from scratch.
     """
     _ensure_schema(db)
     outbox = Path(mailbox_dir) / "outbox"
@@ -233,14 +342,20 @@ def collect_replies(
 
         digest = hashlib.sha256(answer_bytes).hexdigest()
         answer_path = answers_dir / f"{job_id}.txt"
+        written = False
         try:
             # The answer file is written (atomically: temp file plus rename)
             # before the row is updated; both the UPDATE and the seen-mark
-            # commit in this one transaction, so a crash either leaves the row
+            # commit in this one savepoint, so a crash either leaves the row
             # queued for the next tick or fully answered with its file present.
-            with db:
+            # The savepoint (not ``with db:``) keeps a caller's open
+            # transaction on the shared connection uncommitted.
+            with _tx(db):
                 answers_dir.mkdir(parents=True, exist_ok=True)
+                # A leftover orphan from an interrupted earlier attempt is
+                # safely replaced here by the rename.
                 mailbox_core._atomic_write(answer_path, answer)
+                written = True
                 updated = db.execute(
                     """
                     UPDATE home_gpu_jobs
@@ -271,8 +386,19 @@ def collect_replies(
                 seen_set.add(path.name)
                 _save_seen(db, seen)
         except _NotClaimed:
+            if written:
+                _reconcile_orphan(db, answer_path, digest, job_id)
             _ignore(db, seen, seen_set, path.name, "job already answered", job_id)
             continue
+        except BaseException:
+            # The transaction rolled back. If the answer file already landed
+            # on disk it is now orphaned (no row represents it): remove it so
+            # a later, differently failing retry can never leave a file whose
+            # contents are not represented by the row. The file is not marked
+            # seen, so the next tick retries it.
+            if written:
+                _reconcile_orphan(db, answer_path, digest, job_id)
+            raise
         collected += 1
         logger.info(
             "Collected home-GPU reply file=%s job_id=%s model=%s bytes=%d",
