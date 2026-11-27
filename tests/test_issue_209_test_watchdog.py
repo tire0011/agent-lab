@@ -213,7 +213,7 @@ class TestRunLogTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="nexus-test-log-"))
 
-    def test_entries_and_heartbeat_are_durable(self):
+    def test_entries_and_heartbeat_are_readable_immediately(self):
         log = VerificationTestLog("run-1", log_dir=self.dir)
         log.log_test_start("tests.m.C.test_a", at="2026-01-01T00:00:00+00:00")
         log.log_test_end(
@@ -230,6 +230,17 @@ class TestRunLogTests(unittest.TestCase):
         heartbeat = _read_heartbeat(log)
         self.assertEqual(heartbeat["current_test"], "tests.m.C.test_b")
         self.assertEqual(heartbeat["run_id"], "run-1")
+
+    def test_test_events_are_synced_with_the_next_run_event(self):
+        log = VerificationTestLog("run-1", log_dir=self.dir)
+        with patch("modules.test_run_log.os.fsync") as sync:
+            log.log_test_start("tests.m.C.test_a")
+            log.log_test_end("tests.m.C.test_a", result=RESULT_PASSED,
+                             started_at=None, at=None, duration_ms=None)
+            sync.assert_not_called()
+            log.log_run_event("test_run_finished", "finished")
+            sync.assert_called_once()
+        self.assertEqual(len(_read_entries(log)), 3)
 
     def test_log_dir_is_a_subdirectory_of_the_experiment_log_dir(self):
         """Isolation is structural: the unified feed globs ``*.jsonl`` in the

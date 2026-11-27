@@ -65,7 +65,7 @@ def _utcnow_iso() -> str:
 
 
 class VerificationTestLog:
-    """Durable per-test log plus heartbeat file for one verification run."""
+    """Per-test log plus durable lifecycle events and heartbeat for one run."""
 
     def __init__(
         self,
@@ -168,8 +168,12 @@ class VerificationTestLog:
                         }, ensure_ascii=False) + "\n"
                 with self._path.open("a", encoding="utf-8") as handle:
                     handle.write(line)
-                    handle.flush()
-                    os.fsync(handle.fileno())
+                    # Closing the file makes test events visible to live readers.
+                    # Sync the log at lifecycle events to keep slow disks from
+                    # backpressuring the test process through its stderr pipe.
+                    if entry["kind"] == "run":
+                        handle.flush()
+                        os.fsync(handle.fileno())
         except OSError:
             # Instrumentation must never be the reason a test run fails.
             logger.exception("test_run_log: failed to append to %s", self._path)

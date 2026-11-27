@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from modules import verification_env
+from modules.verification_runner import WatchdogConfig, run_verification_test_monitored
 from modules.verification_env import build_verification_test_env, prune_test_tmp, verification_tmp_parent
 
 
@@ -32,6 +33,33 @@ class TestTmpTests(unittest.TestCase):
         out = subprocess.run([sys.executable, "-c", "import tempfile; print(tempfile.mkdtemp())"],
                              env=env, capture_output=True, text=True, check=True).stdout.strip()
         self.assertEqual(Path(out).parent, run_dir)
+
+    def test_monitored_run_cleans_up_after_exit_or_watchdog_abort(self):
+        for delay, exit_code in ((0, 0), (0, 1), (60, 0)):
+            with self.subTest(delay=delay, exit_code=exit_code):
+                result = run_verification_test_monitored(
+                    [sys.executable, "-c",
+                     f"import os, time; print(os.environ['TMPDIR']); time.sleep({delay}); "
+                     f"raise SystemExit({exit_code})"],
+                    cwd=str(Path.cwd()), run_id="tmp-cleanup",
+                    config=WatchdogConfig(0.4, 0.05, 10),
+                    test_log_dir=verification_tmp_parent() / "logs",
+                    tests_only_progress=True,
+                )
+                run_dir = Path(result.stdout.strip())
+                self.assertEqual(run_dir.parent, verification_tmp_parent())
+                self.assertFalse(run_dir.exists())
+                self.assertEqual(result.stalled, bool(delay))
+                self.assertEqual(result.exit_code, None if delay else exit_code)
+
+    def test_monitored_run_cleans_up_when_spawn_fails(self):
+        result = run_verification_test_monitored(
+            [str(verification_tmp_parent() / "missing-executable")],
+            cwd=str(Path.cwd()), run_id="tmp-spawn-failure",
+            test_log_dir=verification_tmp_parent() / "logs",
+        )
+        self.assertIsInstance(result.exception, FileNotFoundError)
+        self.assertEqual(list(verification_tmp_parent().glob("run-*")), [])
 
     def test_prune_removes_only_old_run_dirs(self):
         old = Path(build_verification_test_env({})["TMPDIR"])

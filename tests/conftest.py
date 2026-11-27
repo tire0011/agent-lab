@@ -123,6 +123,8 @@ os.environ["AGENT_API_KEY"] = "test-key"
 # lifespan test then marked the running experiment "interrupted by service
 # restart" (#309). Assigned, not setdefault: the production value is set there.
 os.environ["AGENT_DB_PATH"] = str(Path(_LOG_DIR) / "agent.db")
+os.environ["NEXUS_DB_MIGRATE_LEGACY"] = "0"
+os.environ["NEXUS_LLAMA_SERVER_DIAGNOSTICS"] = "0"
 
 # Test databases live in temporary directories and are deleted with them, so
 # there is nothing for an fsync to protect and the suite pays for it on every
