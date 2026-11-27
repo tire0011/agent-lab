@@ -413,9 +413,9 @@ def _migrate_known_drift_tests(conn: sqlite3.Connection) -> None:
 
 def _migrate_gate_self_repair(conn: sqlite3.Connection) -> None:
     """#730: durable pending gate-repair reports, retried on the next tick."""
-    from modules.gate_self_repair import REPORT_SCHEMA_SQL
+    from modules.gate_self_repair import ensure_report_schema
 
-    conn.executescript(REPORT_SCHEMA_SQL)
+    ensure_report_schema(conn)
 
 
 def _backfill_run_costs_once(conn: sqlite3.Connection) -> None:

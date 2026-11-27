@@ -378,6 +378,7 @@ class McpApiTests(unittest.TestCase):
                 "gate_self_repair": {
                     "disabled_gates": [],
                     "host_blocker": None,
+                    "last_rerun": None,
                     "pending_reports": 0,
                     "repair_issue_number": None,
                     "state": None,

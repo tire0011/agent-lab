@@ -66,25 +66,36 @@ _EMBEDDED_2026_11_14 = [
         ),
     ),
 ]
+# The stored rows that follow up to and including #696 (both succeeded).
+_EMBEDDED_2026_11_14_AFTER = [
+    ("2a2374508cfb40d382e127e0ba08f00a", "2026-11-15T10:13:15.649053+00:00", 703, None, "succeeded"),
+    ("fc9688489c534e868c2e1caacc37846b", "2026-11-15T10:57:59.408410+00:00", 696, None, "succeeded"),
+]
 
 
-def _snapshot_2026_11_14() -> list[tuple[str, str, int, str]] | None:
-    """The same sequence read from the stored production rows, when available."""
+def _embedded_replay() -> list[tuple[str, str, int, str | None, str]]:
+    return [(*row, "needs_review") for row in _EMBEDDED_2026_11_14] + _EMBEDDED_2026_11_14_AFTER
+
+
+def _snapshot_2026_11_14() -> list[tuple[str, str, int, str | None, str]] | None:
+    """The same sequence read from the stored production rows, when available:
+    every finished experiment from the first #694 gate failure up to and
+    including the #696 run (#694, #705, #709, #709, #703, #696)."""
     path = os.environ.get("NEXUS_PROD_DB_SNAPSHOT")
     if not path or not os.path.exists(path):
         return None
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         rows = conn.execute(
-            "SELECT e.id, e.ended_at, l.issue_number, e.error FROM experiments e "
+            "SELECT e.id, e.ended_at, l.issue_number, e.error, e.status FROM experiments e "
             "JOIN github_experiment_links l ON l.experiment_id=e.id "
-            "WHERE l.issue_number IN (694, 705, 709) AND e.error LIKE 'timing check failed closed%' "
-            "AND e.ended_at LIKE '2026-11-14%' ORDER BY e.ended_at"
+            "WHERE e.ended_at >= '2026-11-14T18:16:53' AND e.ended_at <= '2026-11-15T10:57:59.5' "
+            "ORDER BY e.ended_at"
         ).fetchall()
         conn.close()
     except sqlite3.Error:
         return None
-    return [(str(r[0]), str(r[1]), int(r[2]), str(r[3])) for r in rows] or None
+    return [(str(r[0]), str(r[1]), int(r[2]), r[3], str(r[4])) for r in rows] or None
 
 
 class _Repo:
@@ -632,35 +643,601 @@ class SchemaTests(GateSelfRepairTestCase):
 
 class ReplayMeasureTests(GateSelfRepairTestCase):
     def test_2026_11_14_replay_switches_off_after_the_third_failure(self):
-        """Measure: replay the stored 2026-11-14 sequence; the switch-off must
-        happen after the third finished experiment (#709 at 19:43), not later."""
-        rows = _snapshot_2026_11_14() or _EMBEDDED_2026_11_14
-        self.assertGreaterEqual(len(rows), 4)
-        self.assertEqual([r[2] for r in rows[:4]], [694, 705, 709, 709])
+        """Measure: replay the stored 2026-11-14 sequence (#694, #705, #709,
+        then #709 again, #703 and #696); the switch-off must happen right
+        after the third finished experiment (#709 at 19:43), only once, and
+        the gate is rerun on main exactly once."""
+        rows = _snapshot_2026_11_14() or _embedded_replay()
+        issues = [r[2] for r in rows]
+        self.assertEqual(issues[:3], [694, 705, 709])
+        self.assertIn(696, issues[3:])
         deliver = self.FakeDeliver()
+        runner_calls: list[list[str]] = []
+
+        def runner(repo_path: str, tests: list[str]) -> str:
+            runner_calls.append(list(tests))
+            return self.failing_runner(repo_path, tests)
+
         switched_at: list[int] = []
-        for index, (experiment_id, ended_at, issue, error) in enumerate(rows, start=1):
+        for index, (experiment_id, ended_at, issue, error, status) in enumerate(rows, start=1):
             conn = self._conn()
-            self.add_finished(conn, experiment_id, ended_at, error, issue=issue)
+            self.add_finished(conn, experiment_id, ended_at, error, issue=issue, status=status)
             conn.close()
             outcome = gsr.check_and_repair(
                 db_path=self.db_path, repo_root=str(self.repo.path),
-                deliver=deliver, runner=self.failing_runner,
+                deliver=deliver, runner=runner,
             )
             if outcome["switched_off"]:
                 switched_at.append(index)
-        # Exactly after the third one, and only once.
         self.assertEqual(switched_at, [3])
+        self.assertEqual(len(runner_calls), 1)
         github_calls = [p for kind, p in deliver.calls if kind == "github_issue"]
         self.assertEqual(len(github_calls), 1)
         self.assertEqual(github_calls[0]["title"], "Repair host blocker: timing_check")
-        # After the fourth row (same issue #709 again) the last three finished
-        # experiments span only two issues, so no fresh detection fires.
-        conn = self._conn()
-        self.assertIsNone(gsr.detect_repeated_blocker(conn))
-        conn.close()
-        self.assertEqual(gsr.status(self.db_path)["timing_check"], "off")
+        state = gsr.status(self.db_path)
+        self.assertEqual(state["timing_check"], "off")
+        self.assertEqual(sorted(state["state"]["issues"]), [694, 705, 709])
+        self.assertEqual(state["pending_reports"], 0)
 
+
+class RerunVerdictTests(GateSelfRepairTestCase):
+    """Review finding (1): only the same gate failing the same way on main
+    switches the gate off; a timing-sensitive or verdict-less rerun never does."""
+
+    REASON = "timing check failed closed: error: these tests fail on this host without drift too"
+
+    def _run(self, runner):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        deliver = self.FakeDeliver()
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=runner,
+        )
+        return outcome, deliver
+
+    def assert_nothing_switched(self, outcome, deliver, verdict):
+        self.assertFalse(outcome["switched_off"])
+        self.assertEqual(outcome["timing_check"], "on")
+        self.assertEqual(outcome["rerun"]["verdict"], verdict)
+        self.assertEqual(outcome["pending_reports"], 0)
+        self.assertEqual(deliver.calls, [])
+        conn = self._conn()
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM gate_repair_reports").fetchone()[0], 0)
+        from modules.experiment_service.service_parts.verification import timing_check_enabled
+
+        with patch.dict(os.environ, {"NEXUS_TIMING_CHECK": "1"}):
+            self.assertTrue(timing_check_enabled(self.db_path))
+
+    def test_timing_sensitive_on_main_switches_nothing_off(self):
+        outcome, deliver = self._run(lambda repo, tests: "timing_sensitive: " + ", ".join(tests))
+        self.assert_nothing_switched(outcome, deliver, gsr.VERDICT_TIMING_SENSITIVE)
+
+    def test_error_without_verdict_switches_nothing_off(self):
+        for result in (
+            "error",
+            "error: control run without drift gave no verdict",
+            "error: watchdog stopped the rerun (tests/test_a.py::T::test_x)",
+            "error: none of the test ids exist on main",
+        ):
+            with self.subTest(result=result):
+                self.setUp()
+                outcome, deliver = self._run(lambda repo, tests, result=result: result)
+                self.assert_nothing_switched(outcome, deliver, gsr.VERDICT_NO_VERDICT)
+
+    def test_crashing_runner_switches_nothing_off(self):
+        def runner(repo, tests):
+            raise RuntimeError("pytest child crashed")
+
+        outcome, deliver = self._run(runner)
+        self.assert_nothing_switched(outcome, deliver, gsr.VERDICT_NO_VERDICT)
+        self.assertIn("pytest child crashed", outcome["rerun"]["result"])
+
+    def test_missing_main_is_no_verdict(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        self.repo.git("branch", "-m", "main", "trunk")
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path),
+            deliver=self.FakeDeliver(), runner=self.failing_runner,
+        )
+        self.assertFalse(outcome["switched_off"])
+        self.assertEqual(outcome["rerun"]["verdict"], gsr.VERDICT_NO_VERDICT)
+
+    def test_classify_rerun(self):
+        fails = gsr.FAILS_WITHOUT_DRIFT_RESULT + "tests/test_a.py::T::test_x"
+        self.assertEqual(gsr.classify_rerun("ok", self.REASON), gsr.VERDICT_PASSED)
+        self.assertEqual(gsr.classify_rerun(fails, self.REASON), gsr.VERDICT_FAILED)
+        self.assertEqual(gsr.classify_rerun(fails, "some other reason"), gsr.VERDICT_NO_VERDICT)
+        self.assertEqual(gsr.classify_rerun(gsr.FAILS_WITHOUT_DRIFT_RESULT, self.REASON), gsr.VERDICT_NO_VERDICT)
+        self.assertEqual(
+            gsr.classify_rerun("timing_sensitive: tests/test_a.py::T::test_x", self.REASON),
+            gsr.VERDICT_TIMING_SENSITIVE,
+        )
+        for result in (None, "", "error", "error: interrupted (KeyboardInterrupt)"):
+            self.assertEqual(gsr.classify_rerun(result, self.REASON), gsr.VERDICT_NO_VERDICT)
+
+
+class DefaultGateRunnerTests(GateSelfRepairTestCase):
+    """The default runner repeats the gate itself: drift run in the
+    verification env on the same test ids, then the control run without drift."""
+
+    IDS = ["tests/test_a.py::T::test_x", "tests/test_b.py::T::test_y"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.worktree = Path(self.tmp.name) / "wt"
+        (self.worktree / "tests").mkdir(parents=True)
+        for name in ("test_a.py", "test_b.py"):
+            (self.worktree / "tests" / name).write_text("", encoding="utf-8")
+
+    def _run(self, drift_result, control_result=None, collected=None):
+        from modules import timing_check as tc
+
+        drift = MagicMock(return_value=drift_result)
+        control = MagicMock(return_value=control_result)
+        with patch.object(tc, "_collected_ids", return_value=set(self.IDS) if collected is None else collected), \
+                patch.object(tc, "run_timing_check", drift), patch.object(tc, "control_check", control):
+            result = gsr.default_gate_runner(python="/py")(str(self.worktree), list(self.IDS))
+        return result, drift, control
+
+    def test_fails_without_drift_on_main_reproduces_the_gate_reason(self):
+        result, drift, control = self._run("timing_sensitive: " + ", ".join(self.IDS), ([], list(self.IDS)))
+        self.assertEqual(result, gsr.FAILS_WITHOUT_DRIFT_RESULT + ", ".join(self.IDS))
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_FAILED)
+        # Same test ids, the drift (verification) environment, the given interpreter.
+        args, kwargs = drift.call_args
+        self.assertEqual(args[1], self.IDS)
+        self.assertEqual(kwargs["python"], "/py")
+        from modules.verification_env import CLOCK_DRIFT_ENV
+
+        self.assertEqual(kwargs["env"][CLOCK_DRIFT_ENV], "50")
+        self.assertEqual(control.call_args[0][1], self.IDS)
+
+    def test_drift_only_on_main_is_timing_sensitive(self):
+        result, _, _ = self._run(
+            "timing_sensitive: " + ", ".join(self.IDS), ([self.IDS[0]], [self.IDS[1]]),
+        )
+        self.assertEqual(result, "timing_sensitive: " + self.IDS[0])
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_TIMING_SENSITIVE)
+
+    def test_control_without_verdict_is_no_verdict(self):
+        result, _, _ = self._run("timing_sensitive: " + self.IDS[0], None)
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_NO_VERDICT)
+
+    def test_passing_drift_run_skips_the_control_run(self):
+        result, _, control = self._run("ok")
+        self.assertEqual(result, "ok")
+        control.assert_not_called()
+
+    def test_drift_error_is_no_verdict(self):
+        result, _, control = self._run("error")
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_NO_VERDICT)
+        control.assert_not_called()
+
+    def test_only_test_ids_present_on_main_are_run(self):
+        result, drift, _ = self._run("ok", collected={self.IDS[1]})
+        self.assertEqual(drift.call_args[0][1], [self.IDS[1]])
+        result, drift, _ = self._run("ok", collected=set())
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_NO_VERDICT)
+        drift.assert_not_called()
+
+    def test_hung_rerun_is_no_verdict(self):
+        from modules import timing_check as tc
+        from modules.verification_runner import HungTest
+
+        with patch.object(tc, "_collected_ids", return_value=set(self.IDS)), \
+                patch.object(tc, "run_timing_check", side_effect=HungTest("tests/test_a.py::T::test_x")):
+            result = gsr.default_gate_runner()(str(self.worktree), list(self.IDS))
+        self.assertEqual(gsr.classify_rerun(result, RerunVerdictTests.REASON), gsr.VERDICT_NO_VERDICT)
+
+
+class RealRerunOnMainTests(GateSelfRepairTestCase):
+    """End to end with real pytest children on a main worktree."""
+
+    def _main_with_test(self, body: str) -> None:
+        tests = self.repo.path / "tests"
+        tests.mkdir(exist_ok=True)
+        (tests / "test_host.py").write_text(body, encoding="utf-8")
+        self.repo.git("add", ".")
+        self.repo.git("commit", "-q", "-m", "test")
+
+    def _three(self, test_id: str) -> None:
+        conn = self._conn()
+        for name, ended, issue in (("exp-a", "2026-11-14T18:16:53+00:00", 694),
+                                   ("exp-b", "2026-11-14T18:59:31+00:00", 705),
+                                   ("exp-c", "2026-11-14T19:43:24+00:00", 709)):
+            self.add_finished(conn, name, ended, gate_error(test_id), issue=issue)
+        conn.close()
+
+    def test_test_failing_on_main_without_drift_switches_the_gate_off(self):
+        self._main_with_test("def test_host():\n    assert False, 'host state'\n")
+        self._three("tests/test_host.py::test_host")
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=self.FakeDeliver(),
+        )
+        self.assertEqual(outcome["rerun"]["verdict"], gsr.VERDICT_FAILED, outcome["rerun"])
+        self.assertTrue(outcome["switched_off"])
+        # The temporary main worktree is gone again.
+        listed = self.repo.git("worktree", "list")
+        self.assertEqual(len(listed.strip().splitlines()), 1, listed)
+
+    def test_test_passing_on_main_switches_nothing_off(self):
+        self._main_with_test("def test_host():\n    assert True\n")
+        self._three("tests/test_host.py::test_host")
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=self.FakeDeliver(),
+        )
+        self.assertEqual(outcome["rerun"]["verdict"], gsr.VERDICT_PASSED, outcome["rerun"])
+        self.assertFalse(outcome["switched_off"])
+
+    def test_test_missing_on_main_is_no_verdict(self):
+        self._three("tests/test_host.py::test_host")
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=self.FakeDeliver(),
+        )
+        self.assertEqual(outcome["rerun"]["verdict"], gsr.VERDICT_NO_VERDICT, outcome["rerun"])
+        self.assertFalse(outcome["switched_off"])
+
+
+class RerunOnceTests(GateSelfRepairTestCase):
+    """Review finding (2): the gate is rerun on main once per triple, not every tick."""
+
+    def _tick(self, runner):
+        return gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path),
+            deliver=self.FakeDeliver(), runner=runner,
+        )
+
+    def _counting(self, result):
+        calls: list[list[str]] = []
+
+        def runner(repo, tests):
+            calls.append(list(tests))
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        return runner, calls
+
+    def test_passing_rerun_is_not_repeated_on_the_next_ticks(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        runner, calls = self._counting("ok")
+        first = self._tick(runner)
+        self.assertEqual(first["rerun"]["verdict"], gsr.VERDICT_PASSED)
+        for _ in range(3):
+            later = self._tick(runner)
+            self.assertEqual(later["rerun_skipped"], "already_checked")
+            self.assertNotIn("rerun", later)
+            self.assertFalse(later["switched_off"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(gsr.status(self.db_path)["last_rerun"]["verdict"], gsr.VERDICT_PASSED)
+
+    def test_no_verdict_rerun_is_not_repeated(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        runner, calls = self._counting("error")
+        self._tick(runner)
+        # A later failing runner must not be asked: the triple was checked.
+        failing, failing_calls = self._counting(gsr.FAILS_WITHOUT_DRIFT_RESULT + "tests/test_a.py::T::test_x")
+        outcome = self._tick(failing)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(failing_calls, [])
+        self.assertFalse(outcome["switched_off"])
+
+    def test_a_new_triple_gets_its_own_single_rerun(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        runner, calls = self._counting("ok")
+        self._tick(runner)
+        conn = self._conn()
+        self.add_finished(
+            conn, "exp-d", "2026-11-14T21:00:00+00:00",
+            gate_error("tests/test_d.py::T::test_w"), issue=720,
+        )
+        conn.close()
+        self._tick(runner)
+        self._tick(runner)
+        self.assertEqual(len(calls), 2)
+
+    def test_interrupted_rerun_is_never_repeated_and_switches_nothing_off(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        runner, calls = self._counting(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self._tick(runner)
+        failing, failing_calls = self._counting(gsr.FAILS_WITHOUT_DRIFT_RESULT + "tests/test_a.py::T::test_x")
+        outcome = self._tick(failing)
+        self.assertEqual(outcome["rerun_skipped"], "in_progress_or_interrupted")
+        self.assertEqual(outcome["rerun_record"]["status"], gsr.RERUN_RUNNING)
+        self.assertEqual(failing_calls, [])
+        self.assertFalse(outcome["switched_off"])
+        self.assertEqual(outcome["timing_check"], "on")
+
+    def test_a_second_claim_of_the_same_triple_is_refused(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        detection = gsr.detect_repeated_blocker(conn)
+        _, first = gsr.claim_rerun(conn, detection)
+        other = sqlite3.connect(self.db_path)
+        self.addCleanup(other.close)
+        record, second = gsr.claim_rerun(other, detection)
+        self.assertTrue(first)
+        self.assertFalse(second)
+        self.assertEqual(record["status"], gsr.RERUN_RUNNING)
+
+    def test_manual_re_enable_is_not_undone_by_the_same_triple(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        runner, calls = self._counting(gsr.FAILS_WITHOUT_DRIFT_RESULT + "tests/test_a.py::T::test_x")
+        self.assertTrue(self._tick(runner)["switched_off"])
+        conn = self._conn()
+        conn.execute("UPDATE service_settings SET value='[]' WHERE key=?", (gsr.SETTING_DISABLED_GATES,))
+        conn.commit()
+        conn.close()
+        outcome = self._tick(runner)
+        self.assertFalse(outcome["switched_off"])
+        self.assertEqual(outcome["timing_check"], "on")
+        self.assertEqual(len(calls), 1)
+
+
+class AtomicSwitchOffTests(GateSelfRepairTestCase):
+    """Review finding (3): the switch-off and its pending reports commit together."""
+
+    FAIL = staticmethod(GateSelfRepairTestCase.failing_runner)
+
+    def _prepare(self):
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+
+    def _report_rows(self):
+        conn = self._conn()
+        return conn.execute("SELECT kind, status FROM gate_repair_reports ORDER BY id").fetchall()
+
+    def test_crash_while_writing_the_reports_rolls_the_switch_off_back(self):
+        self._prepare()
+        real_insert = gsr._insert_missing_reports
+
+        def crash(conn, entry, now):
+            conn.execute(
+                "INSERT INTO gate_repair_reports (kind, payload_json, report_key, created_at, updated_at) "
+                "VALUES ('github_issue', '{}', 'partial', ?, ?)", (now, now),
+            )
+            raise sqlite3.OperationalError("database is locked")
+
+        runner_calls = []
+
+        def runner(repo, tests):
+            runner_calls.append(tests)
+            return self.FAIL(repo, tests)
+
+        with patch.object(gsr, "_insert_missing_reports", crash):
+            with self.assertRaises(sqlite3.OperationalError):
+                gsr.check_and_repair(
+                    db_path=self.db_path, repo_root=str(self.repo.path),
+                    deliver=self.FakeDeliver(), runner=runner,
+                )
+        # Nothing of the switch-off survived: gate on, no (partial) reports.
+        state = gsr.status(self.db_path)
+        self.assertEqual(state["timing_check"], "on")
+        self.assertEqual(self._report_rows(), [])
+        self.assertFalse(state["last_rerun"]["applied"])
+        self.assertEqual(state["last_rerun"]["verdict"], gsr.VERDICT_FAILED)
+        # The next tick completes the switch-off from the stored rerun, without rerunning.
+        self.assertIs(gsr._insert_missing_reports, real_insert)
+        deliver = self.FakeDeliver()
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=runner,
+        )
+        self.assertTrue(outcome["switched_off"])
+        self.assertEqual(outcome["rerun_skipped"], "already_checked")
+        self.assertEqual(len(runner_calls), 1)
+        self.assertEqual([tuple(r) for r in self._report_rows()], [("github_issue", "done"), ("mailbox", "done")])
+        self.assertEqual(outcome["repair_issue_number"], 4201)
+
+    def test_crash_between_rerun_and_switch_off_is_completed_next_tick(self):
+        self._prepare()
+        runner_calls = []
+
+        def runner(repo, tests):
+            runner_calls.append(tests)
+            return self.FAIL(repo, tests)
+
+        with patch.object(gsr, "disable_gate", side_effect=RuntimeError("process killed")):
+            with self.assertRaises(RuntimeError):
+                gsr.check_and_repair(
+                    db_path=self.db_path, repo_root=str(self.repo.path),
+                    deliver=self.FakeDeliver(), runner=runner,
+                )
+        self.assertEqual(gsr.status(self.db_path)["timing_check"], "on")
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path),
+            deliver=self.FakeDeliver(), runner=runner,
+        )
+        self.assertTrue(outcome["switched_off"])
+        self.assertEqual(len(runner_calls), 1)
+        # And only once: a further tick is already_off, no new reports.
+        again = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path),
+            deliver=self.FakeDeliver(), runner=runner,
+        )
+        self.assertTrue(again["already_off"])
+        self.assertEqual(len(self._report_rows()), 2)
+
+    def test_switch_off_without_reports_gets_them_on_the_already_off_path(self):
+        # A switch-off written without its report rows (by hand or an older version).
+        conn = self._conn()
+        conn.execute(
+            "INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, 'now')",
+            (gsr.SETTING_DISABLED_GATES, json.dumps([{
+                "gate": "timing_check", "classification": "host_blocker:timing_check", "reason": "r",
+            }])),
+        )
+        conn.commit()
+        conn.close()
+        deliver = self.FakeDeliver()
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=self.FAIL,
+        )
+        self.assertTrue(outcome["already_off"])
+        self.assertEqual([k for k, _ in deliver.calls], ["github_issue", "mailbox"])
+        self.assertEqual(outcome["repair_issue_number"], 4201)
+        # Running again neither re-enqueues nor re-delivers.
+        deliver2 = self.FakeDeliver()
+        gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver2, runner=self.FAIL,
+        )
+        self.assertEqual(deliver2.calls, [])
+        self.assertEqual(len(self._report_rows()), 2)
+
+    def test_crash_after_delivery_before_marking_done_keeps_the_row_pending(self):
+        self._prepare()
+        deliver = self.FakeDeliver()
+        with patch.object(gsr, "_store_repair_issue_number", side_effect=sqlite3.OperationalError("locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                gsr.check_and_repair(
+                    db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=self.FAIL,
+                )
+        # The switch-off and both reports are committed; the GitHub row stays pending.
+        state = gsr.status(self.db_path)
+        self.assertEqual(state["timing_check"], "off")
+        self.assertEqual(state["pending_reports"], 2)
+        outcome = gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=self.FAIL,
+        )
+        self.assertEqual(outcome["pending_reports"], 0)
+        self.assertIsNotNone(outcome["repair_issue_number"])
+
+    def test_retrying_twice_after_success_sends_nothing_more(self):
+        self._prepare()
+        deliver = self.FakeDeliver()
+        gsr.check_and_repair(db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=self.FAIL)
+        sent = len(deliver.calls)
+        for _ in range(2):
+            gsr.check_and_repair(db_path=self.db_path, repo_root=str(self.repo.path), deliver=deliver, runner=self.FAIL)
+        self.assertEqual(len(deliver.calls), sent)
+
+    def test_report_of_an_earlier_switch_off_does_not_mislabel_the_current_one(self):
+        conn = self._conn()
+        gsr.ensure_schema(conn)
+        entry = gsr.disable_gate(conn, "timing_check", classification="host_blocker:timing_check", reason="r")
+        conn.execute("UPDATE gate_repair_reports SET status='done'")
+        conn.commit()
+        gsr.enqueue_report(conn, "github_issue", {"title": "t", "switch_off_id": "older", "report_key": "older:gh"})
+        gsr.retry_pending_reports(conn, self.FakeDeliver())
+        self.assertIsNone(gsr.gate_disabled(conn, "timing_check")["repair_issue_number"])
+        self.assertEqual(gsr.gate_disabled(conn, "timing_check")["switch_off_id"], entry["switch_off_id"])
+
+
+class IdempotentDeliveryTests(GateSelfRepairTestCase):
+    def test_gh_reuses_an_open_issue_with_the_same_title(self):
+        listed = subprocess.CompletedProcess(
+            [], 0, json.dumps([{"number": 77, "title": "Repair host blocker: timing_check", "url": "u"}]), "",
+        )
+        with patch.object(gsr.subprocess, "run", return_value=listed) as run:
+            result = gsr._gh_create_issue("/repo", "Repair host blocker: timing_check", "body")
+        self.assertEqual(result["number"], 77)
+        self.assertTrue(result["reused"])
+        self.assertEqual(run.call_count, 1)
+        self.assertNotIn("create", run.call_args[0][0])
+
+    def test_gh_creates_without_label_when_none_is_open(self):
+        responses = [
+            subprocess.CompletedProcess([], 0, json.dumps([{"number": 5, "title": "Repair host blocker: timing_check (old)"}]), ""),
+            subprocess.CompletedProcess([], 0, "https://github.com/o/r/issues/901\n", ""),
+        ]
+        with patch.object(gsr.subprocess, "run", side_effect=responses) as run:
+            result = gsr._gh_create_issue("/repo", "Repair host blocker: timing_check", "body")
+        self.assertEqual(result["number"], 901)
+        create = run.call_args_list[1][0][0]
+        self.assertIn("create", create)
+        self.assertNotIn("--label", create)
+
+    def test_gh_list_failure_raises_so_the_row_stays_pending(self):
+        failed = subprocess.CompletedProcess([], 1, "", "network down")
+        with patch.object(gsr.subprocess, "run", return_value=failed) as run:
+            with self.assertRaises(RuntimeError):
+                gsr._gh_create_issue("/repo", "Repair host blocker: timing_check", "body")
+        self.assertEqual(run.call_count, 1)
+
+    def test_mailbox_post_twice_writes_one_file(self):
+        outbox = Path(self.tmp.name) / "outbox"
+        payload = {"title": "Repair host blocker: timing_check", "body": "b",
+                   "report_key": "abc:mailbox", "created_at": "2026-11-14T19:43:24+00:00"}
+        first = gsr._mailbox_post(payload, outbox)
+        second = gsr._mailbox_post(payload, outbox)
+        self.assertEqual(first["outbox_file"], second["outbox_file"])
+        self.assertTrue(second["reused"])
+        self.assertEqual(len(list(outbox.iterdir())), 1)
+        text = (outbox / first["outbox_file"]).read_text(encoding="utf-8")
+        self.assertIn("type: report", text)
+        self.assertIn("created_by: nexus", text)
+
+
+class TickIntegrationTests(GateSelfRepairTestCase):
+    def test_tick_passes_the_verification_interpreter_and_watchdog(self):
+        import nexus_tick
+        from modules.verification_runner import WatchdogConfig
+
+        watchdog = WatchdogConfig(stall_timeout_seconds=9, check_interval_seconds=1, safety_cap_seconds=99)
+        service = MagicMock()
+        service.experiment_service.test_python_executable = "/venv/bin/python"
+        service.experiment_service._get_test_watchdog_config.return_value = watchdog
+        with patch.object(gsr, "check_and_repair", return_value={"switched_off": False}) as check:
+            nexus_tick._gate_self_repair_tick(self.db_path, str(self.repo.path), service)
+        kwargs = check.call_args.kwargs
+        self.assertEqual(kwargs["python"], "/venv/bin/python")
+        self.assertIs(kwargs["watchdog"], watchdog)
+
+    def test_tick_survives_a_failing_check(self):
+        import nexus_tick
+
+        with patch.object(gsr, "check_and_repair", side_effect=sqlite3.OperationalError("locked")):
+            nexus_tick._gate_self_repair_tick(self.db_path, str(self.repo.path), None)
+
+    def test_status_issue_shows_pending_reports(self):
+        from modules import nexus_status_issue
+
+        conn = self._conn()
+        self.add_three_same_reason(conn)
+        conn.close()
+        gsr.check_and_repair(
+            db_path=self.db_path, repo_root=str(self.repo.path),
+            deliver=self.FakeDeliver(fail_github=True), runner=self.failing_runner,
+        )
+        conn = self._conn()
+        body = nexus_status_issue.render(
+            conn, now=datetime.now(timezone.utc), budget=10, spent=1, paused=False, busy=None,
+        )
+        self.assertIn("switched off: timing_check", body)
+        self.assertIn("1 report(s) pending", body)
+
+
+class SchemaMigrationTests(GateSelfRepairTestCase):
+    def test_an_older_report_table_gets_the_report_key_column(self):
+        path = str(Path(self.tmp.name) / "old.db")
+        conn = sqlite3.connect(path)
+        conn.execute(
+            "CREATE TABLE gate_repair_reports (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, "
+            "payload_json TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, "
+            "last_error TEXT NULL, result_json TEXT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+        )
+        conn.commit()
+        conn.close()
+        conn = init_db(path)
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(gate_repair_reports)")}
+        conn.close()
+        self.assertIn("report_key", columns)
+        # Idempotent.
+        init_db(path).close()
 
 if __name__ == "__main__":
     unittest.main()

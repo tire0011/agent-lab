@@ -191,6 +191,25 @@ run continues for as long as tests keep starting and finishing.
     `timing check failed closed: ...` (event `timing_check_failed_closed`).
     The check fails closed: when it is on and gives no verdict, the change is
     never approved.
+  - Gate self-repair (#730, `modules/gate_self_repair.py`, run once per tick):
+    when the last 3 finished experiments, on 3 different issues, all end with
+    `timing check failed closed: ... without drift too`, the same gate is
+    rerun once on current `main` (drift run on the same test ids in the
+    verification env, then the control run without drift). Only when the
+    tests fail there without drift too is it `host_blocker:timing_check`: the
+    timing check is switched off persistently (`service_settings` key
+    `gate_self_repair.disabled_gates`, read by `timing_check_enabled()`), and
+    a plain issue `Repair host blocker: timing_check` (no `proposal` label)
+    plus a mailbox report are queued in `gate_repair_reports` in the same
+    transaction and retried every tick until delivered. A rerun that passes,
+    finds the tests timing-sensitive, or gives no verdict switches nothing
+    off. Each experiment triple is rerun at most once (key
+    `gate_self_repair.rerun:<ids>`; an interrupted rerun stays `running` and
+    counts as no verdict). Only `timing_check` can be switched off, at most one
+    gate at a time. The state is shown under `gate_self_repair` in `/status` and
+    in the status issue. To re-enable it after fixing the host, set
+    `gate_self_repair.disabled_gates` to `[]`. The same triple will not switch
+    it off again.
   Both events carry `tails: {node_id: text}` - at most 40 lines of each
   failing test's failure/error text, read from pytest's `--junitxml` report
   and matched by the exact node id, parameters included (`test_x[b]`, not

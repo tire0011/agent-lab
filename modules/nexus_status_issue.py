@@ -55,6 +55,7 @@ def render(conn: sqlite3.Connection, *, now: datetime, budget: int, spent: int,
             f"**Gates:** switched off: {', '.join(str(g) for g in gate['disabled_gates'])} "
             f"({gate.get('host_blocker')}"
             + (f", repair issue #{issue}" if issue else "")
+            + (f", {gate['pending_reports']} report(s) pending" if gate.get("pending_reports") else "")
             + ")"
         )
     lines += ["", "**Recent experiments**", ""]
