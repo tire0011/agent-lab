@@ -10,7 +10,9 @@ decides; nothing is installed or changed.
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -88,9 +90,40 @@ def outlook_prompt(setup: str, last_report: str | None) -> str:
         "2. Hoechstens 3 Vorschlaege, each with a link, the expected gain for Nexus and how to "
         "measure it, small enough to approve or reject in one sentence. Say plainly when nothing "
         "relevant is new.\n\n"
+        "End with exactly one fenced ```json block listing the same proposals, each as an issue "
+        "Nexus can work on: {\"proposals\": [{\"title\": \"<short English title>\", "
+        "\"body\": \"<English: evidence with link, change, how to measure>\"}]} - an empty list "
+        "when nothing is worth doing.\n\n"
         f"CURRENT SETUP:\n{setup}\n\n"
         + (f"LAST OUTLOOK:\n{last_report[:4000]}\n" if last_report else "")
     )
+
+
+MAX_PROPOSALS = 3
+_JSON_BLOCK = re.compile(r"```json\s*(.*?)\s*```", re.DOTALL)
+
+
+def parse_proposals(report: str) -> tuple[str, list[dict[str, str]]]:
+    """``(report without the json block, proposals)``; a broken block yields none."""
+    match = None
+    for match in _JSON_BLOCK.finditer(report):
+        pass
+    if match is None:
+        return report, []
+    text = (report[:match.start()] + report[match.end():]).strip()
+    try:
+        data = json.loads(match.group(1))
+    except ValueError:
+        return text, []
+    out = []
+    for item in (data.get("proposals") or [])[:MAX_PROPOSALS] if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or "").split())[:150]
+        body = str(item.get("body") or "").strip()
+        if title and body:
+            out.append({"title": title, "body": body[:20000]})
+    return text, out
 
 
 def _run_claude(prompt: str, repo_root: str, db_path: str | None = None) -> str:
@@ -131,11 +164,17 @@ def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
     if not report:
         return "Outlook failed: empty report"
     title = f"{TITLE_PREFIX} {now.date().isoformat()}"
+    report, proposals = parse_proposals(report)
     open_issue(title, report)
+    # Owner 2026-11-28: each proposal becomes its own issue, a proposal like the
+    # planner's (the owner can object; otherwise Nexus releases it after the wait).
+    for proposal in proposals:
+        open_issue(f"Outlook: {proposal['title']}",
+                   f"{proposal['body']}\n\nFrom the outlook \"{title}\".")
     conn = _connect(db_path)
     try:
         with conn:
             _set(conn, LAST_REPORT, report[:6000], now)
     finally:
         conn.close()
-    return f"Outlook: issue \"{title}\" opened"
+    return f"Outlook: issue \"{title}\" opened with {len(proposals)} proposal issue(s)"

@@ -39,6 +39,22 @@ class OutlookTests(unittest.TestCase):
         self.run_outlook(runner, NOW + timedelta(days=14))
         self.assertIn("LAST OUTLOOK:\nNeu: ein kleineres Modell", prompts[1])
 
+    def test_each_proposal_becomes_its_own_issue(self):
+        report = ("Gefunden: Qwen3-Coder 4B.\n\n```json\n"
+                  '{"proposals": [{"title": "Try a 4B coder model", "body": "Link, gain, measure."},'
+                  ' {"title": "", "body": "no title"}]}\n```')
+        line = self.run_outlook(lambda p, root: report)
+        self.assertIn("1 proposal issue(s)", line)
+        self.assertEqual(self.issues[0], ("Ausblick Nexus 2026-11-28", "Gefunden: Qwen3-Coder 4B."))
+        self.assertEqual(self.issues[1][0], "Outlook: Try a 4B coder model")
+        self.assertIn('From the outlook "Ausblick Nexus 2026-11-28"', self.issues[1][1])
+        self.assertIn("```json", outlook.outlook_prompt("setup", None))
+
+    def test_a_broken_json_block_opens_only_the_report(self):
+        text, proposals = outlook.parse_proposals("Bericht\n```json\n{broken\n```")
+        self.assertEqual((text, proposals), ("Bericht", []))
+        self.assertEqual(outlook.parse_proposals("Nur Text"), ("Nur Text", []))
+
     def test_a_failure_is_reported_once_and_switched_off_does_nothing(self):
         def down(p, root):
             raise RuntimeError("limit")
