@@ -31,24 +31,26 @@ class OutlookTests(unittest.TestCase):
     def test_an_outlook_every_two_weeks_becomes_an_issue(self):
         prompts = []
         runner = lambda p, root: prompts.append(p) or "Neu: ein kleineres Modell"
-        self.assertIn("Ausblick Nexus 2026-11-28", self.run_outlook(runner))
-        self.assertEqual(self.issues[0][1], "Neu: ein kleineres Modell")
+        self.assertIn("Outlook 2026-11-28: 0 issue(s)", self.run_outlook(runner))
+        self.assertEqual(self.issues, [])  # the report is for Nexus, not an issue
         self.assertIn("Search the web", prompts[0])
         self.assertIn("RTX 2000 Ada", prompts[0])
         self.assertIsNone(self.run_outlook(runner, NOW + timedelta(days=13)))
         self.run_outlook(runner, NOW + timedelta(days=14))
         self.assertIn("LAST OUTLOOK:\nNeu: ein kleineres Modell", prompts[1])
 
-    def test_each_proposal_becomes_its_own_issue(self):
-        report = ("Gefunden: Qwen3-Coder 4B.\n\n```json\n"
-                  '{"proposals": [{"title": "Try a 4B coder model", "body": "Link, gain, measure."},'
+    def test_proposals_become_nexus_issues_and_only_owner_actions_go_to_the_owner(self):
+        report = ("Gefunden: zwei Dinge.\n\n```json\n"
+                  '{"proposals": [{"title": "Try n-gram speculation", "body": "Link, gain, measure.", "needs_owner": false},'
+                  ' {"title": "Run a MoE model on the PC", "body": "Owner installs it.", "needs_owner": true},'
                   ' {"title": "", "body": "no title"}]}\n```')
-        line = self.run_outlook(lambda p, root: report)
-        self.assertIn("1 proposal issue(s)", line)
-        self.assertEqual(self.issues[0], ("Ausblick Nexus 2026-11-28", "Gefunden: Qwen3-Coder 4B."))
-        self.assertEqual(self.issues[1][0], "Outlook: Try a 4B coder model")
-        self.assertIn('From the outlook "Ausblick Nexus 2026-11-28"', self.issues[1][1])
-        self.assertIn("```json", outlook.outlook_prompt("setup", None))
+        tasks = []
+        line = outlook.run(self.db, ".", lambda t, b: self.issues.append((t, b)), now=NOW,
+                           runner=lambda p, root: report, open_task=lambda t, b: tasks.append((t, b)))
+        self.assertEqual(line, "Outlook 2026-11-28: 1 issue(s) for Nexus, 1 needing the owner")
+        self.assertEqual([t for t, _ in tasks], ["Outlook: Try n-gram speculation"])
+        self.assertEqual([t for t, _ in self.issues], ["Outlook: Run a MoE model on the PC"])
+        self.assertIn("needs_owner", outlook.outlook_prompt("setup", None))
 
     def test_a_broken_json_block_opens_only_the_report(self):
         text, proposals = outlook.parse_proposals("Bericht\n```json\n{broken\n```")
