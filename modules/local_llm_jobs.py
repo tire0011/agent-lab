@@ -36,6 +36,10 @@ ROLE_LOCAL_WORKER = "local_worker"
 ROLE_TOOL_ROUTER = "tool_router"
 ROLE_EXPERIMENT_REFLECTION = "experiment_reflection"
 ROLE_EXPERIMENT_LESSON = "experiment_lesson"
+# Home-GPU fallback jobs (#761): queued on this path when the home PC is off;
+# unlike the other roles they are only claimed inside the VM night window
+# (NEXUS_HOME_GPU_VM_HOURS, default 0-6 UTC - see modules.home_gpu.fallback).
+ROLE_HOME_GPU = "home_gpu"
 
 # Error classification (#167). A job's failure reason is part of the shared
 # observability contract: callers should be able to tell a wedged worker from
@@ -95,6 +99,37 @@ _DIAG_TIMEOUT_SECONDS = 3
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _home_gpu_vm_window_active() -> bool:
+    """Whether the VM night window for home-GPU fallback jobs is open now.
+
+    Lazily imported from :mod:`modules.home_gpu.fallback` (which imports this
+    module lazily in turn, so neither import cycle bites at import time).
+    Fails open - True - so a broken window configuration can never block
+    ordinary local-model work, only the home-GPU rows are gated on it.
+    """
+    try:
+        from modules.home_gpu.fallback import in_vm_window
+
+        return in_vm_window()
+    except Exception:  # noqa: BLE001 - fail open, never wedge the queue
+        return True
+
+
+def _claimable_sql() -> str:
+    """WHERE fragment for jobs this worker may claim right now.
+
+    Everything queued except home-GPU fallback rows outside their night
+    window (#761).
+    """
+    return (
+        "status = ? AND (role IS NULL OR role != ? OR ?)"
+    )
+
+
+def _claimable_params() -> tuple[Any, ...]:
+    return (STATUS_QUEUED, ROLE_HOME_GPU, 1 if _home_gpu_vm_window_active() else 0)
 
 
 def local_llm_watchdog_seconds() -> float:
@@ -624,14 +659,20 @@ class LocalLlmJobService:
         - so two workers in two processes cannot both conclude the slot is
         theirs. Returns the claimed job id, or None when there is nothing to
         run or another worker holds the slot.
+
+        Home-GPU fallback jobs (role ``home_gpu``, #761) are skipped outside
+        the VM night window: they stay queued until the window opens.
         """
         # An idle worker polls for work another process queued. Checking that
         # first keeps the common "nothing to do" tick a single read instead of
         # a write transaction every process fights over.
+        claimable = _claimable_sql()
+        params = _claimable_params()  # one window decision for both reads below
         try:
             with self._lock:
                 pending = self._conn.execute(
-                    "SELECT 1 FROM local_llm_jobs WHERE status = ? LIMIT 1", (STATUS_QUEUED,)
+                    f"SELECT 1 FROM local_llm_jobs WHERE {claimable} LIMIT 1",
+                    params,
                 ).fetchone()
         except sqlite3.Error as exc:
             _LOGGER.warning("local_llm claim could not look for queued work: %s", exc)
@@ -669,9 +710,9 @@ class LocalLlmJobService:
                     self._conn.execute("COMMIT")
                     return None
                 row = self._conn.execute(
-                    "SELECT id FROM local_llm_jobs WHERE status = ? "
+                    f"SELECT id FROM local_llm_jobs WHERE {claimable} "
                     "ORDER BY created_at, rowid LIMIT 1",
-                    (STATUS_QUEUED,),
+                    params,
                 ).fetchone()
                 if row is None:
                     self._conn.execute("COMMIT")

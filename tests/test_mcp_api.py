@@ -368,14 +368,27 @@ class McpApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         body = response.json()["result"]
         self.assertFalse(body["isError"])
+        structured = body["structuredContent"]
+        # #761: /status carries a home_gpu block (PC-off state, VM night window,
+        # savings). Its clock-dependent fields are checked structurally, not
+        # by value.
+        home_gpu = structured.pop("home_gpu")
         self.assertEqual(
-            body["structuredContent"],
+            structured,
             {
                 "agent_status": "idle",
                 "api_version": "0.2.0",
                 "components": ["health", "status", "problems", "ideas", "chat"],
             },
         )
+        self.assertIs(home_gpu["enabled"], False)  # NEXUS_HOME_GPU is unset in tests
+        self.assertIn("vm_window", home_gpu)
+        self.assertIn(home_gpu["vm_window"]["spec"], ("0-6",))
+        self.assertIn("available", home_gpu)
+        if home_gpu["available"]:
+            self.assertIn("pc_off", home_gpu)
+            self.assertIn("savings", home_gpu)
+            self.assertIn("vm_seconds_saved", home_gpu["savings"])
 
     def test_experiment_logs_tool_reuses_existing_route_logic(self):
         experiment = SimpleNamespace(id="exp-123", status="failed")

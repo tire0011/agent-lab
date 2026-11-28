@@ -201,6 +201,20 @@ class LocalModelRates:
         values = self._samples().get(_DRAFT_KEY) or []
         return statistics.median(values) if values else None
 
+    def latest_rate(self, key: str) -> float | None:
+        """The newest stored sample of *key*; ``None`` when nothing is stored.
+
+        *key* is one of ``prompt_tokens_per_second`` / ``generation_tokens_per_second``.
+        Like :meth:`medians`, the measured samples win and the timeout estimates
+        are only used for a rate that was never measured; "latest" is the last
+        element of that list (the most recent recorded sample).
+        """
+        if key not in _KEYS:
+            raise ValueError(f"unknown rate {key!r}; expected one of {', '.join(_KEYS)}")
+        samples = self._samples()
+        values = samples.get(key) or samples.get(_ESTIMATED[key]) or []
+        return float(values[-1]) if values else None
+
     def generation_measured(self) -> bool:
         """Whether the generation rate comes from real timings, not a guess."""
         return bool(self._samples().get("generation_tokens_per_second"))

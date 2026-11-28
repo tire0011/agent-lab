@@ -14,6 +14,8 @@ tools, or arbitrary code, and never fabricates a general-purpose AI answer.
 
 from __future__ import annotations
 
+import os
+
 from nexus_version import VERSION
 
 
@@ -26,4 +28,24 @@ def build_status() -> dict:
         "agent_status": "idle",
         "api_version": API_VERSION,
         "components": COMPONENTS,
+        "home_gpu": _home_gpu_status(),
     }
+
+
+def _home_gpu_status() -> dict:
+    """The ``home_gpu`` block of ``/status`` (#761): PC-off state, VM night
+    window and the savings summary, read from the run database read-only.
+
+    The database path is resolved at call time (tests point ``AGENT_DB_PATH``
+    at a temporary file) and never appears in the result. Any failure - no
+    database yet, unreadable file - degrades to the flag alone instead of
+    failing the status endpoint.
+    """
+    from modules.home_gpu.fallback import home_gpu_status
+    from modules.home_gpu.jobs import home_gpu_enabled
+
+    db_path = (os.environ.get("AGENT_DB_PATH") or "").strip() or "/var/lib/nexus/agent.db"
+    try:
+        return home_gpu_status(db_path)
+    except Exception:  # noqa: BLE001 - /status must never fail on this block
+        return {"enabled": home_gpu_enabled(), "available": False}
