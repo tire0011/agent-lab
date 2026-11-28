@@ -441,6 +441,20 @@ def _cleanup_expired_worktrees(service) -> None:
         logger.warning("could not clean up expired experiment worktrees: %s", exc)
 
 
+def _outlook(db_path: str, repo_root: str) -> None:
+    """Every 14 days a look outward (owner rule). Never fails the tick."""
+    try:
+        from modules import outlook
+
+        line = outlook.run(db_path, repo_root, lambda title, body: _open_proposal(repo_root, title, body))
+    except Exception as exc:  # noqa: BLE001 - the outlook must not break a tick
+        logger.warning("outlook failed: %s", exc)
+        return
+    if line:
+        logger.info("%s", line)
+        _events.append(line)
+
+
 def _weekly_review(db_path: str, repo_root: str) -> None:
     """Weekly open review by one of Nexus's AIs (owner rule). Never fails the tick."""
     try:
@@ -843,6 +857,7 @@ def main(argv: list[str] | None = None) -> int:
             _update_clis(args.db_path)
             if not args.integration_only:
                 _weekly_review(args.db_path, args.repo_root)
+                _outlook(args.db_path, args.repo_root)
             if not args.integration_only:
                 _shadow_replay(args.repo_root, args.db_path)
         service.close()

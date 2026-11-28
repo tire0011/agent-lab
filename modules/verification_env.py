@@ -116,6 +116,8 @@ def build_verification_test_env(base_env: Mapping[str, str] | None = None) -> di
     env["NEXUS_WEEKLY_REVIEW"] = "0"
     # Nor prune the machine's real logs (log_retention).
     env["NEXUS_LOG_RETENTION"] = "0"
+    # Nor start the outlook (outlook).
+    env["NEXUS_OUTLOOK"] = "0"
     run_tmp = new_test_tmp_dir()
     for name in ("TMPDIR", "TEMP", "TMP"):
         env[name] = str(run_tmp)
