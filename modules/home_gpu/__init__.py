@@ -13,7 +13,7 @@ wrapper from :mod:`modules.home_gpu.fallback`, which tracks the job in
 mailbox-only writer stays available as :func:`submit_mailbox_job`.
 """
 
-from .collect import collect_replies
+from .collect import collect_replies, list_jobs
 from .fallback import (
     BATCH_KINDS,
     FALLBACK,
@@ -66,6 +66,7 @@ __all__ = [
     "home_gpu_enabled",
     "home_gpu_status",
     "in_vm_window",
+    "list_jobs",
     "payload_body",
     "pc_is_off",
     "pc_probe_interval",

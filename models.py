@@ -617,6 +617,33 @@ class MailboxMessagesResponse(BaseModel):
     outbox: list[MailboxMessageEntry] = Field(default_factory=list)
 
 
+# Home-GPU job rows (#814): the read side of the ``home_gpu_jobs`` table. The
+# answer text is never part of the API - a row exposes only the answer's hash
+# and path.
+
+
+class HomeGpuJobEntry(BaseModel):
+    job_id: str
+    kind: str
+    status: str
+    submitted_at: str
+    deadline: str
+    answered_at: str | None = None
+    model: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    seconds: float | None = None
+    input_sha256: str
+    answer_sha256: str | None = None
+    answer_path: str | None = None
+    host: str | None = None
+
+
+class HomeGpuJobsResponse(BaseModel):
+    count: int
+    jobs: list[HomeGpuJobEntry] = Field(default_factory=list)
+
+
 class ExperimentLogEntry(BaseModel):
     """One structured, defensively re-sanitized line from an experiment's
     JSONL log (``state/experiment-logs/<experiment_id>.jsonl``). Explicit
