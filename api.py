@@ -741,6 +741,7 @@ from api_routers import (
 )
 from api_routers import chat as chat_routes
 from api_routers import health as health_routes
+from api_routers import home_gpu as home_gpu_routes
 from api_routers import ideas as ideas_routes
 from api_routers import status as status_routes
 
@@ -820,6 +821,11 @@ from api_routers.experiments import (  # noqa: E402
     list_reflections,
 )
 from api_routers.health import health, secure_health  # noqa: E402
+from api_routers.home_gpu import (  # noqa: E402
+    HOME_GPU_JOBS_DEFAULT_LIMIT,
+    HOME_GPU_JOBS_MAX_LIMIT,
+    list_home_gpu_jobs,
+)
 from api_routers.ideas import create_idea, ideas  # noqa: E402
 from api_routers.logs import (  # noqa: E402
     EXPERIMENT_LOGS_DEFAULT_LIMIT,
@@ -918,3 +924,4 @@ _include_router(diagnostics.router)
 _include_router(logs.public_router)
 _include_router(maintenance.router)
 _include_router(operations.executor_router)
+_include_router(home_gpu_routes.router)

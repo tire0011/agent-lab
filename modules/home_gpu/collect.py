@@ -452,4 +452,67 @@ def collect_replies(
     return collected
 
 
-__all__ = ["MAX_ANSWER_BYTES", "MAX_SEEN_FILES", "SEEN_FILES_SETTING", "collect_replies"]
+#: Bounds for :func:`list_jobs` - the read side of ``home_gpu_jobs`` (#814):
+#: *limit* is clamped into this range, never rejected.
+LIST_MIN_LIMIT = 1
+LIST_MAX_LIMIT = 200
+LIST_DEFAULT_LIMIT = 20
+
+#: The columns :func:`list_jobs` returns, in SELECT order. The answer text is
+#: never read: only the answer's hash and path leave the database.
+_LIST_COLUMNS = (
+    "job_id, kind, status, submitted_at, deadline, answered_at, model, "
+    "prompt_tokens, completion_tokens, seconds, input_sha256, "
+    "answer_sha256, answer_path, host"
+)
+
+
+def list_jobs(db_path: Path | str, limit: int = LIST_DEFAULT_LIMIT) -> list[dict[str, Any]]:
+    """The ``home_gpu_jobs`` rows, newest first, as plain dicts (#814).
+
+    Read-only: the database is opened with ``mode=ro`` and never created, so a
+    missing database file or a missing ``home_gpu_jobs`` table both read as an
+    empty list. Only row metadata is returned - the answer itself stays in its
+    file; a row exposes just the answer's hash and path, never its text.
+    *limit* is clamped to ``LIST_MIN_LIMIT``..``LIST_MAX_LIMIT``.
+    """
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        limit = LIST_DEFAULT_LIMIT
+    limit = max(LIST_MIN_LIMIT, min(LIST_MAX_LIMIT, limit))
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return []
+    try:
+        exists = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'home_gpu_jobs'"
+        ).fetchone()[0]
+        if not exists:
+            return []
+        rows = conn.execute(
+            f"""
+            SELECT {_LIST_COLUMNS}
+            FROM home_gpu_jobs
+            ORDER BY submitted_at DESC, job_id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+    keys = [column.strip() for column in _LIST_COLUMNS.split(",")]
+    return [dict(zip(keys, row)) for row in rows]
+
+
+__all__ = [
+    "LIST_DEFAULT_LIMIT",
+    "LIST_MAX_LIMIT",
+    "LIST_MIN_LIMIT",
+    "MAX_ANSWER_BYTES",
+    "MAX_SEEN_FILES",
+    "SEEN_FILES_SETTING",
+    "collect_replies",
+    "list_jobs",
+]

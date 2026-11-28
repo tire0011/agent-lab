@@ -522,6 +522,23 @@ def _build_mount_app() -> tuple[FastAPI, Any]:
             service=nexus_api._resolve_experiment_service(),
         )
 
+    @mcp.tool(
+        description=(
+            "GET /home-gpu/jobs - home-GPU job rows, newest first, with the answer hash "
+            "and path only (never the answer text); limit is clamped to 1-200 (#814)."
+        ),
+        structured_output=True,
+    )
+    def home_gpu_jobs_list(limit: int | None = None) -> dict[str, Any]:
+        nexus_api = _api()
+        limit = nexus_api.HOME_GPU_JOBS_DEFAULT_LIMIT if limit is None else limit
+        return _call_api(
+            nexus_api.list_home_gpu_jobs,
+            x_api_key=_internal_api_key(),
+            limit=limit,
+            service=nexus_api._resolve_experiment_service(),
+        )
+
     @mcp.tool(description="GET /experiments/{experiment_id}/logs", structured_output=True)
     def experiment_logs(
         experiment_id: str,
