@@ -446,7 +446,8 @@ def _outlook(db_path: str, repo_root: str) -> None:
     try:
         from modules import outlook
 
-        line = outlook.run(db_path, repo_root, lambda title, body: _open_proposal(repo_root, title, body))
+        line = outlook.run(db_path, repo_root, lambda title, body: _open_proposal(repo_root, title, body),
+                           open_task=lambda title, body: _open_part_issue(repo_root, title, body))
     except Exception as exc:  # noqa: BLE001 - the outlook must not break a tick
         logger.warning("outlook failed: %s", exc)
         return

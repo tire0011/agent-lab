@@ -86,14 +86,15 @@ def outlook_prompt(setup: str, last_report: str | None) -> str:
         "or best for Nexus.\n\n"
         "Only read: do not install, download models, change files or run commands. Skip what the "
         "last outlook already proposed unless something changed.\n\n"
-        "Write in short plain German, Markdown: 1. Was ich gefunden habe (short, with links). "
+        "The report is for Nexus itself (its next outlook reads it). Write in short plain German, Markdown: 1. Was ich gefunden habe (short, with links). "
         "2. Hoechstens 3 Vorschlaege, each with a link, the expected gain for Nexus and how to "
         "measure it, small enough to approve or reject in one sentence. Say plainly when nothing "
         "relevant is new.\n\n"
         "End with exactly one fenced ```json block listing the same proposals, each as an issue "
         "Nexus can work on: {\"proposals\": [{\"title\": \"<short English title>\", "
-        "\"body\": \"<English: evidence with link, change, how to measure>\"}]} - an empty list "
-        "when nothing is worth doing.\n\n"
+        "\"body\": \"<English: evidence with link, change, how to measure>\", "
+        "\"needs_owner\": <true only if the owner must act himself, e.g. install something on "
+        "his own PC; otherwise false>}]} - an empty list when nothing is worth doing.\n\n"
         f"CURRENT SETUP:\n{setup}\n\n"
         + (f"LAST OUTLOOK:\n{last_report[:4000]}\n" if last_report else "")
     )
@@ -122,7 +123,8 @@ def parse_proposals(report: str) -> tuple[str, list[dict[str, str]]]:
         title = " ".join(str(item.get("title") or "").split())[:150]
         body = str(item.get("body") or "").strip()
         if title and body:
-            out.append({"title": title, "body": body[:20000]})
+            out.append({"title": title, "body": body[:20000],
+                        "needs_owner": item.get("needs_owner") is True})
     return text, out
 
 
@@ -138,8 +140,15 @@ def _run_claude(prompt: str, repo_root: str, db_path: str | None = None) -> str:
 
 
 def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
-        now: datetime | None = None, runner: Callable[[str, str], str] | None = None) -> str | None:
-    """Every 14 days one outlook, reported as an issue. A notification line, or ``None``."""
+        now: datetime | None = None, runner: Callable[[str, str], str] | None = None,
+        open_task: Callable[[str, str], object] | None = None) -> str | None:
+    """Every 14 days one outlook. A notification line, or ``None``.
+
+    Owner 2026-11-28: the outlook is for Nexus itself, not a report for the
+    owner. The report is kept only for the next outlook; each proposal becomes
+    an issue Nexus works on directly (*open_task*), and only a proposal that
+    needs the owner's own action becomes a ``proposal`` issue (*open_issue*)."""
+    open_task = open_task or open_issue
     if not enabled():
         return None
     now = now or datetime.now(timezone.utc)
@@ -165,16 +174,16 @@ def run(db_path: str, repo_root: str, open_issue: Callable[[str, str], None],
         return "Outlook failed: empty report"
     title = f"{TITLE_PREFIX} {now.date().isoformat()}"
     report, proposals = parse_proposals(report)
-    open_issue(title, report)
-    # Owner 2026-11-28: each proposal becomes its own issue, a proposal like the
-    # planner's (the owner can object; otherwise Nexus releases it after the wait).
     for proposal in proposals:
-        open_issue(f"Outlook: {proposal['title']}",
-                   f"{proposal['body']}\n\nFrom the outlook \"{title}\".")
+        body = f"{proposal['body']}\n\nFrom Nexus' outlook of {now.date().isoformat()}."
+        opener = open_issue if proposal.get("needs_owner") else open_task
+        opener(f"Outlook: {proposal['title']}", body)
     conn = _connect(db_path)
     try:
         with conn:
             _set(conn, LAST_REPORT, report[:6000], now)
     finally:
         conn.close()
-    return f"Outlook: issue \"{title}\" opened with {len(proposals)} proposal issue(s)"
+    owner = sum(1 for p in proposals if p.get("needs_owner"))
+    return (f"Outlook {now.date().isoformat()}: {len(proposals) - owner} issue(s) for Nexus, "
+            f"{owner} needing the owner")
