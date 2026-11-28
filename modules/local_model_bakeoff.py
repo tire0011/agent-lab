@@ -38,20 +38,33 @@ def choose_winner(rows: list[dict[str, Any]], current_model: str) -> dict[str, A
     return {"winner": winner, "recommend_switch": recommend, "current": current}
 
 
-def insert_bakeoff_row(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
+#: Hosts a bake-off row can come from (#857); VM and home-PC numbers never mix.
+HOSTS = ("vm", "home-gpu")
+
+
+def insert_bakeoff_row(conn: sqlite3.Connection, row: dict[str, Any], *, commit: bool = True) -> int:
+    """Insert one bake-off row; ``host`` defaults to ``'vm'``.
+
+    With ``commit=False`` the caller commits, so several rows (and the
+    bookkeeping that belongs to them) land in one transaction.
+    """
+    host = row.get("host") or "vm"
+    if host not in HOSTS:
+        raise ValueError(f"unknown bake-off host {host!r}; expected one of {', '.join(HOSTS)}")
     columns = (
         "run_id", "created_at", "model", "is_current", "status",
         "prompt_tokens_per_second", "output_tokens_per_second", "hunks_total",
         "hunks_applied", "hunks_compiled", "passing_hunks", "local_too_slow",
         "seconds", "passing_hunks_per_hour", "winner", "recommend_switch",
-        "details_json", "error",
+        "details_json", "error", "host",
     )
-    values = [row.get(c) for c in columns]
+    values = [row.get(c) if c != "host" else host for c in columns]
     cur = conn.execute(
         f"INSERT INTO local_model_bakeoffs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
         values,
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return int(cur.lastrowid)
 
 
@@ -73,6 +86,10 @@ def list_bakeoffs(limit: int = 50, *, db_path: str = DEFAULT_DB_PATH) -> list[di
         row = dict(stored)
         for key in ("is_current", "winner", "recommend_switch"):
             row[key] = bool(row[key])
+        # #857: the host column ('vm'/'home-gpu') separates VM rows from
+        # home-GPU rows so the two hosts' numbers are never mixed.
+        if not row.get("host"):
+            row["host"] = "vm"
         try:
             row["details"] = json.loads(row.pop("details_json")) if row.get("details_json") else None
         except (TypeError, ValueError):

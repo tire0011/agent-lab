@@ -720,17 +720,74 @@ def _summary(conn: sqlite3.Connection, experiment_id: str, variant: str, ran: in
 
 # ---- one unit ----------------------------------------------------------------
 
-def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str, title: str,
-                summary: str, client: Any, worker_factory: Callable[[Any], Any],
-                tests: list[str], test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
-                baseline: dict[str, lsr.MergedTestRun]) -> UnitOutcome:
-    outcome = UnitOutcome()
-    timeout = unit_timeout_seconds()
-    tests_timeout = lsr.tests_timeout_seconds()
+def check_unit_text(worktree: str, unit: HunkUnit, local_text: str, *, start_text: str,
+                    outcome: UnitOutcome, notes: list[str], tests: list[str],
+                    test_runner: Callable[[str, list[str], float], lsr.MergedTestRun]) -> UnitOutcome:
+    """Score a model-produced *local_text* for *unit* - the checker both hosts use.
 
+    *start_text* is the file the producer started from: for the VM replay the
+    text :func:`worker_start_text` wrote into the worktree (for a symbol unit
+    in a file over 16 KiB that is the **reduced** text - imports plus the
+    enclosing symbol - not ``unit.start_text``), for the home-GPU bake-off
+    (#857) the exact text that was sent to the PC. "Did the producer change
+    anything" is always judged against it, so an untouched reduced file is
+    never counted as applied.
+
+    This is the checking half of :func:`_score_unit`, unchanged: back to the
+    merged commit, splice this unit's code out of *local_text* into the merged
+    file (a file that does not parse, or that lost the symbol, is a failed
+    unit - never the merged text), then ``py_compile`` and the merged tests
+    that touch the module. The caller has set ``outcome.has_tests`` (merged
+    baseline) and may already hold *notes*; the outcome is filled in place,
+    its ``error`` is the joined *notes* and it is returned.
+    """
+    tests_timeout = lsr.tests_timeout_seconds()
+    # Back to merged: edits to other files are dropped, every other hunk returns.
+    reset_to_merged(worktree)
+    merged_changes = _change_set(unit.start_text, unit.merged_text)
+    try:
+        scored = splice_unit(unit, local_text)
+    except SpliceError as exc:
+        outcome.applied = local_text != start_text
+        outcome.overlap = changed_line_overlap(merged_changes, _change_set(start_text, local_text))
+        notes.insert(0, str(exc))
+        outcome.error = "; ".join(notes)
+        return outcome
+    if unit.is_module:
+        region_changed = scored != unit.start_text
+    else:
+        region_changed = _symbol_text(local_text, unit.symbol) != _symbol_text(start_text, unit.symbol)
+    outcome.applied = local_text != start_text and region_changed
+    outcome.overlap = changed_line_overlap(merged_changes, _change_set(unit.start_text, scored))
+    if outcome.applied:
+        _write_text(worktree, unit.file, scored)
+        outcome.compiled = lsr._compiles(worktree, [unit.file])
+        if outcome.compiled and outcome.has_tests:
+            run = test_runner(worktree, tests, tests_timeout)
+            outcome.tests_total, outcome.tests_ok = int(run.total), int(run.passed)
+            outcome.tests_passed = _all_passed(run)
+            if run.error:
+                notes.append(run.error)
+        elif not outcome.compiled:
+            notes.append("the spliced file does not compile")
+    else:
+        notes.append("the local patch did not change this unit")
+    outcome.error = "; ".join(notes) if notes else None
+    return outcome
+
+
+def _baseline_notes(worktree: str, unit: HunkUnit, *, tests: list[str],
+                    test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
+                    baseline: dict[str, lsr.MergedTestRun],
+                    outcome: UnitOutcome) -> list[str]:
+    """Run (or reuse) the merged-tree baseline for *unit*; set ``has_tests``.
+
+    Returns the notes list, starting with the ``not tested`` reason when the
+    merged tests do not pass on the merged tree.
+    """
     reset_to_merged(worktree)
     if unit.file not in baseline:
-        baseline[unit.file] = (test_runner(worktree, tests, tests_timeout) if tests
+        baseline[unit.file] = (test_runner(worktree, tests, lsr.tests_timeout_seconds()) if tests
                                else lsr.MergedTestRun(0, 0, "no merged tests touch this module"))
     base_run = baseline[unit.file]
     outcome.has_tests = _all_passed(base_run)
@@ -738,6 +795,35 @@ def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str,
     if not outcome.has_tests:
         notes.append("not tested: " + (base_run.error or
                                        f"merged tests fail on the merged tree ({base_run.passed}/{base_run.total})"))
+    return notes
+
+
+def score_unit_text(worktree: str, unit: HunkUnit, local_text: str, *, start_text: str,
+                    tests: list[str],
+                    test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
+                    baseline: dict[str, lsr.MergedTestRun] | None = None) -> UnitOutcome:
+    """Score an already produced *local_text* exactly like the VM replay does.
+
+    The same baseline step as :func:`_score_unit` followed by
+    :func:`check_unit_text`; used for text that was produced elsewhere (the
+    home-GPU bake-off ``--collect``, #857). *start_text* is the file the
+    producer was given.
+    """
+    outcome = UnitOutcome(status=UNIT_SCORED)
+    notes = _baseline_notes(worktree, unit, tests=tests, test_runner=test_runner,
+                            baseline={} if baseline is None else baseline, outcome=outcome)
+    return check_unit_text(worktree, unit, local_text, start_text=start_text, outcome=outcome,
+                           notes=notes, tests=tests, test_runner=test_runner)
+
+
+def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str, title: str,
+                summary: str, client: Any, worker_factory: Callable[[Any], Any],
+                tests: list[str], test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
+                baseline: dict[str, lsr.MergedTestRun]) -> UnitOutcome:
+    outcome = UnitOutcome()
+    timeout = unit_timeout_seconds()
+    notes = _baseline_notes(worktree, unit, tests=tests, test_runner=test_runner,
+                            baseline=baseline, outcome=outcome)
 
     # The model's view: merged tree, merged tests undone, this unit's hunks reverted.
     hide_merged_tests(repo, worktree, old, new)
@@ -777,38 +863,10 @@ def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str,
         notes.insert(0, worker_error)
 
     local_text = _read_text(worktree, unit.file)
-    # Back to merged: edits to other files are dropped, every other hunk returns.
-    reset_to_merged(worktree)
-    merged_changes = _change_set(unit.start_text, unit.merged_text)
-    try:
-        scored = splice_unit(unit, local_text)
-    except SpliceError as exc:
-        outcome.applied = local_text != start_text
-        outcome.overlap = changed_line_overlap(merged_changes, _change_set(start_text, local_text))
-        notes.insert(0, str(exc))
-        outcome.error = "; ".join(notes)
-        return outcome
-    if unit.is_module:
-        region_changed = scored != unit.start_text
-    else:
-        region_changed = _symbol_text(local_text, unit.symbol) != _symbol_text(start_text, unit.symbol)
-    outcome.applied = local_text != start_text and region_changed
-    outcome.overlap = changed_line_overlap(merged_changes, _change_set(unit.start_text, scored))
-    if outcome.applied:
-        _write_text(worktree, unit.file, scored)
-        outcome.compiled = lsr._compiles(worktree, [unit.file])
-        if outcome.compiled and outcome.has_tests:
-            run = test_runner(worktree, tests, tests_timeout)
-            outcome.tests_total, outcome.tests_ok = int(run.total), int(run.passed)
-            outcome.tests_passed = _all_passed(run)
-            if run.error:
-                notes.append(run.error)
-        elif not outcome.compiled:
-            notes.append("the spliced file does not compile")
-    else:
-        notes.append("the local patch did not change this unit")
-    outcome.error = "; ".join(notes) if notes else None
-    return outcome
+    # The checker the home-GPU bake-off shares (#857), judged against the
+    # text this worker was given - the reduced one for a large file.
+    return check_unit_text(worktree, unit, local_text, start_text=start_text, outcome=outcome,
+                           notes=notes, tests=tests, test_runner=test_runner)
 
 
 # ---- the replay --------------------------------------------------------------
