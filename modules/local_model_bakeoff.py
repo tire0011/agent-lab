@@ -44,9 +44,10 @@ def insert_bakeoff_row(conn: sqlite3.Connection, row: dict[str, Any]) -> int:
         "prompt_tokens_per_second", "output_tokens_per_second", "hunks_total",
         "hunks_applied", "hunks_compiled", "passing_hunks", "local_too_slow",
         "seconds", "passing_hunks_per_hour", "winner", "recommend_switch",
-        "details_json", "error",
+        "details_json", "error", "host",
     )
-    values = [row.get(c) for c in columns]
+    # #857: rows written before the host column existed are VM rows.
+    values = [row.get(c) if c != "host" else (row.get("host") or "vm") for c in columns]
     cur = conn.execute(
         f"INSERT INTO local_model_bakeoffs ({','.join(columns)}) VALUES ({','.join('?' for _ in columns)})",
         values,
@@ -73,6 +74,10 @@ def list_bakeoffs(limit: int = 50, *, db_path: str = DEFAULT_DB_PATH) -> list[di
         row = dict(stored)
         for key in ("is_current", "winner", "recommend_switch"):
             row[key] = bool(row[key])
+        # #857: the host column ('vm'/'home-gpu') separates VM rows from
+        # home-GPU rows so the two hosts' numbers are never mixed.
+        if not row.get("host"):
+            row["host"] = "vm"
         try:
             row["details"] = json.loads(row.pop("details_json")) if row.get("details_json") else None
         except (TypeError, ValueError):

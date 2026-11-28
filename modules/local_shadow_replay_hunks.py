@@ -720,6 +720,75 @@ def _summary(conn: sqlite3.Connection, experiment_id: str, variant: str, ran: in
 
 # ---- one unit ----------------------------------------------------------------
 
+def check_unit_text(worktree: str, unit: HunkUnit, local_text: str, *,
+                    tests: list[str],
+                    test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
+                    baseline: dict[str, lsr.MergedTestRun],
+                    notes: list[str]) -> UnitOutcome:
+    """Score a model-produced *local_text* for *unit* - the one checker both hosts use.
+
+    This is exactly the checking half of :func:`_score_unit`: back to the merged
+    commit, baseline the merged tests (``has_tests``), splice this unit's symbol
+    out of *local_text* into the merged file (a file that does not parse, or that
+    lost the symbol, is a failed unit - never the merged text), then
+    ``py_compile`` and the merged tests that touch the module. The VM replay
+    calls it on its worker's resulting file; the home-GPU bake-off ``--collect``
+    path (#857) calls it on the PC's answer text, so a case is scored
+    identically no matter which host produced the text.
+
+    *baseline* caches each file's merged-tree test run (shared across units when
+    the caller passes one dict in); when this function fills it itself it also
+    appends the ``not tested`` note. *notes* collects the reasons in the order
+    the VM replay records them and the returned outcome carries them as
+    ``error``. The outcome's ``status`` is always ``scored``; the caller owns
+    timeout/worker statuses.
+    """
+    outcome = UnitOutcome(status=UNIT_SCORED)
+    tests_timeout = lsr.tests_timeout_seconds()
+    # Back to merged: edits to other files are dropped, every other hunk returns.
+    reset_to_merged(worktree)
+    if unit.file not in baseline:
+        baseline[unit.file] = (test_runner(worktree, tests, tests_timeout) if tests
+                               else lsr.MergedTestRun(0, 0, "no merged tests touch this module"))
+        if not _all_passed(baseline[unit.file]):
+            notes.append("not tested: " + (baseline[unit.file].error or
+                                           f"merged tests fail on the merged tree "
+                                           f"({baseline[unit.file].passed}/{baseline[unit.file].total})"))
+    outcome.has_tests = _all_passed(baseline[unit.file])
+    reset_to_merged(worktree)
+    merged_changes = _change_set(unit.start_text, unit.merged_text)
+    try:
+        scored = splice_unit(unit, local_text)
+    except SpliceError as exc:
+        outcome.applied = local_text != unit.start_text
+        outcome.overlap = changed_line_overlap(merged_changes, _change_set(unit.start_text, local_text))
+        notes.insert(0, str(exc))
+        outcome.error = "; ".join(notes)
+        return outcome
+    if unit.is_module:
+        region_changed = scored != unit.start_text
+    else:
+        region_changed = (_symbol_text(local_text, unit.symbol)
+                          != _symbol_text(unit.start_text, unit.symbol))
+    outcome.applied = local_text != unit.start_text and region_changed
+    outcome.overlap = changed_line_overlap(merged_changes, _change_set(unit.start_text, scored))
+    if outcome.applied:
+        _write_text(worktree, unit.file, scored)
+        outcome.compiled = lsr._compiles(worktree, [unit.file])
+        if outcome.compiled and outcome.has_tests:
+            run = test_runner(worktree, tests, tests_timeout)
+            outcome.tests_total, outcome.tests_ok = int(run.total), int(run.passed)
+            outcome.tests_passed = _all_passed(run)
+            if run.error:
+                notes.append(run.error)
+        elif not outcome.compiled:
+            notes.append("the spliced file does not compile")
+    else:
+        notes.append("the local patch did not change this unit")
+    outcome.error = "; ".join(notes) if notes else None
+    return outcome
+
+
 def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str, title: str,
                 summary: str, client: Any, worker_factory: Callable[[Any], Any],
                 tests: list[str], test_runner: Callable[[str, list[str], float], lsr.MergedTestRun],
@@ -777,37 +846,18 @@ def _score_unit(repo: str, worktree: str, unit: HunkUnit, *, old: str, new: str,
         notes.insert(0, worker_error)
 
     local_text = _read_text(worktree, unit.file)
-    # Back to merged: edits to other files are dropped, every other hunk returns.
-    reset_to_merged(worktree)
-    merged_changes = _change_set(unit.start_text, unit.merged_text)
-    try:
-        scored = splice_unit(unit, local_text)
-    except SpliceError as exc:
-        outcome.applied = local_text != start_text
-        outcome.overlap = changed_line_overlap(merged_changes, _change_set(start_text, local_text))
-        notes.insert(0, str(exc))
-        outcome.error = "; ".join(notes)
-        return outcome
-    if unit.is_module:
-        region_changed = scored != unit.start_text
-    else:
-        region_changed = _symbol_text(local_text, unit.symbol) != _symbol_text(start_text, unit.symbol)
-    outcome.applied = local_text != start_text and region_changed
-    outcome.overlap = changed_line_overlap(merged_changes, _change_set(unit.start_text, scored))
-    if outcome.applied:
-        _write_text(worktree, unit.file, scored)
-        outcome.compiled = lsr._compiles(worktree, [unit.file])
-        if outcome.compiled and outcome.has_tests:
-            run = test_runner(worktree, tests, tests_timeout)
-            outcome.tests_total, outcome.tests_ok = int(run.total), int(run.passed)
-            outcome.tests_passed = _all_passed(run)
-            if run.error:
-                notes.append(run.error)
-        elif not outcome.compiled:
-            notes.append("the spliced file does not compile")
-    else:
-        notes.append("the local patch did not change this unit")
-    outcome.error = "; ".join(notes) if notes else None
+    # The shared checker (#857): the home-GPU collect path runs the very same
+    # function on a PC answer, so both hosts score a case identically.
+    checked = check_unit_text(worktree, unit, local_text, tests=tests,
+                              test_runner=test_runner, baseline=baseline, notes=notes)
+    outcome.applied = checked.applied
+    outcome.compiled = checked.compiled
+    outcome.has_tests = checked.has_tests
+    outcome.tests_passed = checked.tests_passed
+    outcome.tests_total = checked.tests_total
+    outcome.tests_ok = checked.tests_ok
+    outcome.overlap = checked.overlap
+    outcome.error = checked.error
     return outcome
 
 

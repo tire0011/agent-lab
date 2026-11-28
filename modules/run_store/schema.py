@@ -322,7 +322,8 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
             winner INTEGER NOT NULL DEFAULT 0 CHECK (winner IN (0, 1)),
             recommend_switch INTEGER NOT NULL DEFAULT 0 CHECK (recommend_switch IN (0, 1)),
             details_json TEXT NULL,
-            error TEXT NULL
+            error TEXT NULL,
+            host TEXT NOT NULL DEFAULT 'vm'
         );
 
         CREATE INDEX IF NOT EXISTS idx_local_model_bakeoffs_created
@@ -387,6 +388,7 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     _migrate_router_tables(conn)
     _migrate_benchmark_runs(conn)
     _migrate_local_replays(conn)
+    _migrate_local_model_bakeoffs_columns(conn)
     _migrate_known_drift_tests(conn)
     _migrate_experiment_lessons(conn)
     conn.commit()
@@ -1288,3 +1290,16 @@ def _widen_local_replays_status_check(conn: sqlite3.Connection) -> None:
     except BaseException:
         conn.execute("ROLLBACK")
         raise
+
+
+def _migrate_local_model_bakeoffs_columns(conn: sqlite3.Connection) -> None:
+    """#857: ``host`` on ``local_model_bakeoffs`` ('vm' or 'home-gpu').
+
+    ``CREATE TABLE IF NOT EXISTS`` never adds columns, so a database created
+    before #857 gets the column via ``ALTER TABLE`` with the same default the
+    fresh schema carries; existing rows read as ``'vm'``. Idempotent: the
+    ``PRAGMA table_info`` probe skips the ALTER when the column is present.
+    """
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(local_model_bakeoffs)")}
+    if "host" not in existing:
+        conn.execute("ALTER TABLE local_model_bakeoffs ADD COLUMN host TEXT NOT NULL DEFAULT 'vm'")
