@@ -42,14 +42,16 @@ when ``NEXUS_HOME_GPU=1`` (``modules.home_gpu.jobs.home_gpu_enabled``).
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
 import math
 import re
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 from modules.mailbox import core as mailbox_core
 
@@ -142,23 +144,30 @@ def _ensure_schema(db: sqlite3.Connection) -> None:
         db.execute(statement)
 
 
+_SAVEPOINT_SEQ = itertools.count(1)
+
+
 @contextmanager
-def _tx(db: sqlite3.Connection) -> Iterator[None]:
+def _tx(db: sqlite3.Connection, name: str | None = None) -> Iterator[None]:
     """One unit of database work that never commits a caller's transaction.
 
     A SAVEPOINT is used instead of ``with db:``: with no transaction open the
     RELEASE commits exactly this unit; with a caller's transaction already
     open the savepoint nests inside it, so RELEASE / ROLLBACK TO touch only
-    this unit and the caller's transaction stays open and uncommitted.
+    this unit and the caller's transaction stays open and uncommitted. The
+    savepoint name is unique per call, so units that nest (the fallback
+    wrapper runs inside its own savepoint) each roll back exactly their own
+    work.
     """
-    db.execute("SAVEPOINT home_gpu_collect")
+    point = name or f"home_gpu_{next(_SAVEPOINT_SEQ)}"
+    db.execute(f"SAVEPOINT {point}")
     try:
         yield
     except BaseException:
-        db.execute("ROLLBACK TO home_gpu_collect")
-        db.execute("RELEASE home_gpu_collect")
+        db.execute(f"ROLLBACK TO {point}")
+        db.execute(f"RELEASE {point}")
         raise
-    db.execute("RELEASE home_gpu_collect")
+    db.execute(f"RELEASE {point}")
 
 
 def _load_seen(db: sqlite3.Connection) -> list[str]:
@@ -247,6 +256,20 @@ def _reconcile_orphan(
         )
 
 
+def _parse_iso(value: Any) -> datetime | None:
+    """Parse an ISO-8601 timestamp (``Z`` or offset); ``None`` when unparseable."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+
+
 def _metrics(meta: dict[str, str]) -> tuple[int, int, float]:
     """Parse and validate ``prompt_tokens`` / ``completion_tokens`` / ``seconds``."""
     try:
@@ -331,13 +354,31 @@ def collect_replies(
             continue
 
         row = db.execute(
-            "SELECT status FROM home_gpu_jobs WHERE job_id = ?", (job_id,)
+            "SELECT status, deadline FROM home_gpu_jobs WHERE job_id = ?", (job_id,)
         ).fetchone()
         if row is None:
             _ignore(db, seen, seen_set, path.name, "unknown job", job_id)
             continue
         if row[0] != "queued":
             _ignore(db, seen, seen_set, path.name, "job already answered", job_id)
+            continue
+        # A reply for a job whose deadline has passed is never claimed: the row
+        # becomes ``expired`` here (the poll also expires it, this covers a
+        # reply that lands in the same window) and the reply is ignored.
+        deadline = _parse_iso(row[1])
+        if deadline is not None and deadline <= datetime.now(timezone.utc):
+            with _tx(db):
+                db.execute(
+                    "UPDATE home_gpu_jobs SET status = 'expired' "
+                    "WHERE job_id = ? AND status = 'queued'",
+                    (job_id,),
+                )
+            _ignore(db, seen, seen_set, path.name, "deadline passed", job_id)
+            logger.info(
+                "Expired home-GPU job at reply collection job_id=%s deadline=%s",
+                job_id,
+                row[1],
+            )
             continue
 
         digest = hashlib.sha256(answer_bytes).hexdigest()

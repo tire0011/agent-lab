@@ -22,6 +22,9 @@ class StatusResponse(BaseModel):
     agent_status: str
     api_version: str
     components: list[str]
+    # Home-GPU block (#761): enabled flag, PC-off state, VM night window and
+    # the savings summary. Never contains paths or credentials.
+    home_gpu: dict[str, Any] | None = None
 
 
 class Problem(BaseModel):

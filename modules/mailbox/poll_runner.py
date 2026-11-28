@@ -475,7 +475,19 @@ def run_mailbox_poll_once(
                 # with the flag off the outbox is never read here (#813).
                 if home_gpu_enabled():
                     from modules.home_gpu.collect import collect_replies
+                    from modules.home_gpu.fallback import expire_jobs
 
+                    # Deadline expiry runs on every poll, not only when a new
+                    # job is submitted, so a final queued job cannot stay
+                    # queued indefinitely (#761).
+                    try:
+                        expire_jobs(processor.conn)
+                    except Exception as exc:  # noqa: BLE001 - retry at the next poll
+                        logger.warning(
+                            "Home-GPU job expiry failed run=%s type=%s",
+                            run_name,
+                            type(exc).__name__,
+                        )
                     try:
                         collect_replies(
                             mailbox_config.mailbox_repo_path,

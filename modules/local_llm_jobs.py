@@ -36,6 +36,10 @@ ROLE_LOCAL_WORKER = "local_worker"
 ROLE_TOOL_ROUTER = "tool_router"
 ROLE_EXPERIMENT_REFLECTION = "experiment_reflection"
 ROLE_EXPERIMENT_LESSON = "experiment_lesson"
+# Home-GPU fallback jobs (#761): queued on this path when the home PC is off;
+# unlike the other roles they are only claimed inside the VM night window
+# (NEXUS_HOME_GPU_VM_HOURS, default 0-6 UTC - see modules.home_gpu.fallback).
+ROLE_HOME_GPU = "home_gpu"
 
 # Error classification (#167). A job's failure reason is part of the shared
 # observability contract: callers should be able to tell a wedged worker from
@@ -48,6 +52,10 @@ ERROR_KIND_CANCELLED = "cancelled"
 ERROR_KIND_INTERRUPTED = "interrupted"
 ERROR_KIND_STUCK = "stuck"
 ERROR_KIND_UNKNOWN = "unknown"
+# A home-GPU fallback job whose night window closed while it was executing
+# (#761): the closing boundary is enforced during execution, not only at
+# admission.
+ERROR_KIND_WINDOW_CLOSED = "window_closed"
 
 # The watchdog: one hard deadline for a whole local model call (#236), so a
 # hung call fails in bounded time and its caller can move on - the controller
@@ -95,6 +103,100 @@ _DIAG_TIMEOUT_SECONDS = 3
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _home_gpu_vm_window_active() -> bool:
+    """Whether the VM night window for home-GPU fallback jobs is open now.
+
+    Lazily imported from :mod:`modules.home_gpu.fallback` (which imports this
+    module lazily in turn, so neither import cycle bites at import time).
+    Fails CLOSED - False - for the fallback role: a broken window check must
+    never let a home-GPU row run outside the night window. Ordinary roles are
+    not gated on this at all, so they are never blocked by it either.
+    """
+    try:
+        from modules.home_gpu.fallback import in_vm_window
+
+        return in_vm_window(datetime.now(timezone.utc))
+    except Exception:  # noqa: BLE001 - fail closed for the home_gpu role only
+        _LOGGER.warning(
+            "home-GPU VM window check failed; treating the night window as closed",
+            exc_info=True,
+        )
+        return False
+
+
+def home_gpu_claimable_now() -> bool:
+    """True when home-GPU fallback rows may be claimed right now.
+
+    Shared by the claim gate below and by the idle check in
+    :func:`modules.local_shadow_replay.server_state`, so both always agree on
+    which fallback rows are live. Fails closed.
+    """
+    return _home_gpu_vm_window_active()
+
+
+def _claimable_sql() -> str:
+    """WHERE fragment for jobs this worker may claim right now.
+
+    Everything queued except home-GPU fallback rows outside their night
+    window (#761).
+    """
+    return (
+        "status = ? AND (role IS NULL OR role != ? OR ?)"
+    )
+
+
+def _claimable_params(window_open: bool) -> tuple[Any, ...]:
+    return (STATUS_QUEUED, ROLE_HOME_GPU, 1 if window_open else 0)
+
+
+def busy_local_job_where(exclude_job_id: str | None = None) -> tuple[str, tuple[Any, ...]]:
+    """WHERE fragment + params counting the ``local_llm_jobs`` rows that make
+    llama-server busy right now.
+
+    home-GPU fallback rows count only while their night window is open - i.e.
+    while they are actually claimable. A parked fallback row outside the
+    window uses no inference slot and must not suppress ordinary shadow
+    replays during the day (#761). *exclude_job_id* additionally spares one
+    row (the fallback job currently being considered) from the count.
+    """
+    sql = "status IN ('queued', 'running') AND (role IS NULL OR role != ? OR ?)"
+    params: list[Any] = [ROLE_HOME_GPU, 1 if home_gpu_claimable_now() else 0]
+    if exclude_job_id is not None:
+        sql += " AND id != ?"
+        params.append(exclude_job_id)
+    return sql, tuple(params)
+
+
+def _home_gpu_run_timeout(
+    role: str, watchdog: float, now: datetime | None = None
+) -> tuple[float, bool]:
+    """``(execution timeout, window_limited)`` for a claimed job.
+
+    A home-GPU fallback row is additionally bounded by the closing boundary of
+    the night window, so a job admitted just before the window ends cannot run
+    into the day. Anything failing to compute the window fails closed: the job
+    is not run (timeout 0) rather than allowed to run unbounded.
+    """
+    if (role or ROLE_CONTROLLER) != ROLE_HOME_GPU:
+        return watchdog, False
+    moment = now or datetime.now(timezone.utc)
+    try:
+        from modules.home_gpu.fallback import vm_window_end
+
+        end = vm_window_end(moment)
+    except Exception:  # noqa: BLE001 - fail closed for the fallback role
+        _LOGGER.warning(
+            "home-GPU window end unknown; refusing to run the fallback job", exc_info=True
+        )
+        return 0.0, True
+    if end is None:
+        return 0.0, True
+    remaining = (end - moment).total_seconds()
+    if remaining <= 0:
+        return 0.0, True
+    return min(watchdog, remaining), remaining < watchdog
 
 
 def local_llm_watchdog_seconds() -> float:
@@ -616,28 +718,71 @@ class LocalLlmJobService:
             _LOGGER.warning("local_llm lease reclaim failed: %s", exc)
             return 0
 
+    def _pick_claimable(self, params: tuple[Any, ...], *, skip_home_gpu: bool = False) -> sqlite3.Row | None:
+        """The oldest claimable queued row (optionally without home-GPU rows)."""
+        claimable = _claimable_sql()
+        sql = f"SELECT id, role FROM local_llm_jobs WHERE {claimable}"
+        if skip_home_gpu:
+            sql += " AND (role IS NULL OR role != ?)"
+            params = (*params, ROLE_HOME_GPU)
+        sql += " ORDER BY created_at, rowid LIMIT 1"
+        with self._lock:
+            return self._conn.execute(sql, params).fetchone()
+
     def _claim_next_job(self) -> str | None:
         """Claim the single inference slot for the oldest queued job, if free.
 
         One IMMEDIATE transaction does the whole decision - release dead
-        claims, check that nobody live is running, take the oldest queued job
-        - so two workers in two processes cannot both conclude the slot is
-        theirs. Returns the claimed job id, or None when there is nothing to
-        run or another worker holds the slot.
+        claims, check that nobody live is running, take the chosen job - so
+        two workers in two processes cannot both conclude the slot is theirs.
+        Returns the claimed job id, or None when there is nothing to run or
+        another worker holds the slot.
+
+        Home-GPU fallback jobs (role ``home_gpu``, #761) are skipped outside
+        the VM night window (the gate fails closed): they stay queued until
+        the window opens. Inside the window the shared idle check from
+        :func:`modules.local_shadow_replay.server_state` is reused - with the
+        candidate row itself excluded - so a fallback job only starts when the
+        VM has no other local work; otherwise ordinary queued work is claimed
+        instead and the fallback row waits.
         """
-        # An idle worker polls for work another process queued. Checking that
-        # first keeps the common "nothing to do" tick a single read instead of
-        # a write transaction every process fights over.
+        # One window decision for every read below; fail closed (see
+        # _home_gpu_vm_window_active).
+        window_open = _home_gpu_vm_window_active()
+        params = _claimable_params(window_open)
         try:
-            with self._lock:
-                pending = self._conn.execute(
-                    "SELECT 1 FROM local_llm_jobs WHERE status = ? LIMIT 1", (STATUS_QUEUED,)
-                ).fetchone()
+            row = self._pick_claimable(params)
         except sqlite3.Error as exc:
             _LOGGER.warning("local_llm claim could not look for queued work: %s", exc)
             return None
-        if pending is None:
+        if row is None:
             return None
+        job_id = str(row["id"])
+        role = str(row["role"] or ROLE_CONTROLLER)
+        if role == ROLE_HOME_GPU:
+            # Reuse the existing idle check, sparing the candidate itself, so
+            # the single-worker claim does not race the other llama-server
+            # users (active local experiments, active replays, busy slots).
+            try:
+                from modules.local_shadow_replay import server_state
+
+                idle, reason = server_state(self.llama, self.db_path, exclude_job_id=job_id)
+            except Exception as exc:  # noqa: BLE001 - fail closed for the fallback role
+                _LOGGER.warning(
+                    "local_llm home-GPU idle check failed job_id=%s; leaving it queued: %s: %s",
+                    job_id, type(exc).__name__, exc,
+                )
+                idle, reason = False, f"idle check failed: {type(exc).__name__}"
+            if not idle:
+                _LOGGER.info("local_llm home-GPU job waits job_id=%s reason=%s", job_id, reason)
+                try:
+                    row = self._pick_claimable(params, skip_home_gpu=True)
+                except sqlite3.Error as exc:
+                    _LOGGER.warning("local_llm claim could not look for queued work: %s", exc)
+                    return None
+                if row is None:
+                    return None
+                job_id = str(row["id"])
         with self._lock:
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -668,15 +813,16 @@ class LocalLlmJobService:
                 if busy is not None:
                     self._conn.execute("COMMIT")
                     return None
+                # Re-verify the chosen row is still queued and claimable; another
+                # worker may have taken or altered it between the pick and here.
+                claimable = _claimable_sql()
                 row = self._conn.execute(
-                    "SELECT id FROM local_llm_jobs WHERE status = ? "
-                    "ORDER BY created_at, rowid LIMIT 1",
-                    (STATUS_QUEUED,),
+                    f"SELECT id FROM local_llm_jobs WHERE id = ? AND {claimable}",
+                    (job_id, *params),
                 ).fetchone()
                 if row is None:
                     self._conn.execute("COMMIT")
                     return None
-                job_id = str(row["id"])
                 claimed = self._conn.execute(
                     "UPDATE local_llm_jobs SET status = ?, started_at = ?, worker_id = ?, "
                     "lease_expires_at = ? WHERE id = ? AND status = ?",
@@ -702,6 +848,24 @@ class LocalLlmJobService:
                 "local_llm released %s claim(s) whose worker stopped heartbeating", released
             )
         return job_id if claimed else None
+
+    def _requeue_claimed_job(self, job_id: str) -> None:
+        """Return a claimed job to the queue.
+
+        Used when a home-GPU fallback job's night window closed between claim
+        and execution start: the job is not lost, it waits for the next window.
+        """
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "UPDATE local_llm_jobs SET status = ?, started_at = NULL, worker_id = NULL, "
+                    "lease_expires_at = NULL WHERE id = ? AND status = ? AND worker_id = ?",
+                    (STATUS_QUEUED, job_id, STATUS_RUNNING, self.worker_id),
+                )
+                self._conn.commit()
+            _LOGGER.info("local_llm job re-queued job_id=%s reason=night window closed", job_id)
+        except sqlite3.Error as exc:
+            _LOGGER.warning("local_llm requeue failed job_id=%s reason=%s", job_id, exc)
 
     def _refresh_lease(self, job_id: str) -> bool:
         """Restate this worker's claim. False once the claim is no longer ours."""
@@ -780,18 +944,27 @@ class LocalLlmJobService:
             separators=(",", ":"),
         )
 
-    async def _within_watchdog(self, completion: Coroutine[Any, Any, str]) -> str:
-        """Await one model call, abandoning it at the watchdog deadline (#236).
+    async def _within_watchdog(
+        self, completion: Coroutine[Any, Any, str], timeout: float | None = None
+    ) -> str:
+        """Await one model call, abandoning it at the deadline (#236).
 
         The HTTP client's timeout alone cannot promise this: it limits each
         read, so a server that keeps trickling bytes would never trip it. On
-        expiry the request is cancelled, which closes its connection.
+        expiry the request is cancelled, which closes its connection. *timeout*
+        defaults to the watchdog; home-GPU fallback jobs pass the smaller of
+        the watchdog and the time left in the night window (#761).
         """
+        limit = self.watchdog_seconds if timeout is None else float(timeout)
         try:
-            return await asyncio.wait_for(completion, timeout=self.watchdog_seconds)
+            return await asyncio.wait_for(completion, timeout=limit)
         except asyncio.TimeoutError as exc:
+            if timeout is None:
+                raise TimeoutError(
+                    f"local model call exceeded the {limit:.0f}s watchdog"
+                ) from exc
             raise TimeoutError(
-                f"local model call exceeded the {self.watchdog_seconds:.0f}s watchdog"
+                f"local model call exceeded the {limit:.0f}s deadline"
             ) from exc
 
     def _run(self, job_id: str) -> None:
@@ -810,6 +983,19 @@ class LocalLlmJobService:
         if row is None or row["status"] != STATUS_RUNNING or row["worker_id"] != self.worker_id:
             _LOGGER.warning("local_llm job no longer claimed by this worker job_id=%s", job_id)
             return
+        # Closing boundary of the night window, enforced during execution: a
+        # home-GPU fallback job claimed just before the window ends is bounded
+        # by it (and re-queued outright when the window already closed between
+        # claim and run), so it cannot run into the day (#761).
+        run_timeout, window_limited = _home_gpu_run_timeout(
+            str(row["role"] or ROLE_CONTROLLER), self.watchdog_seconds
+        )
+        if window_limited and run_timeout <= 0:
+            self._requeue_claimed_job(job_id)
+            return
+        # Only a window-limited call gets an explicit deadline; everything else
+        # keeps the plain watchdog (and its message).
+        call_timeout = run_timeout if window_limited else None
         session_id = row["session_id"]
         max_tokens = int(row["max_tokens"])
         prompt_chars = len(str(row["prompt"]))
@@ -841,7 +1027,7 @@ class LocalLlmJobService:
                 completion_options["system"] = str(row["system"])
             if row["top_logprobs"]:
                 result = asyncio.run(
-                    self._within_watchdog(self._logprob_completion(row, max_tokens))
+                    self._within_watchdog(self._logprob_completion(row, max_tokens), call_timeout)
                 )
             else:
                 result = asyncio.run(
@@ -851,13 +1037,21 @@ class LocalLlmJobService:
                             temperature=float(row["temperature"]),
                             max_tokens=max_tokens,
                             **completion_options,
-                        )
+                        ),
+                        call_timeout,
                     )
                 )
         except Exception as exc:  # noqa: BLE001
             lease.stop()
             duration = time.perf_counter() - started
-            error_kind = classify_job_error(exc)
+            if window_limited and isinstance(exc, TimeoutError):
+                error_kind = ERROR_KIND_WINDOW_CLOSED
+                error_text = (
+                    f"home-GPU VM night window closed during execution: {str(exc)[:1000]}"
+                )
+            else:
+                error_kind = classify_job_error(exc)
+                error_text = f"{type(exc).__name__}: {str(exc)[:1000]}"
             diagnostics = llama_server_failure_diagnostics()
             _LOGGER.error(
                 "local_llm job failed job_id=%s role=%s session_id=%s provider=local model=%s "
@@ -882,7 +1076,7 @@ class LocalLlmJobService:
                 (
                     STATUS_FAILED,
                     _now(),
-                    f"{type(exc).__name__}: {str(exc)[:1000]}",
+                    error_text,
                     error_kind,
                     job_id,
                     STATUS_RUNNING,
