@@ -92,6 +92,7 @@ _DEFAULT_SANDBOX: str = "read-only"
 # Tool sets per sandbox mode. These are Claude Code's built-in tool names;
 # a tool that is not listed does not exist for that run at all.
 _READ_ONLY_TOOLS = "Read,Glob,Grep"
+_WEB_TOOLS = "WebSearch,WebFetch"
 _WORKSPACE_WRITE_TOOLS = "Read,Glob,Grep,Edit,Write,Bash,TodoWrite"
 
 
@@ -288,11 +289,15 @@ class ClaudeWorker:
         max_output_bytes: int = _DEFAULT_MAX_OUTPUT_BYTES,
         db_path: str | None = None,
         model: str | None = None,
+        web: bool = False,
     ) -> None:
         self.claude_bin = claude_bin or _default_claude_bin()
         self.max_output_bytes = max_output_bytes
         self._db_path = db_path
         self.model = model or os.environ.get("AGENT_CLAUDE_MODEL") or None
+        # read-only plus WebSearch/WebFetch, for the outlook (2026-11-28); still
+        # no tool that writes or executes anything.
+        self.web = web
 
     # ------------------------------------------------------------------
     # Public API
@@ -495,7 +500,9 @@ class ClaudeWorker:
             "--permission-prompts", "none",
         ]
 
-        if sandbox == "read-only":
+        if sandbox == "read-only" and getattr(self, "web", False):
+            cmd += ["--tools", _READ_ONLY_TOOLS + "," + _WEB_TOOLS, "--allowedTools", _WEB_TOOLS]
+        elif sandbox == "read-only":
             # No tool that could write or execute anything exists for this run.
             cmd += ["--tools", _READ_ONLY_TOOLS]
         elif sandbox == "workspace-write":
