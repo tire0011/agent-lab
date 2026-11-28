@@ -148,6 +148,16 @@ def _check(payload: Any) -> str:
     return body
 
 
+def payload_body(payload: Any) -> str:
+    """The deterministic JSON serialization of *payload*, after all checks.
+
+    Raises ``PayloadRejected`` unless the payload is safe to publish. The
+    fallback wrapper hashes exactly this string, so the ``input_sha256`` in a
+    ``home_gpu_jobs`` row always matches the body written to the mailbox.
+    """
+    return _check(payload)
+
+
 def check_payload(payload: Any) -> None:
     """Raise ``PayloadRejected`` unless *payload* is safe to publish."""
     _check(payload)
@@ -168,6 +178,8 @@ def submit_job(
     *,
     mailbox_dir: Path | str,
     commit: bool,
+    job_id: str | None = None,
+    now: datetime | None = None,
 ) -> SubmittedJob:
     """Write a ``batch_job`` for the home GPU into ``<mailbox_dir>/inbox``.
 
@@ -177,6 +189,10 @@ def submit_job(
     all raise and leave the mailbox untouched. A failed push is reported via
     ``pushed=False`` (the mailbox poll retries unpushed commits); a failed
     commit raises.
+
+    *job_id* and *now* are normally left alone; the fallback wrapper (#761)
+    passes them so a retry after a partial failure republishes under the same
+    job id and the tracking row and the mailbox file always agree on it.
     """
     if not home_gpu_enabled():
         raise HomeGpuDisabled(f"{ENV_FLAG}=1 is not set; home-GPU jobs are off")
@@ -186,6 +202,8 @@ def submit_job(
         )
     if isinstance(deadline_s, bool) or not isinstance(deadline_s, int) or deadline_s <= 0:
         raise HomeGpuJobError(f"deadline_s must be a positive int, got {deadline_s!r}")
+    if job_id is not None and not re.fullmatch(r"[A-Za-z0-9-]+", str(job_id)):
+        raise HomeGpuJobError(f"job_id must be plain [A-Za-z0-9-], got {job_id!r}")
 
     body = _check(payload)
 
@@ -193,8 +211,13 @@ def submit_job(
     if not repo.is_dir():
         raise HomeGpuJobError(f"mailbox working copy not found: {repo}")
 
-    now = datetime.now(timezone.utc)
-    job_id = _new_job_id(now)
+    if now is None:
+        now = datetime.now(timezone.utc)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    else:
+        now = now.astimezone(timezone.utc)
+    job_id = str(job_id) if job_id is not None else _new_job_id(now)
     deadline = _iso(now + timedelta(seconds=deadline_s))
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     content = (

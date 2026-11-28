@@ -937,9 +937,20 @@ def next_candidate(conn: sqlite3.Connection, variant: str) -> str | None:
     return str(found[0]) if found else None
 
 
-def server_state(client: Any, db_path: str) -> tuple[bool, str]:
+def server_state(client: Any, db_path: str, *, exclude_job_id: str | None = None) -> tuple[bool, str]:
     """``(idle, reason)``. Fail closed: unreachable, unknown errors or any sign
-    of local-model work count as not idle."""
+    of local-model work count as not idle.
+
+    *exclude_job_id* spares one ``local_llm_jobs`` row - the home-GPU fallback
+    job currently being considered (#761) - so it does not count as busy
+    against itself. Parked home-GPU fallback rows outside their night window
+    never count as busy either: they hold no inference slot and must not
+    suppress ordinary shadow replays during the day.
+    """
+    # Lazy import: local_llm_jobs imports home_gpu lazily in turn, so neither
+    # import cycle bites at module load.
+    from modules.local_llm_jobs import busy_local_job_where
+
     try:
         reachable = asyncio.run(client.is_available())
     except Exception as exc:  # noqa: BLE001
@@ -949,9 +960,20 @@ def server_state(client: Any, db_path: str) -> tuple[bool, str]:
     try:
         conn = sqlite3.connect(db_path, timeout=_BUSY_TIMEOUT_MS / 1000)
         try:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(local_llm_jobs)")}
+            if "role" in columns:
+                job_where, job_params = busy_local_job_where(exclude_job_id=exclude_job_id)
+            else:
+                # A table without the role column predates #167: every row in
+                # it is an ordinary job, so all queued/running rows count.
+                job_where = "status IN ('queued', 'running')"
+                job_params: tuple[Any, ...] = ()
+                if exclude_job_id is not None:
+                    job_where += " AND id != ?"
+                    job_params = (exclude_job_id,)
             checks = (
-                ("SELECT COUNT(*) FROM local_llm_jobs WHERE status IN ('queued', 'running')",
-                 (), "local model jobs are queued or running"),
+                (f"SELECT COUNT(*) FROM local_llm_jobs WHERE {job_where}",
+                 job_params, "local model jobs are queued or running"),
                 (f"SELECT COUNT(*) FROM experiments WHERE implementation_provider = 'local' "
                  f"AND status IN ({','.join('?' for _ in _ACTIVE_EXPERIMENT_STATUSES)})",
                  _ACTIVE_EXPERIMENT_STATUSES, "a local experiment is running"),

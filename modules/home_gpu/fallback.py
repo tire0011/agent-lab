@@ -4,22 +4,40 @@ Three things live here:
 
 * :func:`expire_jobs` - a ``queued`` ``home_gpu_jobs`` row whose deadline has
   passed becomes ``expired``. Deadlines are compared as parsed timestamps, not
-  as strings, so a row written in a different ISO format still expires.
+  as strings, so a row written in a different ISO format still expires. Expiry
+  also runs during normal mailbox polling (``modules.mailbox.poll_runner``) and
+  when a reply is claimed (``modules.home_gpu.collect``), so a final queued job
+  cannot stay queued indefinitely and a late reply is never accepted.
 
 * PC-off detection and :func:`submit_job` - when no job has been ``answered``
   in the last 24 h *and* the PC had work older than that (at least one row
   submitted at or before the 24 h cutoff - without that evidence a fresh queue
   with in-flight jobs would read as "off" and the home GPU could never boot),
   the PC counts as off. New :func:`submit_job` calls then return
-  ``"fallback"`` at once and write nothing to the mailbox, so nothing in the
-  paid path ever waits on a home-GPU job. Batch kinds (``hunk_replay``,
-  ``bakeoff_prompt``) are put on the existing VM local path
+  ``"fallback"`` at once and write nothing of the caller's job to the mailbox,
+  so nothing in the paid path ever waits on a home-GPU job. Batch kinds
+  (``hunk_replay``, ``bakeoff_prompt``) are put on the existing VM local path
   (``local_llm_jobs`` with role ``home_gpu``) and run in the night window only
-  (:func:`in_vm_window`, ``NEXUS_HOME_GPU_VM_HOURS``, default ``0-6`` UTC);
-  interactive kinds (``code_draft``, ``review_draft``, ``chat_completion``)
-  are recorded as ``home_gpu_expired`` and dropped. Both cases still get a
-  ``home_gpu_jobs`` row (status ``fallback`` / ``home_gpu_expired``) so the
-  savings share can see them; only the mailbox is left untouched.
+  (:func:`in_vm_window`, ``NEXUS_HOME_GPU_VM_HOURS``, default ``0-6`` UTC; the
+  queue worker reuses the shared idle check from
+  :func:`modules.local_shadow_replay.server_state` and enforces the closing
+  boundary during execution); interactive kinds (``code_draft``,
+  ``review_draft``, ``chat_completion``) are recorded as ``home_gpu_expired``
+  and dropped. Both cases still get a ``home_gpu_jobs`` row (status
+  ``fallback`` / ``home_gpu_expired``) so the savings share can see them; only
+  the mailbox is left untouched. Because a permanently "off" verdict would
+  never recover, at most one tiny liveness probe per
+  ``NEXUS_HOME_GPU_PC_PROBE_HOURS`` (default 6) is still sent to the PC
+  (:func:`_maybe_send_probe`); once the PC answers it, ``pc_is_off`` is false
+  again and ordinary submissions go to the GPU at once.
+
+  Every mutation is ordered for crash safety: the flag is checked before any
+  schema or row is touched, the payload is validated before anything is
+  written, the VM-queue row and the tracking row are written in one
+  transaction, and the online branch inserts its ``queued`` row *before*
+  publishing the mailbox file under the same job id, so a retry after either
+  partial failure reuses that id instead of leaving a published job the
+  collector would treat as unknown.
 
 * :func:`savings_summary` - answered jobs, completion tokens and PC seconds
   over the last ``days`` days, plus the VM seconds those tokens would have
@@ -28,9 +46,11 @@ Three things live here:
   of expired-or-fallback jobs. :func:`home_gpu_status` bundles this for
   ``/status`` under ``home_gpu``.
 
-All functions take an optional ``now`` (fake clock in tests). Database work
-runs in savepoints exactly like :mod:`modules.home_gpu.collect`, so a caller's
-open transaction on the shared connection is never committed here.
+All functions take an optional ``now`` (fake clock in tests); timestamps are
+always normalized to UTC before any hour or deadline comparison. Database
+work runs in uniquely named savepoints exactly like
+:mod:`modules.home_gpu.collect`, so a caller's open transaction on the shared
+connection is never committed here.
 """
 
 from __future__ import annotations
@@ -39,6 +59,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -81,11 +102,30 @@ DEFAULT_VM_TOKENS_PER_SECOND = 2.6
 #: Key read from ``LocalModelRates`` for the VM-seconds estimate.
 _VM_RATE_KEY = "generation_tokens_per_second"
 
+#: Liveness probe sent to the PC at most once per this interval while the PC
+#: counts as off, so a PC that comes back is detected and ``pc_is_off`` flips
+#: back to false when the probe is answered.
+ENV_PC_PROBE_HOURS = "NEXUS_HOME_GPU_PC_PROBE_HOURS"
+DEFAULT_PC_PROBE_HOURS = 6
+PROBE_KIND = "chat_completion"
+PROBE_PAYLOAD = {"kind": "pc_probe", "text": "ping"}
+#: ``service_settings`` key holding the ISO time of the last liveness probe.
+PROBE_SETTING = "home_gpu.fallback.last_pc_probe_at"
+
+_JOB_ID_RE = re.compile(r"[A-Za-z0-9-]+\Z")
+
 
 def _utc(now: datetime | None = None) -> datetime:
+    """*now* as an aware UTC datetime; naive values are read as UTC.
+
+    Aware values are converted with ``astimezone``, so an offset-aware fake
+    clock is compared by its UTC instant, never by its local hour.
+    """
     if now is None:
         return datetime.now(timezone.utc)
-    return now if now.tzinfo is not None else now.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None:
+        return now.replace(tzinfo=timezone.utc)
+    return now.astimezone(timezone.utc)
 
 
 def _iso(moment: datetime) -> str:
@@ -111,6 +151,25 @@ def _table_exists(db: sqlite3.Connection, name: str) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (name,)
     ).fetchone()
     return row is not None
+
+
+def _get_setting(db: sqlite3.Connection, key: str) -> str | None:
+    if not _table_exists(db, "service_settings"):
+        return None
+    row = db.execute("SELECT value FROM service_settings WHERE key = ?", (key,)).fetchone()
+    return str(row[0]) if row is not None else None
+
+
+def _set_setting(db: sqlite3.Connection, key: str, value: str) -> None:
+    """Persist one setting; must run inside the caller's transaction."""
+    db.execute(
+        """
+        INSERT INTO service_settings (key, value, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, _iso(datetime.now(timezone.utc))),
+    )
 
 
 # --- deadline expiry ---------------------------------------------------------
@@ -156,7 +215,7 @@ def pc_is_off(db: sqlite3.Connection, now: datetime | None = None) -> bool:
     submitted at or before the 24 h cutoff). A fresh queue whose jobs are
     still inside their deadline is not evidence - those may simply be in
     flight - and an empty table is not either, so the first job ever still
-    goes to the GPU.
+    goes to the GPU. An answered liveness probe flips this back to false.
     """
     if not _table_exists(db, "home_gpu_jobs"):
         return False
@@ -177,6 +236,71 @@ def pc_is_off(db: sqlite3.Connection, now: datetime | None = None) -> bool:
     if latest_answered is not None and latest_answered >= cutoff:
         return False
     return has_old_work
+
+
+def pc_probe_interval() -> timedelta:
+    """How often a liveness probe may be sent while the PC counts as off."""
+    raw = (os.environ.get(ENV_PC_PROBE_HOURS) or "").strip()
+    if not raw:
+        return timedelta(hours=DEFAULT_PC_PROBE_HOURS)
+    try:
+        hours = float(raw)
+    except ValueError:
+        logger.warning("%s=%r is not a number; using %sh", ENV_PC_PROBE_HOURS, raw,
+                       DEFAULT_PC_PROBE_HOURS)
+        return timedelta(hours=DEFAULT_PC_PROBE_HOURS)
+    if hours <= 0:
+        return timedelta(hours=DEFAULT_PC_PROBE_HOURS)
+    return timedelta(hours=hours)
+
+
+def _maybe_send_probe(
+    db: sqlite3.Connection,
+    *,
+    mailbox_dir: Path | str,
+    commit: bool,
+    now: datetime,
+) -> None:
+    """Send one liveness probe to the PC, at most once per probe interval.
+
+    Best-effort and bounded: while the PC counts as off, ordinary submissions
+    still return ``fallback`` immediately, but one tiny job goes to the
+    mailbox per interval. When the PC is back it answers the probe, and the
+    fresh ``answered`` row makes :func:`pc_is_off` false again. Any failure
+    here is logged and swallowed - a broken probe must never break the
+    fallback return. The tracking row is inserted before the mailbox file
+    (same job id), so an interrupted probe is recovered by deadline expiry,
+    not by an unknown reply.
+    """
+    try:
+        last = _parse_iso(_get_setting(db, PROBE_SETTING))
+        if last is not None and now - last < pc_probe_interval():
+            return
+        with _tx(db):
+            _set_setting(db, PROBE_SETTING, _iso(now))
+        interval_s = max(1, int(pc_probe_interval().total_seconds()))
+        job_id = jobs._new_job_id(now)
+        body = jobs.payload_body(PROBE_PAYLOAD)
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        with _tx(db):
+            db.execute(
+                """
+                INSERT INTO home_gpu_jobs
+                    (job_id, kind, status, submitted_at, deadline, input_sha256)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (job_id, PROBE_KIND, STATUS_QUEUED, _iso(now),
+                 _iso(now + timedelta(seconds=interval_s)), digest),
+            )
+        jobs.submit_job(
+            PROBE_KIND, PROBE_PAYLOAD, interval_s,
+            mailbox_dir=mailbox_dir, commit=commit, job_id=job_id, now=now,
+        )
+        logger.info("sent home-GPU PC liveness probe job_id=%s", job_id)
+    except Exception as exc:  # noqa: BLE001 - the probe is best-effort only
+        logger.warning(
+            "home-GPU PC liveness probe not sent: %s: %s", type(exc).__name__, exc
+        )
 
 
 # --- night window for VM-run fallback jobs -----------------------------------
@@ -218,13 +342,30 @@ def vm_window() -> tuple[int, int]:
 
 
 def in_vm_window(now: datetime | None = None) -> bool:
-    """True when *now* (UTC) is inside the configured VM night window."""
+    """True when *now* (normalized to UTC) is inside the configured VM night window."""
     now = _utc(now)
     start, end = vm_window()
     hour = now.hour
     if start < end:
         return start <= hour < end
     return hour >= start or hour < end  # wraps past midnight, e.g. 22-6
+
+
+def vm_window_end(now: datetime | None = None) -> datetime | None:
+    """The closing boundary (UTC) of the VM window containing *now*.
+
+    ``None`` when *now* is outside the window. Used to bound the execution of
+    a fallback job that was admitted just before the window closes, so it
+    cannot run into the day.
+    """
+    now = _utc(now)
+    if not in_vm_window(now):
+        return None
+    _, end = vm_window()
+    candidate = now.replace(hour=end % 24, minute=0, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def vm_window_info(now: datetime | None = None) -> dict[str, Any]:
@@ -243,15 +384,17 @@ def vm_window_info(now: datetime | None = None) -> dict[str, Any]:
 # --- submission with fallback ------------------------------------------------
 
 
-def _enqueue_vm_local(
+def _insert_vm_local_row(
     db: sqlite3.Connection, kind: str, payload: Any, *, now: datetime
 ) -> str:
-    """Put a batch job on the existing VM local path (``local_llm_jobs``).
+    """Insert a row into the existing VM local path (``local_llm_jobs``).
 
-    The row gets role ``home_gpu``; :mod:`modules.local_llm_jobs` only claims
-    such rows inside the VM night window, so the job waits there until the
-    window opens. The prompt is the deterministic JSON envelope of the kind
-    and the payload.
+    The row gets role ``home_gpu``; the queue worker only claims such rows
+    inside the VM night window and while the shared idle check passes, so the
+    job waits there until then. The prompt is the deterministic JSON envelope
+    of the kind and the payload. Must run inside the caller's transaction:
+    together with the ``home_gpu_jobs`` tracking row it is written atomically,
+    so a failure can never leave runnable VM work behind.
     """
     from modules.local_llm_jobs import ROLE_HOME_GPU  # lazy: local_llm_jobs imports this module lazily too
 
@@ -266,20 +409,33 @@ def _enqueue_vm_local(
         if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate > 0:
             max_tokens = candidate
     job_id = uuid.uuid4().hex
-    with _tx(db):
-        db.execute(
-            """
-            INSERT INTO local_llm_jobs
-                (id, status, prompt, temperature, max_tokens, session_id, created_at, role)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                job_id, STATUS_QUEUED, prompt, 0.0, max_tokens, None, _iso(now), ROLE_HOME_GPU,
-            ),
-        )
+    db.execute(
+        """
+        INSERT INTO local_llm_jobs
+            (id, status, prompt, temperature, max_tokens, session_id, created_at, role)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            job_id, STATUS_QUEUED, prompt, 0.0, max_tokens, None, _iso(now), ROLE_HOME_GPU,
+        ),
+    )
     logger.info("home-GPU batch job fell back to the VM local queue job_id=%s kind=%s",
                 job_id, kind)
     return job_id
+
+
+def enqueue_vm_local(
+    db: sqlite3.Connection, kind: str, payload: Any, *, now: datetime | None = None
+) -> str:
+    """Put a batch job on the VM local path in its own transaction.
+
+    Standalone helper (tests/tools); :func:`submit_job` uses the inner
+    :func:`_insert_vm_local_row` so the VM row and its tracking row commit
+    together.
+    """
+    now = _utc(now)
+    with _tx(db):
+        return _insert_vm_local_row(db, kind, payload, now=now)
 
 
 _LOCAL_LLM_JOBS_DDL = """
@@ -324,28 +480,43 @@ def _ensure_local_llm_jobs_table(db: sqlite3.Connection) -> None:
             db.execute("ALTER TABLE local_llm_jobs ADD COLUMN role TEXT NOT NULL DEFAULT 'controller'")
 
 
-def _record_fallback_row(
+def _insert_tracking_row(
     db: sqlite3.Connection,
     *,
     job_id: str,
     kind: str,
     status: str,
-    payload: Any,
     deadline_s: int,
+    digest: str,
     now: datetime,
 ) -> None:
-    """Insert the ``home_gpu_jobs`` row for a job that did not reach the PC."""
-    jobs.check_payload(payload)  # same public-data guard as the mailbox path
-    digest = hashlib.sha256(jobs._serialize(payload).encode("utf-8")).hexdigest()
-    with _tx(db):
-        db.execute(
-            """
-            INSERT INTO home_gpu_jobs
-                (job_id, kind, status, submitted_at, deadline, input_sha256)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (job_id, kind, status, _iso(now), _iso(now + timedelta(seconds=deadline_s)), digest),
+    """Insert the ``home_gpu_jobs`` row; must run inside the caller's transaction."""
+    db.execute(
+        """
+        INSERT INTO home_gpu_jobs
+            (job_id, kind, status, submitted_at, deadline, input_sha256)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (job_id, kind, status, _iso(now), _iso(now + timedelta(seconds=deadline_s)), digest),
+    )
+
+
+def _validate(kind: str, payload: Any, deadline_s: int, job_id: str | None) -> str:
+    """All input checks, before anything is written anywhere.
+
+    Returns the sha256 of the deterministic payload body, so the tracking row
+    and the mailbox file always carry the same ``input_sha256``.
+    """
+    if kind not in jobs.ALLOWED_KINDS:
+        raise jobs.HomeGpuJobError(
+            f"unknown job kind {kind!r}; allowed: {', '.join(sorted(jobs.ALLOWED_KINDS))}"
         )
+    if isinstance(deadline_s, bool) or not isinstance(deadline_s, int) or deadline_s <= 0:
+        raise jobs.HomeGpuJobError(f"deadline_s must be a positive int, got {deadline_s!r}")
+    if job_id is not None and not _JOB_ID_RE.fullmatch(str(job_id)):
+        raise jobs.HomeGpuJobError(f"job_id must be plain [A-Za-z0-9-], got {job_id!r}")
+    body = jobs.payload_body(payload)  # PayloadRejected before any write
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
 def submit_job(
@@ -358,62 +529,89 @@ def submit_job(
     commit: bool,
     now: datetime | None = None,
     enqueue_vm: Callable[[sqlite3.Connection, str, Any], str] | None = None,
+    job_id: str | None = None,
 ) -> str:
     """Submit a job, falling back to the VM path when the PC counts as off.
 
-    Returns the ``hg-...`` job id when the job went to the home GPU (mailbox
-    file written by :func:`modules.home_gpu.jobs.submit_job` plus a ``queued``
-    row here), or ``"fallback"`` when the PC is off. In the fallback case
-    nothing is written to the mailbox and nothing waits: batch kinds are
+    This is the canonical entry point (``modules.home_gpu.submit_job``). It
+    returns the ``hg-...`` job id when the job went to the home GPU, or
+    ``"fallback"`` when the PC is off. In the fallback case nothing of the
+    caller's job is written to the mailbox and nothing waits: batch kinds are
     enqueued on the VM local path via *enqueue_vm* (default
     :func:`enqueue_vm_local`; the worker only claims such rows inside the
-    night window) and recorded as ``fallback``; interactive kinds are recorded as
-    ``home_gpu_expired`` and dropped. The return happens at once either way,
-    so the paid path never waits on a home-GPU job.
+    night window while the VM is idle) and recorded as ``fallback``;
+    interactive kinds are recorded as ``home_gpu_expired`` and dropped. The
+    return happens at once either way, so the paid path never waits on a
+    home-GPU job.
+
+    Ordering, for crash safety: the ``NEXUS_HOME_GPU`` flag and all input
+    validation run before any schema or row is touched; the batch fallback
+    writes the VM-queue row and its tracking row in one transaction; the
+    online branch inserts its ``queued`` row *before* publishing the mailbox
+    file, and *job_id* lets a retry after a partial failure republish under
+    the same id instead of leaving an unknown job behind.
     """
+    if not jobs.home_gpu_enabled():
+        raise jobs.HomeGpuDisabled(
+            f"{jobs.ENV_FLAG}=1 is not set; home-GPU jobs are off"
+        )
     now = _utc(now)
+    digest = _validate(kind, payload, deadline_s, job_id)
     _ensure_schema(db)
-    if kind not in jobs.ALLOWED_KINDS:
-        raise jobs.HomeGpuJobError(
-            f"unknown job kind {kind!r}; allowed: {', '.join(sorted(jobs.ALLOWED_KINDS))}"
-        )
-    if isinstance(deadline_s, bool) or not isinstance(deadline_s, int) or deadline_s <= 0:
-        raise jobs.HomeGpuJobError(f"deadline_s must be a positive int, got {deadline_s!r}")
     expire_jobs(db, now)
+    job_id = str(job_id) if job_id is not None else jobs._new_job_id(now)
+
     if pc_is_off(db, now):
-        job_id = jobs._new_job_id(now)
-        if kind in BATCH_KINDS:
-            if enqueue_vm is not None:
-                enqueue_vm(db, kind, payload)
+        _maybe_send_probe(db, mailbox_dir=mailbox_dir, commit=commit, now=now)
+        existing = db.execute(
+            "SELECT 1 FROM home_gpu_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if existing is None:
+            # One transaction for the VM row and the tracking row: a rejected
+            # payload, a failed insert or a deadline overflow can never leave
+            # runnable work behind, and a retry with the same job id neither
+            # duplicates the VM row nor the tracking row.
+            if kind in BATCH_KINDS:
+                with _tx(db):
+                    if enqueue_vm is not None:
+                        enqueue_vm(db, kind, payload)
+                    else:
+                        _insert_vm_local_row(db, kind, payload, now=now)
+                    _insert_tracking_row(
+                        db, job_id=job_id, kind=kind, status=STATUS_FALLBACK,
+                        deadline_s=deadline_s, digest=digest, now=now,
+                    )
+                logger.info("home-GPU job %s (kind=%s) fell back to the VM path; PC off",
+                            job_id, kind)
             else:
-                _enqueue_vm_local(db, kind, payload, now=now)
-            _record_fallback_row(
-                db, job_id=job_id, kind=kind, status=STATUS_FALLBACK, payload=payload,
-                deadline_s=deadline_s, now=now,
-            )
-            logger.info("home-GPU job %s (kind=%s) fell back to the VM path; PC off", job_id, kind)
+                with _tx(db):
+                    _insert_tracking_row(
+                        db, job_id=job_id, kind=kind, status=STATUS_HOME_GPU_EXPIRED,
+                        deadline_s=deadline_s, digest=digest, now=now,
+                    )
+                logger.info("home-GPU job %s (kind=%s) dropped as home_gpu_expired; PC off",
+                            job_id, kind)
         else:
-            _record_fallback_row(
-                db, job_id=job_id, kind=kind, status=STATUS_HOME_GPU_EXPIRED, payload=payload,
-                deadline_s=deadline_s, now=now,
-            )
-            logger.info("home-GPU job %s (kind=%s) dropped as home_gpu_expired; PC off", job_id, kind)
+            logger.info("home-GPU job %s already tracked; fallback not duplicated", job_id)
         return FALLBACK
-    submitted = jobs.submit_job(
-        kind, payload, deadline_s, mailbox_dir=mailbox_dir, commit=commit
-    )
+
+    # Online branch: tracking row first, then the mailbox file under the same
+    # job id. A crash between the two leaves a queued row that deadline expiry
+    # (run by the poll) retires; a retry with the same job id republishes
+    # instead of creating an unknown job.
     with _tx(db):
-        db.execute(
-            """
-            INSERT INTO home_gpu_jobs
-                (job_id, kind, status, submitted_at, deadline, input_sha256)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (
-                submitted.job_id, kind, STATUS_QUEUED, _iso(now), submitted.deadline,
-                submitted.input_sha256,
-            ),
-        )
+        existing = db.execute(
+            "SELECT 1 FROM home_gpu_jobs WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if existing is None:
+            _insert_tracking_row(
+                db, job_id=job_id, kind=kind, status=STATUS_QUEUED,
+                deadline_s=deadline_s, digest=digest, now=now,
+            )
+    submitted = jobs.submit_job(
+        kind, payload, deadline_s, mailbox_dir=mailbox_dir, commit=commit,
+        job_id=job_id, now=now,
+    )
     return submitted.job_id
 
 
@@ -525,12 +723,17 @@ def home_gpu_status(
 
 __all__ = [
     "BATCH_KINDS",
+    "DEFAULT_PC_PROBE_HOURS",
     "DEFAULT_VM_HOURS",
     "DEFAULT_VM_TOKENS_PER_SECOND",
+    "ENV_PC_PROBE_HOURS",
     "ENV_VM_HOURS",
     "FALLBACK",
     "INTERACTIVE_KINDS",
     "PC_OFF_AFTER",
+    "PROBE_KIND",
+    "PROBE_PAYLOAD",
+    "PROBE_SETTING",
     "STATUS_ANSWERED",
     "STATUS_EXPIRED",
     "STATUS_FALLBACK",
@@ -541,13 +744,11 @@ __all__ = [
     "home_gpu_status",
     "in_vm_window",
     "pc_is_off",
+    "pc_probe_interval",
     "savings_summary",
     "submit_job",
     "vm_hours_spec",
     "vm_window",
+    "vm_window_end",
     "vm_window_info",
 ]
-
-
-# Public alias: the default VM enqueue is useful on its own in tests/tools.
-enqueue_vm_local = _enqueue_vm_local

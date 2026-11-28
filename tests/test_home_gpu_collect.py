@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -49,16 +50,27 @@ def _reply(job_id: str, answer: str = "The home GPU says hi.") -> str:
     )
 
 
-def _queue_job(db: sqlite3.Connection, job_id: str = JOB_ID) -> None:
+def _queue_job(
+    db: sqlite3.Connection,
+    job_id: str = JOB_ID,
+    *,
+    deadline: str | None = None,
+    submitted_at: str = "2026-01-01T00:00:00Z",
+) -> None:
+    """Queue a row whose deadline is in the future by default: a reply for a
+    row past its deadline is expired at claim time, not collected (#761)."""
+    if deadline is None:
+        deadline = (
+            datetime.now(timezone.utc) + timedelta(hours=6)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
     _ensure_schema(db)
     db.execute(
         """
         INSERT INTO home_gpu_jobs
             (job_id, kind, status, submitted_at, deadline, input_sha256)
-        VALUES (?, 'chat_completion', 'queued', '2026-01-01T00:00:00Z',
-                '2026-01-01T06:00:00Z', '0' * 64)
+        VALUES (?, 'chat_completion', 'queued', ?, ?, '0' * 64)
         """,
-        (job_id,),
+        (job_id, submitted_at, deadline),
     )
     db.commit()
 
@@ -634,4 +646,81 @@ def test_tick_with_flag_on_collects_replies(tmp_path, monkeypatch):
     expected = code_repo / "state" / "home_gpu" / f"{JOB_ID}.txt"
     assert row[7] == str(expected)
     assert expected.read_text(encoding="utf-8") == answer
+    db.close()
+
+
+# --- deadline enforcement at claim time and during the poll (#761) ---------------
+
+
+def test_reply_for_a_job_past_its_deadline_is_expired_not_claimed(mailbox, db, state_dir, caplog):
+    past = (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _queue_job(db, deadline=past)
+    (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger=COLLECT_LOGGER):
+        assert collect_replies(mailbox, db, state_dir) == 0
+
+    # The row became expired at claim time; no answer file, reply marked seen.
+    assert _job_row(db)[0] == "expired"
+    assert not (state_dir / "home_gpu").exists()
+    assert "reply-1.md" in _seen(db)
+    assert any("deadline passed" in rec.message for rec in caplog.records)
+    # A repeated run over the same outbox is idempotent and silent on this file.
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=COLLECT_LOGGER):
+        assert collect_replies(mailbox, db, state_dir) == 0
+    assert not any("deadline passed" in rec.message for rec in caplog.records)
+
+
+def test_reply_for_a_job_inside_its_deadline_is_claimed(mailbox, db, state_dir):
+    future = (datetime.now(timezone.utc) + timedelta(hours=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _queue_job(db, deadline=future)
+    (mailbox / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+
+    assert collect_replies(mailbox, db, state_dir) == 1
+    assert _job_row(db)[0] == "answered"
+
+
+def test_tick_with_flag_on_expires_past_deadline_jobs_before_collecting(tmp_path, monkeypatch):
+    """Expiry runs during normal mailbox polling, not only on submission: a
+    queued row past its deadline is expired by the tick and its late reply is
+    never claimed."""
+    monkeypatch.setenv("NEXUS_HOME_GPU", "1")
+    code_repo, mailbox_repo, db_path = _tick_setup(tmp_path)
+    db = init_db(str(db_path))
+    past = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _queue_job(db, deadline=past)
+    (mailbox_repo / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+    _patch_tick(monkeypatch, _FakeProcessor(db))
+
+    cfg = MailboxConfig.from_paths(code_repo, mailbox_repo)
+    result = run_mailbox_poll_once(
+        db_path=str(db_path),
+        mailbox_config=cfg,
+        lock_path=tmp_path / "mailbox.lock",
+        dry_run=False,
+    )
+    assert result.status == "processed"
+    assert _job_row(db)[0] == "expired"
+    assert not (code_repo / "state" / "home_gpu").exists()
+    db.close()
+
+
+def test_tick_with_flag_on_collects_a_reply_inside_its_deadline(tmp_path, monkeypatch):
+    monkeypatch.setenv("NEXUS_HOME_GPU", "1")
+    code_repo, mailbox_repo, db_path = _tick_setup(tmp_path)
+    db = init_db(str(db_path))
+    _queue_job(db)  # future deadline by default
+    (mailbox_repo / "outbox" / "reply-1.md").write_text(_reply(JOB_ID), encoding="utf-8")
+    _patch_tick(monkeypatch, _FakeProcessor(db))
+
+    cfg = MailboxConfig.from_paths(code_repo, mailbox_repo)
+    result = run_mailbox_poll_once(
+        db_path=str(db_path),
+        mailbox_config=cfg,
+        lock_path=tmp_path / "mailbox.lock",
+        dry_run=False,
+    )
+    assert result.status == "processed"
+    assert _job_row(db)[0] == "answered"
     db.close()
