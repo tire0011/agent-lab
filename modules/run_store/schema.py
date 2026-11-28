@@ -329,6 +329,28 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
         CREATE INDEX IF NOT EXISTS idx_local_model_bakeoffs_created
             ON local_model_bakeoffs(created_at DESC, id DESC);
 
+        -- #857: one row per bake-off case sent to the home GPU. It keeps the
+        -- exact payload (prompt and start text) so --collect scores the PC's
+        -- answer against the text the PC was given, lets an interrupted
+        -- submission resume under the same job id, and marks a case as
+        -- collected in the same transaction that writes its bake-off row.
+        CREATE TABLE IF NOT EXISTS local_model_bakeoff_home_gpu_cases (
+            job_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            experiment_id TEXT NOT NULL,
+            case_index INTEGER NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'submitting',
+            error TEXT NULL,
+            collected_at TEXT NULL,
+            bakeoff_id INTEGER NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_local_model_bakeoff_home_gpu_cases_input
+            ON local_model_bakeoff_home_gpu_cases(input_sha256);
+
         CREATE TABLE IF NOT EXISTS issue_approvals (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             repository TEXT NOT NULL,
@@ -1302,4 +1324,10 @@ def _migrate_local_model_bakeoffs_columns(conn: sqlite3.Connection) -> None:
     """
     existing = {row[1] for row in conn.execute("PRAGMA table_info(local_model_bakeoffs)")}
     if "host" not in existing:
-        conn.execute("ALTER TABLE local_model_bakeoffs ADD COLUMN host TEXT NOT NULL DEFAULT 'vm'")
+        try:
+            conn.execute("ALTER TABLE local_model_bakeoffs ADD COLUMN host TEXT NOT NULL DEFAULT 'vm'")
+        except sqlite3.OperationalError as exc:
+            # A concurrent init_db won the race between the probe and the
+            # ALTER; the column is there, which is all this migration wants.
+            if "duplicate column" not in str(exc).lower():
+                raise

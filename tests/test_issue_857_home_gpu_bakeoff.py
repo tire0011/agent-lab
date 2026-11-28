@@ -1,13 +1,15 @@
-"""Issue #857: home-gpu bake-off lane - ``--via home-gpu`` submits one
-``bakeoff_prompt`` job per case, ``--collect`` scores the answered jobs with
-the VM checker into ``host='home-gpu'`` bake-off rows.
+"""Issue #857: home-gpu bake-off lane.
 
-The submission tests use a temp mailbox with ``NEXUS_HOME_GPU=1``. The
-collection test builds a real throwaway git repo (base + merged commit) and a
-real experiment row, answers some jobs with fixture replies through
-:func:`modules.home_gpu.collect.collect_replies`, and checks that the written
-rows match :func:`modules.local_shadow_replay_hunks.check_unit_text` - the VM
-scorer - run on the same answer text.
+``--via home-gpu`` submits one ``bakeoff_prompt`` job per case through
+``modules.home_gpu.submit_job`` and writes no bake-off rows; ``--collect``
+scores the answered jobs with the VM checker into ``host='home-gpu'`` rows.
+
+Also pins the review blocker of the first attempt: the shared checker must
+judge the VM worker against the text it was given (the *reduced* text for a
+symbol unit in a file over 16 KiB), never against ``unit.start_text``.
+
+The real-git tests build a throwaway repo (base + merged commit) and a real
+experiment row; the merged tests run for real with pytest in a worktree.
 """
 
 from __future__ import annotations
@@ -15,24 +17,26 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import subprocess
-import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from modules import home_gpu
 from modules import local_shadow_replay as lsr
 from modules import local_shadow_replay_hunks as lsh
-from modules.home_gpu import collect_replies, submit_job
-from modules.home_gpu.collect import _ensure_schema
 from modules.home_gpu.fallback import STATUS_EXPIRED, STATUS_QUEUED
 from modules.local_model_bakeoff import insert_bakeoff_row, list_bakeoffs
 from modules.mailbox import core as mailbox_core
 from modules.run_store import init_db
+from modules.run_store.schema import _migrate_local_model_bakeoffs_columns
 
 ROOT = Path(__file__).resolve().parents[1]
-SPEC = importlib.util.spec_from_file_location("local_model_bakeoff_script", ROOT / "scripts/local_model_bakeoff.py")
+SPEC = importlib.util.spec_from_file_location("local_model_bakeoff_script_857",
+                                              ROOT / "scripts/local_model_bakeoff.py")
 assert SPEC and SPEC.loader
 bakeoff = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(bakeoff)
@@ -64,22 +68,25 @@ def _write(root, rel, text):
     path.write_text(text, encoding="utf-8")
 
 
-def make_repo(root) -> tuple[str, str, str]:
-    """A temp git repo with a base and a merged commit; returns (repo, base, merged)."""
+def make_repo(root, base_files, merged_files) -> tuple[str, str, str]:
     repo = str(Path(root) / "repo")
     os.makedirs(repo)
     _git(repo, "init", "-q", "-b", "main")
-    _write(repo, "pkg/__init__.py", "")
-    _write(repo, SHAPES, BASE_SHAPES)
-    _write(repo, "README.md", "base\n")
+    for rel, text in base_files.items():
+        _write(repo, rel, text)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     base = _git(repo, "rev-parse", "HEAD")
-    _write(repo, SHAPES, MERGED_SHAPES)
-    _write(repo, "tests/test_shapes.py", TEST_SHAPES)
+    for rel, text in merged_files.items():
+        _write(repo, rel, text)
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "merged shapes (#42)")
     return repo, base, _git(repo, "rev-parse", "HEAD")
+
+
+def shapes_repo(root):
+    return make_repo(root, {"pkg/__init__.py": "", SHAPES: BASE_SHAPES, "README.md": "b\n"},
+                     {SHAPES: MERGED_SHAPES, "tests/test_shapes.py": TEST_SHAPES})
 
 
 def add_experiment(db_path, experiment_id, *, merged, base,
@@ -100,14 +107,14 @@ def add_experiment(db_path, experiment_id, *, merged, base,
 
 
 @pytest.fixture
-def workspace(tmp_path):
-    """A db, a 10-case fixture, a temp mailbox and a fake-git patch."""
+def workspace(tmp_path, monkeypatch):
     db_path = str(tmp_path / "agent.db")
     init_db(db_path).close()
     fixture = tmp_path / "hunks.json"
     fixture.write_text(json.dumps([{"experiment_id": "exp-1"} for _ in range(10)]))
     mailbox = tmp_path / "mailbox"
     (mailbox / "inbox").mkdir(parents=True)
+    monkeypatch.setenv(lsr.ENV_WORKTREE_DIR, str(tmp_path / "worktrees"))
     return {"tmp": tmp_path, "db": db_path, "fixture": fixture, "mailbox": mailbox}
 
 
@@ -124,303 +131,662 @@ def no_git(monkeypatch):
     monkeypatch.setattr(mailbox_core, "git_push", lambda repo: True)
 
 
-def _inbox_jobs(mailbox) -> list[tuple[str, dict, dict]]:
+@pytest.fixture
+def repo(workspace):
+    repo, base, merged = shapes_repo(workspace["tmp"])
+    add_experiment(workspace["db"], "exp-1", merged=merged, base=base)
+    return repo
+
+
+def fake_payload(item, index):
+    """A cheap, valid payload (no git) for the bookkeeping tests."""
+    return {"bakeoff": {"experiment_id": item["experiment_id"], "index": index},
+            "commit": "0" * 40, "file": SHAPES, "symbol": "area", "reduced": False,
+            "prompt": f"case {index}", "file_text": BASE_SHAPES}
+
+
+def _fixture(ws):
+    return bakeoff._load_fixture(ws["fixture"], ws["db"])
+
+
+def _submit(ws, **kwargs):
+    kwargs.setdefault("payload_fn", fake_payload)
+    return bakeoff.submit_home_gpu_jobs(_fixture(ws), db_path=ws["db"],
+                                        mailbox_dir=ws["mailbox"], commit=False, **kwargs)
+
+
+def _inbox(mailbox) -> list[tuple[dict, dict]]:
     out = []
     for path in sorted((Path(mailbox) / "inbox").glob("*.md")):
         meta, body = mailbox_core.parse_front_matter(path.read_text(encoding="utf-8"))
-        out.append((path.name, meta, json.loads(body)))
+        out.append((meta, json.loads(body)))
     return out
 
 
-def _job_rows(db_path, kind="bakeoff_prompt"):
+def _rows(db_path, sql, args=()):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
-        return [dict(r) for r in conn.execute(
-            "SELECT * FROM home_gpu_jobs WHERE kind = ? ORDER BY submitted_at, job_id", (kind,))]
+        return [dict(r) for r in conn.execute(sql, args)]
+    except sqlite3.OperationalError:
+        return []
     finally:
         conn.close()
 
 
+def _jobs(db_path):
+    return {r["job_id"]: r for r in _rows(
+        db_path, "SELECT * FROM home_gpu_jobs WHERE kind = 'bakeoff_prompt'")}
+
+
+def _cases(db_path):
+    return {r["case_index"]: r for r in _rows(
+        db_path, "SELECT * FROM local_model_bakeoff_home_gpu_cases ORDER BY created_at")}
+
+
 def _write_reply(mailbox, job_id, answer, *, model="pc-7b", prompt=100, completion=50,
-                 seconds=10.0, status="done"):
+                 seconds=10.0):
     outbox = Path(mailbox) / "outbox"
     outbox.mkdir(exist_ok=True)
     (outbox / f"reply-{job_id}.md").write_text(
         "---\n"
-        f"reply_to: {job_id}\n"
-        f"status: {status}\n"
-        f"model: {model}\n"
-        f"prompt_tokens: {prompt}\n"
-        f"completion_tokens: {completion}\n"
-        f"seconds: {seconds}\n"
+        f"reply_to: {job_id}\nstatus: done\nmodel: {model}\nprompt_tokens: {prompt}\n"
+        f"completion_tokens: {completion}\nseconds: {seconds}\n"
         "---\n"
-        f"{answer}\n",
+        f"{answer}",
         encoding="utf-8",
     )
+
+
+def _collect(ws, repo_root=None, **kwargs):
+    return bakeoff.collect_home_gpu_bakeoffs(
+        db_path=ws["db"], repo_root=repo_root or str(ws["tmp"]), mailbox_dir=ws["mailbox"],
+        **kwargs)
+
+
+def ok_score(payload, answer):
+    return {"status": "scored", "applied": True, "compiled": True, "tests_passed": True,
+            "has_tests": True, "error": None}
+
+
+# ---- blocker 1: the VM checker compares against the worker's own start text ----
+
+
+def _filler(n=400):
+    return "".join(f"\n\ndef filler_{i}(x):\n    return x + {i}  # padding padding padding\n"
+                   for i in range(n))
+
+
+class _Worker:
+    def __init__(self, text=None):
+        self.text = text
+
+    def run(self, *, working_dir, **_):
+        if self.text is not None:
+            _write(working_dir, SHAPES, self.text)
+        return SimpleNamespace(success=True, error=None, timed_out=False, usage=None)
+
+
+def _vm_score(repo, unit, old, new, text, *, test_runner=None, db_path=None):
+    """The real VM ``_score_unit`` with a worker that writes *text* (None: no change)."""
+    tests = lsh.unit_test_files(repo, new, lsr.merged_test_changes(repo, old, new), unit.file)
+    module = lsh.module_name(unit.file)
+    runner = test_runner or (lambda wt, t, timeout: lsh.run_unit_tests(wt, t, module, timeout))
+    worktree = lsr._create_worktree(repo, new, db_path=db_path)
+    try:
+        return lsh._score_unit(repo, worktree, unit, old=old, new=new, title="t", summary="s",
+                               client=None, worker_factory=lambda _c: _Worker(text),
+                               tests=tests, test_runner=runner, baseline={})
+    finally:
+        lsr.remove_worktree(repo, worktree)
+
+
+def _passing_runner(wt, tests, timeout):
+    return lsr.MergedTestRun(1, 1, None)
+
+
+@pytest.fixture
+def large_repo(tmp_path, monkeypatch):
+    """A >16 KiB module; the merge adds a brand-new top-level function ``added``."""
+    monkeypatch.setenv(lsr.ENV_WORKTREE_DIR, str(tmp_path / "worktrees"))
+    base = "import math\n" + _filler()
+    merged = base + "\n\ndef added(r):\n    return math.pi * r\n"
+    repo, old, new = make_repo(tmp_path, {"pkg/__init__.py": "", SHAPES: base},
+                               {SHAPES: merged})
+    units = lsh.hunk_units(repo, old, new)
+    assert len(units) == 1
+    unit = units[0]
+    start, reduced = lsh.worker_start_text(unit)
+    assert reduced and start != unit.start_text  # the worker sees the reduced file
+    return repo, old, new, unit, start
+
+
+def test_reduced_unit_left_untouched_is_not_applied(large_repo):
+    repo, old, new, unit, start = large_repo
+    outcome = _vm_score(repo, unit, old, new, None, test_runner=_passing_runner)
+    # The reduced file lacks the new symbol: splice fails. The worker changed
+    # nothing, so this is *not* an applied patch (the bug said True).
+    assert outcome.applied is False
+    merged_changes = lsh._change_set(unit.start_text, unit.merged_text)
+    assert outcome.overlap == lsh.changed_line_overlap(merged_changes, set())
+    assert "has no" in outcome.error
+
+
+def test_reduced_unit_broken_answer_is_applied_and_overlap_uses_reduced_start(large_repo):
+    repo, old, new, unit, start = large_repo
+    broken = start + "\ndef added(r:\n"
+    outcome = _vm_score(repo, unit, old, new, broken, test_runner=_passing_runner)
+    assert outcome.applied is True
+    merged_changes = lsh._change_set(unit.start_text, unit.merged_text)
+    assert outcome.overlap == lsh.changed_line_overlap(
+        merged_changes, lsh._change_set(start, broken))
+    assert "does not parse" in outcome.error
+
+
+def test_reduced_unit_correct_answer_is_applied_and_compiles(large_repo):
+    repo, old, new, unit, start = large_repo
+    answer = start + "\n\ndef added(r):\n    return math.pi * r\n"
+    outcome = _vm_score(repo, unit, old, new, answer, test_runner=_passing_runner)
+    assert outcome.applied is True and outcome.compiled is True
+    assert outcome.overlap == 1.0
+
+
+def test_score_unit_text_matches_vm_score_unit_on_reduced_unit(large_repo):
+    """The home-GPU entry point scores the same text exactly like the VM replay."""
+    repo, old, new, unit, start = large_repo
+    for text in (start, start + "\ndef added(r:\n",
+                 start + "\n\ndef added(r):\n    return math.pi * r\n"):
+        vm = _vm_score(repo, unit, old, new, text, test_runner=_passing_runner)
+        worktree = lsr._create_worktree(repo, new)
+        try:
+            pc = lsh.score_unit_text(worktree, unit, text, start_text=start, tests=[],
+                                     test_runner=_passing_runner)
+        finally:
+            lsr.remove_worktree(repo, worktree)
+        for field in ("applied", "compiled", "has_tests", "tests_passed", "overlap", "error"):
+            assert getattr(pc, field) == getattr(vm, field), field
+
+
+def test_vm_baseline_note_kept_per_unit_and_tests_run_once(large_repo):
+    repo, old, new, unit, start = large_repo
+    calls = []
+
+    def failing(wt, tests, timeout):
+        calls.append(tests)
+        return lsr.MergedTestRun(1, 0, None)  # total=1, passed=0
+
+    worktree = lsr._create_worktree(repo, new)
+    try:
+        baseline: dict = {}
+        outcomes = [lsh._score_unit(repo, worktree, unit, old=old, new=new, title="t",
+                                    summary="s", client=None,
+                                    worker_factory=lambda _c: _Worker(None),
+                                    tests=["tests/x.py"], test_runner=failing,
+                                    baseline=baseline) for _ in range(2)]
+    finally:
+        lsr.remove_worktree(repo, worktree)
+    assert len(calls) == 1  # the baseline is cached across units of the file
+    for outcome in outcomes:  # ... but every unit still records why it is untested
+        assert outcome.has_tests is False
+        assert "not tested: merged tests fail on the merged tree (0/1)" in outcome.error
 
 
 # ---- --via home-gpu ----------------------------------------------------------
 
 
-def test_via_home_gpu_writes_one_inbox_file_per_case_and_no_bakeoff_rows(workspace, enabled):
-    report = bakeoff.submit_home_gpu_jobs(
-        bakeoff._load_fixture(workspace["fixture"], workspace["db"]),
-        db_path=workspace["db"], mailbox_dir=workspace["mailbox"], commit=False,
-    )
-    assert report["submitted"] == 10
-    assert report["fallback"] == 0
-    files = _inbox_jobs(workspace["mailbox"])
-    assert len(files) == 10  # N inbox files, one per case
-    assert {meta["kind"] for _, meta, _ in files} == {"bakeoff_prompt"}
-    assert {meta["to"] for _, meta, _ in files} == {"home-gpu"}
-    assert sorted(payload["index"] for _, _, payload in files) == list(range(10))
-    assert all(payload["experiment_id"] == "exp-1" for _, _, payload in files)
-    jobs = _job_rows(workspace["db"])
-    assert len(jobs) == 10
-    assert {j["status"] for j in jobs} == {STATUS_QUEUED}
-    assert list_bakeoffs(50, db_path=workspace["db"]) == []  # 0 bake-off rows
+def test_via_home_gpu_writes_one_inbox_file_per_case_and_no_rows(workspace, enabled, repo):
+    report = bakeoff.submit_home_gpu_jobs(_fixture(workspace), db_path=workspace["db"],
+                                          repo_root=repo, mailbox_dir=workspace["mailbox"],
+                                          commit=False)
+    assert report["submitted"] == 10 and report["errors"] == 0
+    files = _inbox(workspace["mailbox"])
+    assert len(files) == 10
+    assert {meta["kind"] for meta, _ in files} == {"bakeoff_prompt"}
+    assert {meta["to"] for meta, _ in files} == {"home-gpu"}
+    assert sorted(p["bakeoff"]["index"] for _, p in files) == list(range(10))
+    payload = files[0][1]
+    unit = bakeoff.resolve_case("exp-1", repo_root=repo, db_path=workspace["db"])["unit"]
+    assert payload["file"] == SHAPES and payload["symbol"] == unit.symbol
+    assert payload["file_text"] == lsh.worker_start_text(unit)[0] == unit.start_text
+    assert payload["reduced"] is False
+    assert "Edit only pkg/shapes.py" in payload["prompt"]
+    assert "complete new content" in payload["prompt"]
+    assert {j["status"] for j in _jobs(workspace["db"]).values()} == {STATUS_QUEUED}
+    assert {c["status"] for c in _cases(workspace["db"]).values()} == {"submitted"}
+    assert list_bakeoffs(50, db_path=workspace["db"]) == []
 
 
-def test_via_home_gpu_through_main_with_temp_mailbox(workspace, enabled, no_git, capsys):
-    rc = bakeoff.main(["--via", "home-gpu", "--db-path", workspace["db"],
+def test_via_home_gpu_through_main(workspace, enabled, no_git, repo, capsys):
+    rc = bakeoff.main(["--via", "home-gpu", "--db-path", workspace["db"], "--repo-root", repo,
                        "--fixture", str(workspace["fixture"]),
                        "--mailbox-dir", str(workspace["mailbox"])])
     assert rc == 0
-    assert len(_inbox_jobs(workspace["mailbox"])) == 10
+    assert len(_inbox(workspace["mailbox"])) == 10
     assert list_bakeoffs(50, db_path=workspace["db"]) == []
     report = json.loads(capsys.readouterr().out)
     assert report["via"] == "home-gpu" and report["submitted"] == 10
 
 
-def test_via_home_gpu_with_flag_off_exits_non_zero_with_clear_message(workspace, monkeypatch, capsys):
+def test_via_home_gpu_with_flag_off_exits_non_zero_and_writes_nothing(workspace, monkeypatch,
+                                                                      capsys):
     monkeypatch.delenv("NEXUS_HOME_GPU", raising=False)
     rc = bakeoff.main(["--via", "home-gpu", "--db-path", workspace["db"],
                        "--fixture", str(workspace["fixture"]),
                        "--mailbox-dir", str(workspace["mailbox"])])
     assert rc != 0
-    err = capsys.readouterr().err
-    assert "NEXUS_HOME_GPU=1" in err
-    assert list((Path(workspace["mailbox"]) / "inbox").glob("*.md")) == []
+    assert "NEXUS_HOME_GPU=1" in capsys.readouterr().err
+    assert list((workspace["mailbox"] / "inbox").glob("*.md")) == []
+    assert _jobs(workspace["db"]) == {} and _cases(workspace["db"]) == {}
+    with pytest.raises(home_gpu.HomeGpuDisabled, match="NEXUS_HOME_GPU"):
+        _submit(workspace)
+    assert _cases(workspace["db"]) == {}
+
+
+def test_via_home_gpu_without_mailbox_exits_non_zero(workspace, enabled, monkeypatch, capsys):
+    monkeypatch.delenv("AGENT_MAILBOX_REPO_PATH", raising=False)
+    rc = bakeoff.main(["--via", "home-gpu", "--db-path", workspace["db"],
+                       "--fixture", str(workspace["fixture"])])
+    assert rc == 2 and "mailbox" in capsys.readouterr().err
+
+
+def test_via_home_gpu_twice_does_not_double_the_jobs(workspace, enabled):
+    first = _submit(workspace)
+    second = _submit(workspace)
+    assert first["submitted"] == 10
+    assert second["submitted"] == 0 and second["already_pending"] == 10
+    assert {j["job_id"] for j in second["jobs"]} == {j["job_id"] for j in first["jobs"]}
+    assert len(_inbox(workspace["mailbox"])) == 10 and len(_jobs(workspace["db"])) == 10
+
+
+def test_interrupted_submission_resumes_under_the_same_job_id(workspace, enabled):
+    calls = []
+
+    def dies_on_fourth(conn, kind, payload, deadline_s, **kw):
+        calls.append(kw["job_id"])
+        if len(calls) == 4:
+            raise KeyboardInterrupt
+        return home_gpu.submit_job(conn, kind, payload, deadline_s, **kw)
+
+    with pytest.raises(KeyboardInterrupt):
+        _submit(workspace, submit_fn=dies_on_fourth)
+    cases = _cases(workspace["db"])
+    assert sorted(cases) == [0, 1, 2, 3]
+    assert cases[3]["status"] == "submitting" and cases[3]["job_id"] == calls[3]
+    assert len(_inbox(workspace["mailbox"])) == 3
     assert list_bakeoffs(50, db_path=workspace["db"]) == []
-    # The library entry point raises the same clear error and writes nothing.
-    conn = init_db(workspace["db"])
-    try:
-        with pytest.raises(Exception, match="NEXUS_HOME_GPU"):
-            submit_job(conn, "bakeoff_prompt", {"experiment_id": "exp-1", "index": 0},
-                       mailbox_dir=workspace["mailbox"], commit=False)
-    finally:
-        conn.close()
+
+    again = _submit(workspace)
+    assert again["already_pending"] == 3 and again["submitted"] == 7
+    resumed = next(j for j in again["jobs"] if j["index"] == 3)
+    assert resumed["job_id"] == calls[3] and resumed.get("resumed") is True
+    assert len(_inbox(workspace["mailbox"])) == 10 and len(_jobs(workspace["db"])) == 10
+    assert {c["status"] for c in _cases(workspace["db"]).values()} == {"submitted"}
+
+
+def test_crash_after_submit_job_republishes_instead_of_a_second_job(workspace, enabled):
+    def submits_then_dies(conn, kind, payload, deadline_s, **kw):
+        result = home_gpu.submit_job(conn, kind, payload, deadline_s, **kw)
+        if payload["bakeoff"]["index"] == 5:
+            raise KeyboardInterrupt  # before the case is marked submitted
+        return result
+
+    with pytest.raises(KeyboardInterrupt):
+        _submit(workspace, submit_fn=submits_then_dies)
+    job_id = _cases(workspace["db"])[5]["job_id"]
+    assert _cases(workspace["db"])[5]["status"] == "submitting"
+    again = _submit(workspace)
+    assert next(j for j in again["jobs"] if j["index"] == 5)["job_id"] == job_id
+    assert len(_jobs(workspace["db"])) == 10  # no second job for case 5
+
+
+def test_failed_mailbox_commit_is_reported_and_resumed(workspace, enabled, capsys):
+    def commit_fails(conn, kind, payload, deadline_s, **kw):
+        if payload["bakeoff"]["index"] == 2:
+            raise home_gpu.HomeGpuJobError("job file written but the mailbox commit failed")
+        return home_gpu.submit_job(conn, kind, payload, deadline_s, **kw)
+
+    report = _submit(workspace, submit_fn=commit_fails)
+    assert report["errors"] == 1 and report["submitted"] == 9
+    case = _cases(workspace["db"])[2]
+    assert case["status"] == "submitting" and "commit failed" in case["error"]
+    again = _submit(workspace)
+    assert again["errors"] == 0 and again["submitted"] == 1
+    assert next(j for j in again["jobs"] if j["index"] == 2)["job_id"] == case["job_id"]
+    assert _cases(workspace["db"])[2]["error"] is None
+
+
+def test_rejected_and_unresolvable_cases_are_reported_not_submitted(workspace, enabled):
+    def payloads(item, index):
+        if index == 0:
+            raise ValueError("experiment exp-1 is not merged")
+        payload = fake_payload(item, index)
+        if index == 1:
+            payload["file_text"] = "open('/etc/passwd')\n"  # absolute path: never published
+        return payload
+
+    report = _submit(workspace, payload_fn=payloads)
+    assert report["fixture_errors"] == 1 and report["rejected"] == 1
+    assert report["submitted"] == 8
+    assert len(_inbox(workspace["mailbox"])) == 8 and sorted(_cases(workspace["db"])) == list(
+        range(2, 10))
+
+
+def test_expired_case_is_sent_again_but_fallback_crash_is_not_resubmitted(workspace, enabled):
+    first = _submit(workspace)
+    expired_id = first["jobs"][0]["job_id"]
+    fallback_id = first["jobs"][1]["job_id"]
+    conn = sqlite3.connect(workspace["db"])
+    with conn:
+        conn.execute("UPDATE home_gpu_jobs SET status = 'expired' WHERE job_id = ?", (expired_id,))
+        conn.execute("UPDATE home_gpu_jobs SET status = 'fallback' WHERE job_id = ?",
+                     (fallback_id,))
+        # A crash right after the fallback left the case in 'submitting'.
+        conn.execute("UPDATE local_model_bakeoff_home_gpu_cases SET status = 'submitting' "
+                     "WHERE job_id = ?", (fallback_id,))
+    conn.close()
+    seen = []
+
+    def record(conn, kind, payload, deadline_s, **kw):
+        seen.append(kw["job_id"])
+        return home_gpu.submit_job(conn, kind, payload, deadline_s, **kw)
+
+    again = _submit(workspace, submit_fn=record)
+    assert fallback_id not in seen and expired_id not in seen
+    by_index = {j["index"]: j for j in again["jobs"]}
+    assert by_index[0]["status"] == "submitted" and by_index[0]["job_id"] != expired_id
+    statuses = {c["job_id"]: c["status"] for c in _rows(
+        workspace["db"], "SELECT * FROM local_model_bakeoff_home_gpu_cases")}
+    assert statuses[fallback_id] == "fallback"
 
 
 # ---- --collect ---------------------------------------------------------------
 
 
-def test_collect_scores_answered_jobs_with_the_vm_checker(workspace, enabled, no_git, monkeypatch):
-    tmp = workspace["tmp"]
-    repo, base, merged = make_repo(tmp)
-    add_experiment(workspace["db"], "exp-1", merged=merged, base=base)
-    monkeypatch.setenv(lsr.ENV_WORKTREE_DIR, str(tmp / "worktrees"))
+def _stable(error):
+    """A note without pytest's run-specific noise (addresses, temp paths, timings)."""
+    if error is None:
+        return None
+    error = re.sub(r"0x[0-9a-f]+", "0x", error)
+    error = re.sub(r"/\S*/", "/<tmp>/", error)
+    return re.sub(r"in \d+\.\d+s", "in Ns", error)
 
-    submitted = bakeoff.submit_home_gpu_jobs(
-        bakeoff._load_fixture(workspace["fixture"], workspace["db"]),
-        db_path=workspace["db"], mailbox_dir=workspace["mailbox"], commit=False,
-    )
-    job_ids = [job["job_id"] for job in submitted["jobs"]]
-    answered_ids = job_ids[:3]  # three fixture replies; the other seven stay queued
-    for job_id in answered_ids:
-        _write_reply(workspace["mailbox"], job_id, MERGED_SHAPES)
 
-    conn = init_db(workspace["db"])
-    try:
-        assert collect_replies(workspace["mailbox"], conn, tmp / "state") == 3
-    finally:
-        conn.close()
+def test_collect_scores_answers_exactly_like_the_vm_replay(workspace, enabled, repo):
+    submitted = bakeoff.submit_home_gpu_jobs(_fixture(workspace), db_path=workspace["db"],
+                                             repo_root=repo, mailbox_dir=workspace["mailbox"],
+                                             commit=False)
+    ids = [j["job_id"] for j in submitted["jobs"]]
+    answers = {
+        ids[0]: MERGED_SHAPES,                                  # passes
+        ids[1]: "```python\n" + MERGED_SHAPES + "```\n",       # fenced, passes
+        ids[2]: BASE_SHAPES,                                    # unchanged
+        ids[3]: "def area(r:\n",                                # does not parse
+        ids[4]: MERGED_SHAPES.replace("math.pi * r * r", "3 * r * r"),  # compiles, fails
+    }
+    for job_id, text in answers.items():
+        _write_reply(workspace["mailbox"], job_id, text)
+    conn = sqlite3.connect(workspace["db"])
+    with conn:  # one job runs out of time: skipped, never a failure
+        conn.execute("UPDATE home_gpu_jobs SET status = 'expired' WHERE job_id = ?", (ids[9],))
+    conn.close()
 
-    report = bakeoff.collect_home_gpu_bakeoffs(
-        db_path=workspace["db"], repo_root=repo, fixture_path=workspace["fixture"],
-        mailbox_dir=workspace["mailbox"],
-    )
-    assert report["scored"] == 3
-    assert report["written"] == 1  # one model -> one normal bake-off row
+    report = _collect(workspace, repo_root=repo)  # also runs collect_replies
+    assert report["scored"] == 5 and report["written"] == 1
+    waiting = {w["job_id"]: w["status"] for w in report["waiting"]}
+    assert waiting == {**{i: STATUS_QUEUED for i in ids[5:9]}, ids[9]: STATUS_EXPIRED}
 
     rows = list_bakeoffs(50, db_path=workspace["db"])
     assert len(rows) == 1
     row = rows[0]
-    assert row["host"] == "home-gpu"
-    assert row["model"] == "pc-7b"
-    assert row["status"] == "completed"
-    assert row["hunks_total"] == 3          # only the answered jobs, not all 10
-    assert row["hunks_applied"] == 3
-    assert row["hunks_compiled"] == 3
-    assert row["passing_hunks"] == 3
-    assert row["seconds"] == 30.0
-    assert row["prompt_tokens_per_second"] == pytest.approx(300 / 30.0)
-    assert row["output_tokens_per_second"] == pytest.approx(150 / 30.0)
+    assert row["host"] == "home-gpu" and row["model"] == "pc-7b"
+    assert row["status"] == "completed" and row["hunks_total"] == 5
+    assert row["seconds"] == 50.0
+    assert row["prompt_tokens_per_second"] == pytest.approx(10.0)
+    assert row["output_tokens_per_second"] == pytest.approx(5.0)
     assert row["winner"] is False and row["recommend_switch"] is False
 
-    # Parity with the VM scorer on the same text: check_unit_text run directly
-    # on the same answer must agree with what --collect stored per job.
-    conn = lsr._connect(workspace["db"])
-    try:
-        exp_row, adoption = lsr._load(conn, "exp-1")
-    finally:
-        conn.close()
-    old, new = lsr.merged_range(repo, adoption["integrated_commit_sha"],
-                                adoption["experiment_commit_sha"],
-                                str(exp_row["base_commit_sha"]).strip())
-    unit = lsh.hunk_units(repo, old, new)[0]
-    test_changes = lsr.merged_test_changes(repo, old, new)
-    tests = lsh.unit_test_files(repo, new, test_changes, unit.file)
-    worktree = lsr._create_worktree(repo, new, db_path=workspace["db"])
-    try:
-        vm_outcome = lsh.check_unit_text(
-            worktree, unit, MERGED_SHAPES, tests=tests,
-            test_runner=lambda wt, t, timeout: lsh.run_unit_tests(
-                wt, t, lsh.module_name(unit.file), timeout),
-            baseline={}, notes=[])
-    finally:
-        lsr.remove_worktree(repo, worktree)
-    details = row["details"]
-    assert {j["job_id"] for j in details["jobs"]} == set(answered_ids)
-    for job in details["jobs"]:
-        outcome = job["outcome"]
-        assert outcome["applied"] == vm_outcome.applied
-        assert outcome["compiled"] == vm_outcome.compiled
-        assert outcome["tests_passed"] == vm_outcome.tests_passed
-        assert outcome["has_tests"] == vm_outcome.has_tests
+    # Parity: the real VM _score_unit, its worker writing the same text.
+    case = bakeoff.resolve_case("exp-1", repo_root=repo, db_path=workspace["db"])
+    hunks = {h["job_id"]: h for h in row["details"]["hunks"]}
+    for job_id, text in answers.items():
+        vm = _vm_score(repo, case["unit"], case["old"], case["new"],
+                       bakeoff.answer_file_text(text), db_path=workspace["db"])
+        for field in ("applied", "compiled", "has_tests", "tests_passed", "overlap",
+                      "tests_total", "tests_ok"):
+            assert hunks[job_id][field] == getattr(vm, field), (job_id, field)
+        assert _stable(hunks[job_id]["error"]) == _stable(vm.error), job_id
+    assert row["passing_hunks"] == 2 and row["hunks_applied"] == 4
+    assert row["hunks_compiled"] == 3
 
-    # The seven unanswered jobs stay queued - skipped, never scored as failures.
-    jobs = {j["job_id"]: j for j in _job_rows(workspace["db"])}
-    for job_id in job_ids[3:]:
-        assert jobs[job_id]["status"] == STATUS_QUEUED
-    assert len(rows) == 1 and rows[0]["hunks_total"] == 3
-
-    # A repeated --collect does not duplicate the rows.
-    again = bakeoff.collect_home_gpu_bakeoffs(
-        db_path=workspace["db"], repo_root=repo, fixture_path=workspace["fixture"],
-        mailbox_dir=workspace["mailbox"],
-    )
-    assert again["scored"] == 0
+    jobs = _jobs(workspace["db"])
+    assert all(jobs[i]["status"] == STATUS_QUEUED for i in ids[5:9])
+    again = _collect(workspace, repo_root=repo)
+    assert again["scored"] == 0 and again["written"] == 0
     assert len(list_bakeoffs(50, db_path=workspace["db"])) == 1
 
 
-def test_collect_skips_queued_and_expired_jobs(workspace, enabled):
-    db = workspace["db"]
-    conn = init_db(db)
-    _ensure_schema(conn)
-    fixture = bakeoff._load_fixture(workspace["fixture"], db)
-    payload = bakeoff.bakeoff_case_payload(fixture[0], 0, db)
-    import hashlib
-    digest = hashlib.sha256(
-        __import__("modules.home_gpu", fromlist=["payload_body"]).payload_body(payload)
-        .encode("utf-8")).hexdigest()
-    rows = [
-        ("hg-queued-1", STATUS_QUEUED, "2999-01-01T00:00:00Z", None),
-        ("hg-expired-1", STATUS_EXPIRED, "2020-01-01T00:00:00Z", None),
-        ("hg-answered-1", "answered", "2999-01-01T00:00:00Z", "some-answer"),
-    ]
-    with conn:
-        for job_id, status, deadline, answer in rows:
-            conn.execute(
-                "INSERT INTO home_gpu_jobs (job_id, kind, status, submitted_at, deadline, "
-                "input_sha256, answer_path, model, prompt_tokens, completion_tokens, seconds) "
-                "VALUES (?, 'bakeoff_prompt', ?, '2026-08-13T00:00:00Z', ?, ?, ?, 'pc-7b', "
-                "100, 50, 10.0)",
-                (job_id, status, deadline,
-                 digest if job_id == "hg-answered-1" else "0" * 64,
-                 answer and str(workspace["tmp"] / f"{job_id}.txt")),
-            )
-        # the answered job's digest matches fixture case 0; give it an answer file
-        answer_path = workspace["tmp"] / "hg-answered-1.txt"
-        answer_path.write_text("some-answer", encoding="utf-8")
+def test_missing_replies_stay_queued_and_write_no_rows(workspace, enabled):
+    _submit(workspace)
+    report = _collect(workspace, score_fn=ok_score)
+    assert report["written"] == 0 and len(report["waiting"]) == 10
+    assert {j["status"] for j in _jobs(workspace["db"]).values()} == {STATUS_QUEUED}
+    assert list_bakeoffs(50, db_path=workspace["db"]) == []
+
+
+def test_late_replies_are_collected_by_a_later_run(workspace, enabled):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    _write_reply(workspace["mailbox"], ids[0], "x")
+    assert _collect(workspace, score_fn=ok_score)["scored"] == 1
+    _write_reply(workspace["mailbox"], ids[1], "y")
+    assert _collect(workspace, score_fn=ok_score)["scored"] == 1
+    rows = list_bakeoffs(50, db_path=workspace["db"])
+    assert [r["hunks_total"] for r in rows] == [1, 1]
+    assert {h["job_id"] for r in rows for h in r["details"]["hunks"]} == {ids[0], ids[1]}
+
+
+def test_collect_crash_while_writing_rows_writes_nothing(workspace, enabled, monkeypatch):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    _write_reply(workspace["mailbox"], ids[0], "a", model="m-a")
+    _write_reply(workspace["mailbox"], ids[1], "b", model="m-b")
+    real = bakeoff.insert_bakeoff_row
+    calls = []
+
+    def dies_on_second(conn, row, **kw):
+        calls.append(row["model"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return real(conn, row, **kw)
+
+    monkeypatch.setattr(bakeoff, "insert_bakeoff_row", dies_on_second)
+    with pytest.raises(KeyboardInterrupt):
+        _collect(workspace, score_fn=ok_score)
+    assert list_bakeoffs(50, db_path=workspace["db"]) == []  # the first row rolled back too
+    assert all(c["collected_at"] is None for c in _cases(workspace["db"]).values())
+
+    monkeypatch.setattr(bakeoff, "insert_bakeoff_row", real)
+    report = _collect(workspace, score_fn=ok_score)
+    assert report["written"] == 2
+    assert sorted(r["model"] for r in list_bakeoffs(50, db_path=workspace["db"])) == ["m-a", "m-b"]
+
+
+def test_collect_interrupted_while_scoring_writes_nothing(workspace, enabled):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    for job_id in ids[:3]:
+        _write_reply(workspace["mailbox"], job_id, "a")
+
+    def dies(payload, answer):
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        _collect(workspace, score_fn=dies)
+    assert list_bakeoffs(50, db_path=workspace["db"]) == []
+    assert _collect(workspace, score_fn=ok_score)["scored"] == 3
+
+
+def test_concurrent_collect_never_writes_a_case_twice(workspace, enabled):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    for job_id in ids[:2]:
+        _write_reply(workspace["mailbox"], job_id, "a")
+
+    def other_run_wins(payload, answer):
+        # A second --collect finishes ids[0] while this one is still scoring.
+        conn = sqlite3.connect(workspace["db"])
+        with conn:
+            conn.execute("UPDATE local_model_bakeoff_home_gpu_cases SET collected_at = 'x' "
+                         "WHERE job_id = ?", (ids[0],))
+        conn.close()
+        return ok_score(payload, answer)
+
+    report = _collect(workspace, score_fn=other_run_wins)
+    assert {s["job_id"]: s["reason"] for s in report["skipped"]} == {ids[0]: "already collected"}
+    rows = list_bakeoffs(50, db_path=workspace["db"])
+    assert len(rows) == 1 and [h["job_id"] for h in rows[0]["details"]["hunks"]] == [ids[1]]
+
+
+def test_scoring_error_is_recorded_like_the_vm_path_and_others_still_score(workspace, enabled):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    for job_id in ids[:2]:
+        _write_reply(workspace["mailbox"], job_id, "a")
+
+    def flaky(payload, answer):
+        if payload["bakeoff"]["index"] == 0:
+            raise ValueError("experiment exp-1 is not merged")
+        return ok_score(payload, answer)
+
+    report = _collect(workspace, score_fn=flaky)
+    assert report["scored"] == 2
+    hunks = {h["index"]: h for h in list_bakeoffs(50, db_path=workspace["db"])[0]["details"]["hunks"]}
+    assert hunks[0]["status"] == "fixture_error" and hunks[1]["tests_passed"] is True
+
+
+def test_tampered_or_missing_answer_file_is_skipped_not_scored(workspace, enabled):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    for job_id in ids[:2]:
+        _write_reply(workspace["mailbox"], job_id, "a")
+    conn = init_db(workspace["db"])
+    home_gpu.collect_replies(workspace["mailbox"], conn, workspace["tmp"] / "state")
+    conn.commit()
     conn.close()
-
-    def fake_score(case, answer, job=None):
-        assert case["experiment_id"] == "exp-1" and case["index"] == 0
-        assert answer == "some-answer"
-        return {"status": "scored", "applied": True, "compiled": True, "tests_passed": True,
-                "error": None}
-
-    report = bakeoff.collect_home_gpu_bakeoffs(
-        db_path=db, fixture_path=workspace["fixture"], score_fn=fake_score,
-    )
-    assert report["scored"] == 1
-    skipped_reasons = {s["job_id"]: s["reason"] for s in report["skipped"]}
-    assert "hg-queued-1" not in skipped_reasons  # never even looked at: not answered
-    assert "hg-expired-1" not in skipped_reasons
-    rows = list_bakeoffs(50, db_path=db)
-    assert len(rows) == 1
-    assert rows[0]["host"] == "home-gpu"
-    assert rows[0]["hunks_total"] == 1  # only the answered job; queued/expired are not failures
-    assert rows[0]["passing_hunks"] == 1
-    jobs = {j["job_id"]: j for j in _job_rows(db)}
-    assert jobs["hg-queued-1"]["status"] == STATUS_QUEUED
-    assert jobs["hg-expired-1"]["status"] == STATUS_EXPIRED
+    jobs = _jobs(workspace["db"])
+    Path(jobs[ids[0]]["answer_path"]).write_text("changed", encoding="utf-8")
+    Path(jobs[ids[1]]["answer_path"]).unlink()
+    report = _collect(workspace, score_fn=ok_score)
+    assert report["written"] == 0
+    reasons = {s["job_id"]: s["reason"] for s in report["skipped"]}
+    assert "sha256" in reasons[ids[0]] and "unreadable" in reasons[ids[1]]
+    assert all(c["collected_at"] is None for c in _cases(workspace["db"]).values())
 
 
-# ---- host column migration ---------------------------------------------------
+def test_collect_with_flag_off_scores_already_answered_jobs_without_reading_outbox(
+        workspace, enabled, monkeypatch):
+    ids = [j["job_id"] for j in _submit(workspace)["jobs"]]
+    _write_reply(workspace["mailbox"], ids[0], "a")
+    conn = init_db(workspace["db"])
+    home_gpu.collect_replies(workspace["mailbox"], conn, workspace["tmp"] / "state")
+    conn.commit()
+    conn.close()
+    _write_reply(workspace["mailbox"], ids[1], "b")
+    monkeypatch.delenv("NEXUS_HOME_GPU")
+    report = _collect(workspace, score_fn=ok_score)
+    assert report["scored"] == 1  # ids[1] was never collected from the outbox
+    assert _jobs(workspace["db"])[ids[1]]["status"] == STATUS_QUEUED
+
+
+def test_collect_through_main(workspace, enabled, capsys):
+    _submit(workspace)
+    rc = bakeoff.main(["--collect", "--db-path", workspace["db"],
+                       "--repo-root", str(workspace["tmp"]),
+                       "--mailbox-dir", str(workspace["mailbox"])])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["written"] == 0
+
+
+def test_answer_file_text_drops_one_outer_fence_only():
+    assert bakeoff.answer_file_text("```python\nx = 1\n```") == "x = 1\n"
+    assert bakeoff.answer_file_text("x = 1") == "x = 1\n"
+    inner = "x = '''\n```\n'''\n"
+    assert bakeoff.answer_file_text(inner) == inner
+
+
+# ---- host column -------------------------------------------------------------
+
+
+OLD_TABLE = """
+CREATE TABLE local_model_bakeoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL, created_at TEXT NOT NULL, model TEXT NOT NULL,
+    is_current INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
+    prompt_tokens_per_second REAL NULL, output_tokens_per_second REAL NULL,
+    hunks_total INTEGER NOT NULL DEFAULT 0, hunks_applied INTEGER NOT NULL DEFAULT 0,
+    hunks_compiled INTEGER NOT NULL DEFAULT 0, passing_hunks INTEGER NOT NULL DEFAULT 0,
+    local_too_slow INTEGER NOT NULL DEFAULT 0, seconds REAL NOT NULL DEFAULT 0,
+    passing_hunks_per_hour REAL NOT NULL DEFAULT 0,
+    winner INTEGER NOT NULL DEFAULT 0, recommend_switch INTEGER NOT NULL DEFAULT 0,
+    details_json TEXT NULL, error TEXT NULL
+)
+"""
+
+BASE_ROW = {"created_at": "2026-08-13T00:00:00Z", "is_current": 0, "status": "completed",
+            "hunks_total": 0, "hunks_applied": 0, "hunks_compiled": 0, "passing_hunks": 0,
+            "local_too_slow": 0, "seconds": 0, "passing_hunks_per_hour": 0,
+            "winner": 0, "recommend_switch": 0, "details_json": None, "error": None}
 
 
 def test_host_column_migration_is_idempotent_and_defaults_to_vm(tmp_path):
     db_path = str(tmp_path / "old.db")
-    # A database whose local_model_bakeoffs predates the host column (#857).
     conn = sqlite3.connect(db_path)
     with conn:
-        conn.execute(
-            """
-            CREATE TABLE local_model_bakeoffs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id TEXT NOT NULL, created_at TEXT NOT NULL, model TEXT NOT NULL,
-                is_current INTEGER NOT NULL DEFAULT 0, status TEXT NOT NULL,
-                prompt_tokens_per_second REAL NULL, output_tokens_per_second REAL NULL,
-                hunks_total INTEGER NOT NULL DEFAULT 0, hunks_applied INTEGER NOT NULL DEFAULT 0,
-                hunks_compiled INTEGER NOT NULL DEFAULT 0, passing_hunks INTEGER NOT NULL DEFAULT 0,
-                local_too_slow INTEGER NOT NULL DEFAULT 0, seconds REAL NOT NULL DEFAULT 0,
-                passing_hunks_per_hour REAL NOT NULL DEFAULT 0,
-                winner INTEGER NOT NULL DEFAULT 0, recommend_switch INTEGER NOT NULL DEFAULT 0,
-                details_json TEXT NULL, error TEXT NULL
-            )
-            """
-        )
-        conn.execute(
-            "INSERT INTO local_model_bakeoffs (run_id, created_at, model, status) "
-            "VALUES ('old-run', '2026-08-13T00:00:00Z', '7b.gguf', 'completed')"
-        )
+        conn.execute(OLD_TABLE)
+        conn.execute("INSERT INTO local_model_bakeoffs (run_id, created_at, model, status) "
+                     "VALUES ('old-run', '2026-08-13T00:00:00Z', '7b.gguf', 'completed')")
     conn.close()
-
-    init_db(db_path).close()  # migration runs once
-    init_db(db_path).close()  # and again: idempotent
-    rows = list_bakeoffs(10, db_path=db_path)
-    assert len(rows) == 1
-    assert rows[0]["host"] == "vm"  # pre-existing rows are VM rows
-
+    init_db(db_path).close()
+    init_db(db_path).close()
+    assert [r["host"] for r in list_bakeoffs(10, db_path=db_path)] == ["vm"]
     conn = init_db(db_path)
-    base = {"created_at": "2026-08-13T00:00:00Z", "is_current": 0, "status": "completed",
-            "hunks_total": 0, "hunks_applied": 0, "hunks_compiled": 0, "passing_hunks": 0,
-            "local_too_slow": 0, "seconds": 0, "passing_hunks_per_hour": 0,
-            "winner": 0, "recommend_switch": 0, "details_json": None, "error": None}
-    with conn:
-        insert_bakeoff_row(conn, {"run_id": "r2", "model": "3b.gguf", **base,
-                                  "created_at": "2026-08-13T01:00:00Z"})
-        insert_bakeoff_row(conn, {"run_id": "r3", "model": "pc-7b", **base,
-                                  "created_at": "2026-08-13T02:00:00Z", "host": "home-gpu"})
+    insert_bakeoff_row(conn, {"run_id": "r2", "model": "3b.gguf", **BASE_ROW,
+                              "created_at": "2026-08-13T01:00:00Z"})
+    insert_bakeoff_row(conn, {"run_id": "r3", "model": "pc-7b", **BASE_ROW,
+                              "created_at": "2026-08-13T02:00:00Z", "host": "home-gpu"})
     conn.close()
     by_model = {r["model"]: r["host"] for r in list_bakeoffs(10, db_path=db_path)}
     assert by_model == {"7b.gguf": "vm", "3b.gguf": "vm", "pc-7b": "home-gpu"}
 
 
-def test_fresh_database_has_host_column_with_vm_default(tmp_path):
+def test_host_migration_tolerates_a_concurrent_winner(tmp_path):
+    conn = sqlite3.connect(str(tmp_path / "race.db"))
+    conn.execute(OLD_TABLE)
+    conn.execute("ALTER TABLE local_model_bakeoffs ADD COLUMN host TEXT NOT NULL DEFAULT 'vm'")
+
+    class StaleProbe:
+        """The PRAGMA probe ran before the other process added the column."""
+
+        def execute(self, sql, *args):
+            if sql.startswith("PRAGMA"):
+                return iter([])
+            return conn.execute(sql, *args)
+
+    _migrate_local_model_bakeoffs_columns(StaleProbe())  # no "duplicate column" error
+    columns = [r[1] for r in conn.execute("PRAGMA table_info(local_model_bakeoffs)")]
+    assert columns.count("host") == 1
+    conn.close()
+
+
+def test_insert_rejects_unknown_host_and_commit_false_leaves_the_transaction_open(tmp_path):
     db_path = str(tmp_path / "new.db")
     conn = init_db(db_path)
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(local_model_bakeoffs)")}
-    assert "host" in columns
-    with conn:
-        insert_bakeoff_row(conn, {"run_id": "r", "created_at": "2026-08-13T00:00:00Z",
-                                  "model": "7b.gguf", "is_current": 0, "status": "completed",
-                                  "hunks_total": 0, "hunks_applied": 0, "hunks_compiled": 0,
-                                  "passing_hunks": 0, "local_too_slow": 0, "seconds": 0,
-                                  "passing_hunks_per_hour": 0, "winner": 0,
-                                  "recommend_switch": 0, "details_json": None, "error": None})
+    with pytest.raises(ValueError, match="host"):
+        insert_bakeoff_row(conn, {"run_id": "r", "model": "m", **BASE_ROW, "host": "laptop"})
+    insert_bakeoff_row(conn, {"run_id": "r", "model": "m", **BASE_ROW}, commit=False)
+    conn.rollback()
     conn.close()
-    assert list_bakeoffs(1, db_path=db_path)[0]["host"] == "vm"
+    assert list_bakeoffs(10, db_path=db_path) == []
+
+
+def test_case_table_creation_is_idempotent(tmp_path):
+    db_path = str(tmp_path / "x.db")
+    for _ in range(2):
+        init_db(db_path).close()
+    assert _rows(db_path, "SELECT * FROM local_model_bakeoff_home_gpu_cases") == []
+    columns = {r["name"] for r in _rows(db_path, "PRAGMA table_info(local_model_bakeoff_home_gpu_cases)")}
+    assert {"job_id", "input_sha256", "payload_json", "collected_at", "bakeoff_id"} <= columns
