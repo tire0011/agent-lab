@@ -203,3 +203,5 @@ os.environ["NEXUS_CLI_UPDATE"] = "0"
 os.environ["NEXUS_WEEKLY_REVIEW"] = "0"
 # Nor prune this machine's real experiment or Vibe logs (modules/log_retention).
 os.environ["NEXUS_LOG_RETENTION"] = "0"
+# Nor the outlook, which would start a real web-searching agent (modules/outlook).
+os.environ["NEXUS_OUTLOOK"] = "0"

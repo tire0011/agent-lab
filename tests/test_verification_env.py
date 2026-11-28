@@ -98,6 +98,7 @@ class VerificationEnvSecretExclusionTests(unittest.TestCase):
         self.assertEqual(built.pop("NEXUS_CLI_UPDATE"), "0")
         self.assertEqual(built.pop("NEXUS_WEEKLY_REVIEW"), "0")
         self.assertEqual(built.pop("NEXUS_LOG_RETENTION"), "0")
+        self.assertEqual(built.pop("NEXUS_OUTLOOK"), "0")
         run_tmp = {built.pop(name) for name in ("TMPDIR", "TEMP", "TMP")}
         self.assertEqual(len(run_tmp), 1)  # one own temp dir per run
         self.assertEqual(built, {
